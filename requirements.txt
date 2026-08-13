@@ -1,0 +1,8 @@
+torch
+torchvision
+open_clip_torch
+Pillow
+numpy
+pyinstaller
+msal
+requests
