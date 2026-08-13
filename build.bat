@@ -1,5 +1,5 @@
 @echo off
-REM Builds ImageSearch.exe from tkinter_app.py using PyInstaller.
+REM Builds Greenreb_Image_Search.exe from tkinter_app.py using PyInstaller.
 REM Run this from the ImageSearchBuild folder after `pip install -r requirements.txt`.
 
 REM Pre-download the CLIP model weights (once) so they can be bundled into
@@ -9,7 +9,7 @@ if not exist "model_cache" (
     py download_model.py
 )
 
-py -m PyInstaller --noconfirm --onedir --windowed --name ImageSearch ^
+py -m PyInstaller --noconfirm --onedir --windowed --name Greenreb_Image_Search ^
     --collect-all open_clip ^
     --collect-all torch ^
     --collect-all torchvision ^
@@ -22,9 +22,9 @@ REM Strip bundled third-party license text (torch's kineto/dynolog trees in
 REM particular nest ~150 folders deep). Pure attribution files, unused at
 REM runtime, but their long paths risk exceeding Windows' 260-char MAX_PATH
 REM on extraction elsewhere and silently dropping files/folders.
-for /d /r "dist\ImageSearch\_internal" %%D in (*.dist-info) do (
+for /d /r "dist\Greenreb_Image_Search\_internal" %%D in (*.dist-info) do (
     if exist "%%D\licenses" rd /s /q "%%D\licenses"
 )
 
 echo.
-echo Build complete. Find ImageSearch.exe in dist\ImageSearch\
+echo Build complete. Find Greenreb_Image_Search.exe in dist\Greenreb_Image_Search\

@@ -172,7 +172,7 @@ def open_in_system_viewer(path):
 class ImageSearchApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Image Search")
+        self.root.title("Greenreb_Image_Search")
         self.root.geometry("980x720")
         self.root.minsize(760, 520)
 
@@ -385,7 +385,9 @@ class ImageSearchApp:
             os.path.join(local_folder, "folder_indexes"),
         )
 
-    def _apply_folder_changes(self, folder_id, changed_items, deleted_ids, thumbs_dir, indexes_dir):
+    def _apply_folder_changes(
+        self, folder_id, changed_items, deleted_ids, thumbs_dir, indexes_dir, failed_items
+    ):
         """Applies a delta-reported set of adds/updates/deletes to one
         SharePoint folder's shared, thumbnail-based index.
 
@@ -393,6 +395,12 @@ class ImageSearchApp:
         SharePoint folder itself when possible (keyed by driveItem id +
         eTag), so only genuinely new/changed images ever need their
         thumbnail downloaded and embedded - by anyone, on any machine.
+
+        Any item whose download/embed fails (e.g. lost connectivity partway
+        through a run) is recorded into `failed_items` (item_id -> raw item
+        dict) so the caller can persist it for a forced retry next run -
+        delta sync alone would never re-surface it, since nothing about an
+        unchanged-but-previously-failed item looks "changed" to SharePoint.
         Returns the folder's updated {item_id: entry} dict.
         """
         local_index_path = os.path.join(indexes_dir, f"{folder_id}.json")
@@ -469,8 +477,10 @@ class ImageSearchApp:
                             "thumbnail_b64": thumb_b64,
                         }
                         reembedded_count += 1
+                        failed_items.pop(item_id, None)
                     except Exception as exc:
                         self.event_queue.put(("status", f"Skipped {item['name']}: {exc}"))
+                        failed_items[item_id] = item
                     self.event_queue.put(("sp_item_done",))
 
         if changed_items:
@@ -504,6 +514,7 @@ class ImageSearchApp:
         os.makedirs(indexes_dir, exist_ok=True)
         delta_link_path = os.path.join(local_folder, "delta_link.txt")
         folder_map_path = os.path.join(local_folder, "item_folder_map.json")
+        pending_retries_path = os.path.join(local_folder, "pending_retries.json")
 
         self._sp_mode_active = True
         self._set_busy(True)
@@ -524,6 +535,18 @@ class ImageSearchApp:
                             item_folder_map = json.load(f)
                     except (json.JSONDecodeError, OSError):
                         item_folder_map = {}
+
+                # Items that failed to download/embed on a previous run (e.g.
+                # connectivity dropped mid-run) - delta sync alone would never
+                # surface these again since nothing about them looks
+                # "changed" to SharePoint, so they're force-retried here.
+                pending_retries = {}
+                if os.path.exists(pending_retries_path):
+                    try:
+                        with open(pending_retries_path, "r", encoding="utf-8") as f:
+                            pending_retries = json.load(f)
+                    except (json.JSONDecodeError, OSError):
+                        pending_retries = {}
 
                 self.event_queue.put(("status", "Checking SharePoint for changes..."))
                 root = self.sp_client.get_search_root_item()
@@ -557,12 +580,24 @@ class ImageSearchApp:
                     folder_id = item_folder_map.pop(item_id, None)
                     if folder_id:
                         deleted_by_folder.setdefault(folder_id, []).append(item_id)
+                    pending_retries.pop(item_id, None)
+
+                already_queued = {item["id"] for items in changed_by_folder.values() for item in items}
+                for item_id, item in pending_retries.items():
+                    if item_id in already_queued:
+                        continue
+                    parent_id = item.get("parentReference", {}).get("id")
+                    if not parent_id:
+                        continue
+                    changed_by_folder.setdefault(parent_id, []).append(item)
+                    item_folder_map[item_id] = parent_id
 
                 affected_folders = set(changed_by_folder) | set(deleted_by_folder)
                 total_changed = sum(len(v) for v in changed_by_folder.values())
                 self.event_queue.put(("sp_scan_done", total_changed))
                 self.engine.load_model(lambda msg: self.event_queue.put(("status", msg)))
 
+                failed_items = {}
                 for folder_id in affected_folders:
                     self._apply_folder_changes(
                         folder_id,
@@ -570,7 +605,11 @@ class ImageSearchApp:
                         deleted_by_folder.get(folder_id, []),
                         thumbs_dir,
                         indexes_dir,
+                        failed_items,
                     )
+
+                with open(pending_retries_path, "w", encoding="utf-8") as f:
+                    json.dump(failed_items, f)
 
                 # Only name+embedding are needed to build the searchable index below -
                 # discard each folder's thumbnail_b64 data (the bulk of its JSON) right
@@ -605,7 +644,8 @@ class ImageSearchApp:
                     f"RUN COMPLETE: delta_link_was={'set' if delta_link else 'None (full listing)'} "
                     f"new_delta_link={'received' if new_delta_link else 'MISSING'} "
                     f"raw_items={len(raw_items)} affected_folders={len(affected_folders)} "
-                    f"item_folder_map_size={len(item_folder_map)} final_searchable_count={count}"
+                    f"item_folder_map_size={len(item_folder_map)} final_searchable_count={count} "
+                    f"failed_pending_retry={len(failed_items)}"
                 )
                 if new_delta_link:
                     with open(delta_link_path, "w", encoding="utf-8") as f:
@@ -613,7 +653,7 @@ class ImageSearchApp:
                 with open(folder_map_path, "w", encoding="utf-8") as f:
                     json.dump(item_folder_map, f)
 
-                self.event_queue.put(("sp_index_done", count, len(affected_folders)))
+                self.event_queue.put(("sp_index_done", count, len(affected_folders), len(failed_items)))
             except Exception as exc:
                 _log_crash("SharePoint indexing", sys.exc_info())
                 self.event_queue.put(("error", str(exc)))
@@ -680,19 +720,26 @@ class ImageSearchApp:
                         f"Indexing from SharePoint... {self._sp_done_images}/{self._sp_total_images}"
                     )
                 elif kind == "sp_index_done":
-                    _, count, changed_folder_count = event
+                    _, count, changed_folder_count, failed_count = event
                     self.progress.stop()
                     self.progress.config(value=0)
                     self.folder_var.set("SharePoint: Fotos & Videos (all subfolders)")
                     self._set_busy(False)
+                    retry_note = (
+                        f" {failed_count} image(s) failed (e.g. lost connection) and will "
+                        "automatically retry next run."
+                        if failed_count
+                        else ""
+                    )
                     if changed_folder_count:
                         self.status_var.set(
                             f"Indexed {count} image(s) total ({changed_folder_count} folder(s) "
-                            "had changes). Ready to search."
+                            f"had changes). Ready to search.{retry_note}"
                         )
                     else:
                         self.status_var.set(
-                            f"Up to date - {count} image(s) already indexed. Ready to search."
+                            f"Up to date - {count} image(s) already indexed. "
+                            f"Ready to search.{retry_note}"
                         )
                 elif kind == "sp_open_ready":
                     self._set_busy(False)

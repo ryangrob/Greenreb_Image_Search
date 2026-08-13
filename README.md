@@ -71,8 +71,8 @@ pip install -r requirements.txt
 build.bat
 ```
 
-This produces `dist\ImageSearch\ImageSearch.exe`. Zip up the whole
-`dist\ImageSearch` folder (not just the .exe — it needs the files
+This produces `dist\Greenreb_Image_Search\Greenreb_Image_Search.exe`. Zip up
+the whole `dist\Greenreb_Image_Search` folder (not just the .exe — it needs the files
 PyInstaller collects alongside it) and send that to anyone; they can run
 it on Windows without installing Python.
 
