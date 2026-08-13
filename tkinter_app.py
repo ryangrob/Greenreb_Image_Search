@@ -7,6 +7,7 @@ model has been downloaded once.
 """
 
 import base64
+import concurrent.futures
 import datetime
 import json
 import os
@@ -66,6 +67,7 @@ def _log_reuse(line):
 
 THUMB_SIZE = (128, 128)
 GRID_COLUMNS = 5
+DOWNLOAD_WORKERS = 8
 DEFAULT_TOP_K = 50
 
 BG_COLOR = "#0d1b2a"
@@ -417,8 +419,7 @@ class ImageSearchApp:
             local_items.pop(item_id, None)
 
         reused_count = 0
-        reembedded_count = 0
-        mismatch_samples = []
+        to_download = []  # (item, thumb_path) pairs needing the full pipeline
 
         for item in changed_items:
             item_id = item["id"]
@@ -432,30 +433,45 @@ class ImageSearchApp:
                 if not os.path.exists(thumb_path) and existing.get("thumbnail_b64"):
                     with open(thumb_path, "wb") as f:
                         f.write(base64.b64decode(existing["thumbnail_b64"]))
+                self.event_queue.put(("sp_item_done",))
             else:
-                reembedded_count += 1
-                if len(mismatch_samples) < 3:
-                    mismatch_samples.append(
-                        f"{item['name']}: found={existing is not None}, "
-                        f"cached_etag={existing.get('etag') if existing else None!r}, "
-                        f"current_etag={etag!r}"
-                    )
-                self.event_queue.put(("status", f"Indexing {item['name']}..."))
-                try:
-                    if not self.sp_client.download_thumbnail(item, thumb_path):
-                        raise RuntimeError("no thumbnail available")
-                    emb = self.engine.embed_image_file(thumb_path)
-                    with open(thumb_path, "rb") as f:
-                        thumb_b64 = base64.b64encode(f.read()).decode("ascii")
-                    local_items[item_id] = {
-                        "name": item["name"],
-                        "etag": etag,
-                        "embedding": emb.tolist(),
-                        "thumbnail_b64": thumb_b64,
-                    }
-                except Exception as exc:
-                    self.event_queue.put(("status", f"Skipped {item['name']}: {exc}"))
-            self.event_queue.put(("sp_item_done",))
+                to_download.append((item, thumb_path))
+
+        # Downloading a thumbnail is pure network I/O - overlapping several
+        # at once hides Graph's per-request latency behind the CPU-bound
+        # CLIP embed of whichever item downloaded first, instead of paying
+        # network latency + inference time back-to-back per image. The
+        # embed itself stays sequential in this thread: PyTorch's CPU ops
+        # already use multiple cores per call, so running several embeds
+        # concurrently would mostly just contend with itself.
+        reembedded_count = 0
+        if to_download:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+                future_to_item = {
+                    pool.submit(self.sp_client.download_thumbnail, item, thumb_path): (item, thumb_path)
+                    for item, thumb_path in to_download
+                }
+                for future in concurrent.futures.as_completed(future_to_item):
+                    item, thumb_path = future_to_item[future]
+                    item_id = item["id"]
+                    etag = item.get("eTag")
+                    try:
+                        if not future.result():
+                            raise RuntimeError("no thumbnail available")
+                        self.event_queue.put(("status", f"Indexing {item['name']}..."))
+                        emb = self.engine.embed_image_file(thumb_path)
+                        with open(thumb_path, "rb") as f:
+                            thumb_b64 = base64.b64encode(f.read()).decode("ascii")
+                        local_items[item_id] = {
+                            "name": item["name"],
+                            "etag": etag,
+                            "embedding": emb.tolist(),
+                            "thumbnail_b64": thumb_b64,
+                        }
+                        reembedded_count += 1
+                    except Exception as exc:
+                        self.event_queue.put(("status", f"Skipped {item['name']}: {exc}"))
+                    self.event_queue.put(("sp_item_done",))
 
         if changed_items:
             _log_reuse(
@@ -463,8 +479,6 @@ class ImageSearchApp:
                 f"had_remote_index={bool(remote_items)} remote_error={remote_index_error!r} "
                 f"total={len(changed_items)} reused={reused_count} reembedded={reembedded_count}"
             )
-            for sample in mismatch_samples:
-                _log_reuse(f"  mismatch sample: {sample}")
 
         data = {"model": MODEL_TAG, "items": local_items}
         with open(local_index_path, "w", encoding="utf-8") as f:

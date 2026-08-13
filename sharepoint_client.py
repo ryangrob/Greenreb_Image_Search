@@ -3,6 +3,7 @@ document library, using interactive user sign-in (no client secret)."""
 
 import json
 import os
+import threading
 import urllib.parse
 
 import requests
@@ -43,6 +44,10 @@ class SharePointClient:
         self._token = None
         self._site_id = None
         self._drive_id = None
+        # Thumbnail downloads happen concurrently from a thread pool (see
+        # tkinter_app._apply_folder_changes) - MSAL's token acquisition/cache
+        # save isn't documented as thread-safe, so serialize it.
+        self._token_lock = threading.Lock()
 
     def _save_cache(self):
         if self._cache.has_state_changed:
@@ -68,13 +73,14 @@ class SharePointClient:
         # simply coming back to the app later) can easily outlast that, so
         # silently refresh via MSAL's cached refresh token before every call
         # instead of relying on the token captured once at sign_in().
-        accounts = self._app.get_accounts()
-        if accounts:
-            result = self._app.acquire_token_silent(SCOPES, account=accounts[0])
-            if result and "access_token" in result:
-                self._token = result["access_token"]
-                self._save_cache()
-        return {"Authorization": f"Bearer {self._token}"}
+        with self._token_lock:
+            accounts = self._app.get_accounts()
+            if accounts:
+                result = self._app.acquire_token_silent(SCOPES, account=accounts[0])
+                if result and "access_token" in result:
+                    self._token = result["access_token"]
+                    self._save_cache()
+            return {"Authorization": f"Bearer {self._token}"}
 
     def _get(self, url):
         resp = requests.get(url, headers=self._headers(), timeout=30)
@@ -97,8 +103,14 @@ class SharePointClient:
     @staticmethod
     def is_wanted_image(item):
         """Extension-based check (not mimeType) so formats like .dng never
-        get picked up regardless of how Graph classifies them."""
+        get picked up regardless of how Graph classifies them. Also skips
+        macOS AppleDouble sidecar files (e.g. "._DSC1234.JPG") - tiny hidden
+        metadata files macOS creates alongside real photos when copying to
+        non-Mac storage, which otherwise pass the extension check and get
+        wastefully "indexed" as if they were real images."""
         name = item.get("name", "")
+        if name.startswith("._"):
+            return False
         ext = name[name.rfind(".") :].lower() if "." in name else ""
         return ext in IMAGE_EXTENSIONS
 
