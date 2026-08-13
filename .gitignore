@@ -17,3 +17,6 @@ __pycache__/
 
 # Editor / tool local state
 .claude/
+
+# Packaged builds staged for GitHub Releases (uploaded via gh release, not committed)
+/release_upload/

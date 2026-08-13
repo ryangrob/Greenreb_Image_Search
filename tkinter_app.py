@@ -35,6 +35,9 @@ from sharepoint_client import DeltaExpired, SharePointClient
 CRASH_LOG_PATH = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "crash.log"
 )
+REUSE_LOG_PATH = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "reuse_debug.log"
+)
 
 
 def _log_crash(context, exc_info):
@@ -46,6 +49,17 @@ def _log_crash(context, exc_info):
         with open(CRASH_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(f"\n--- {datetime.datetime.now().isoformat()} [{context}] ---\n")
             f.write("".join(traceback.format_exception(*exc_info)))
+    except OSError:
+        pass
+
+
+def _log_reuse(line):
+    """Temporary diagnostic log for tracking down why the SharePoint
+    per-folder cache/shared-index reuse check does or doesn't hit."""
+    try:
+        os.makedirs(os.path.dirname(REUSE_LOG_PATH), exist_ok=True)
+        with open(REUSE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now().isoformat()} {line}\n")
     except OSError:
         pass
 
@@ -388,16 +402,23 @@ class ImageSearchApp:
             except (json.JSONDecodeError, OSError):
                 local_items = {}
 
+        had_local_cache = len(local_items) > 0
         remote_items = {}
+        remote_index_error = None
         if changed_items:
             try:
                 remote_index = self.sp_client.download_index_file(folder_id)
                 remote_items = (remote_index or {}).get("items", {})
             except Exception as exc:
+                remote_index_error = str(exc)
                 self.event_queue.put(("status", f"Couldn't read shared index: {exc}"))
 
         for item_id in deleted_ids:
             local_items.pop(item_id, None)
+
+        reused_count = 0
+        reembedded_count = 0
+        mismatch_samples = []
 
         for item in changed_items:
             item_id = item["id"]
@@ -406,11 +427,19 @@ class ImageSearchApp:
             existing = local_items.get(item_id) or remote_items.get(item_id)
 
             if existing and existing.get("etag") == etag:
+                reused_count += 1
                 local_items[item_id] = existing
                 if not os.path.exists(thumb_path) and existing.get("thumbnail_b64"):
                     with open(thumb_path, "wb") as f:
                         f.write(base64.b64decode(existing["thumbnail_b64"]))
             else:
+                reembedded_count += 1
+                if len(mismatch_samples) < 3:
+                    mismatch_samples.append(
+                        f"{item['name']}: found={existing is not None}, "
+                        f"cached_etag={existing.get('etag') if existing else None!r}, "
+                        f"current_etag={etag!r}"
+                    )
                 self.event_queue.put(("status", f"Indexing {item['name']}..."))
                 try:
                     if not self.sp_client.download_thumbnail(item, thumb_path):
@@ -427,6 +456,15 @@ class ImageSearchApp:
                 except Exception as exc:
                     self.event_queue.put(("status", f"Skipped {item['name']}: {exc}"))
             self.event_queue.put(("sp_item_done",))
+
+        if changed_items:
+            _log_reuse(
+                f"folder={folder_id} had_local_cache={had_local_cache} "
+                f"had_remote_index={bool(remote_items)} remote_error={remote_index_error!r} "
+                f"total={len(changed_items)} reused={reused_count} reembedded={reembedded_count}"
+            )
+            for sample in mismatch_samples:
+                _log_reuse(f"  mismatch sample: {sample}")
 
         data = {"model": MODEL_TAG, "items": local_items}
         with open(local_index_path, "w", encoding="utf-8") as f:
@@ -549,6 +587,12 @@ class ImageSearchApp:
                 ]
                 count = self.engine.load_sp_items(sp_items)
 
+                _log_reuse(
+                    f"RUN COMPLETE: delta_link_was={'set' if delta_link else 'None (full listing)'} "
+                    f"new_delta_link={'received' if new_delta_link else 'MISSING'} "
+                    f"raw_items={len(raw_items)} affected_folders={len(affected_folders)} "
+                    f"item_folder_map_size={len(item_folder_map)} final_searchable_count={count}"
+                )
                 if new_delta_link:
                     with open(delta_link_path, "w", encoding="utf-8") as f:
                         f.write(new_delta_link)
