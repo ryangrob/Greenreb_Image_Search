@@ -7,12 +7,14 @@ model has been downloaded once.
 """
 
 import base64
+import datetime
 import json
 import os
 import queue
 import subprocess
 import sys
 import threading
+import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -29,6 +31,24 @@ from PIL import Image, ImageTk
 
 from search_engine import ImageSearchEngine, MODEL_TAG
 from sharepoint_client import DeltaExpired, SharePointClient
+
+CRASH_LOG_PATH = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "crash.log"
+)
+
+
+def _log_crash(context, exc_info):
+    """Appends a timestamped traceback to crash.log - so an unexpected failure
+    (e.g. during a long SharePoint indexing run) leaves evidence behind
+    instead of the app just silently disappearing."""
+    try:
+        os.makedirs(os.path.dirname(CRASH_LOG_PATH), exist_ok=True)
+        with open(CRASH_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"\n--- {datetime.datetime.now().isoformat()} [{context}] ---\n")
+            f.write("".join(traceback.format_exception(*exc_info)))
+    except OSError:
+        pass
+
 
 THUMB_SIZE = (128, 128)
 GRID_COLUMNS = 5
@@ -287,7 +307,18 @@ class ImageSearchApp:
         self._run_in_background(work)
 
     def _run_in_background(self, fn):
-        self.worker_thread = threading.Thread(target=fn, daemon=True)
+        def guarded():
+            try:
+                fn()
+            except Exception:
+                # Every current work() already has its own try/except that
+                # routes failures to the "error" event - this is a backstop
+                # so a future/unexpected failure still leaves a traceback in
+                # crash.log instead of the thread just dying silently.
+                _log_crash("background thread", sys.exc_info())
+                raise
+
+        self.worker_thread = threading.Thread(target=guarded, daemon=True)
         self.worker_thread.start()
 
     def _set_busy(self, busy):
@@ -489,14 +520,23 @@ class ImageSearchApp:
                         indexes_dir,
                     )
 
+                # Only name+embedding are needed to build the searchable index below -
+                # discard each folder's thumbnail_b64 data (the bulk of its JSON) right
+                # after parsing instead of retaining all ~33k images' worth of it in
+                # memory at once alongside the CLIP model.
                 all_entries = {}
                 for folder_id in set(item_folder_map.values()):
                     path = os.path.join(indexes_dir, f"{folder_id}.json")
                     if os.path.exists(path):
                         try:
                             with open(path, "r", encoding="utf-8") as f:
-                                all_entries.update(json.load(f).get("items", {}))
-                        except (json.JSONDecodeError, OSError):
+                                folder_items = json.load(f).get("items", {})
+                            for item_id, entry in folder_items.items():
+                                all_entries[item_id] = {
+                                    "name": entry["name"],
+                                    "embedding": entry["embedding"],
+                                }
+                        except (json.JSONDecodeError, OSError, KeyError):
                             pass
 
                 sp_items = [
@@ -517,6 +557,7 @@ class ImageSearchApp:
 
                 self.event_queue.put(("sp_index_done", count, len(affected_folders)))
             except Exception as exc:
+                _log_crash("SharePoint indexing", sys.exc_info())
                 self.event_queue.put(("error", str(exc)))
 
         self._run_in_background(work)
@@ -675,14 +716,23 @@ def _apply_theme(root):
     style.map("Vertical.TScrollbar", background=[("active", ACCENT_ACTIVE)])
 
 
+def _thread_excepthook(args):
+    _log_crash("unhandled thread exception", (args.exc_type, args.exc_value, args.exc_traceback))
+
+
 def main():
+    threading.excepthook = _thread_excepthook
     root = tk.Tk()
     try:
         _apply_theme(root)
     except Exception:
         pass
     ImageSearchApp(root)
-    root.mainloop()
+    try:
+        root.mainloop()
+    except Exception:
+        _log_crash("mainloop", sys.exc_info())
+        raise
 
 
 if __name__ == "__main__":

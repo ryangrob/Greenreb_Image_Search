@@ -103,3 +103,10 @@ signing in to Microsoft 365 and the SharePoint indexing itself.
 - **SharePoint search finds nothing / wrong folder:** the folder tree that
   gets indexed is set by `SHAREPOINT_SEARCH_ROOT_PATH` in `config.py`.
   Update it if the target folder path in SharePoint changes.
+- **App closes/crashes unexpectedly during a long SharePoint indexing run:**
+  check `%LOCALAPPDATA%\ImageSearch\crash.log` — any caught exception
+  (including ones that only ever showed as a generic error dialog) is
+  appended there with a full traceback, which is the fastest way to find the
+  actual cause. If that file has no new entry at all after a crash, the
+  failure happened below Python (e.g. the OS killing the process for using
+  too much memory) rather than something Python itself could catch.
