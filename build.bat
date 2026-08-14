@@ -16,6 +16,7 @@ py -m PyInstaller --noconfirm --onedir --windowed --name Greenreb_Image_Search ^
     --collect-all msal ^
     --add-data "model_cache;model_cache" ^
     --add-data "assets;assets" ^
+    --version-file "version_info.txt" ^
     tkinter_app.py
 
 REM Strip bundled third-party license text (torch's kineto/dynolog trees in
