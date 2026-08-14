@@ -17,7 +17,7 @@ import sys
 import threading
 import traceback
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
 
 # When running as a bundled .exe (PyInstaller --onedir), redirect the CLIP
 # model's cache to the copy bundled alongside the exe (see build.bat /
@@ -27,8 +27,9 @@ from tkinter import filedialog, messagebox, ttk
 if getattr(sys, "frozen", False):
     os.environ["HF_HOME"] = os.path.join(sys._MEIPASS, "model_cache")
 
+import customtkinter as ctk
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image
 
 from search_engine import ImageSearchEngine, MODEL_TAG
 from sharepoint_client import DeltaExpired, SharePointClient
@@ -74,11 +75,12 @@ BG_COLOR = "#0d1b2a"
 CARD_COLOR = "#0a141f"
 ACCENT_COLOR = "#0b4c8c"
 ACCENT_ACTIVE = "#004fff"
-ACCENT_DISABLED = "#33404c"
 FIELD_BG = "#0a141f"
 TEXT_COLOR = "#eef3fa"
 MUTED_TEXT_COLOR = "#8fa3b8"
-DISABLED_TEXT_COLOR = "#5c6b7a"
+
+CARD_RADIUS = 14
+BUTTON_RADIUS = 17
 
 LOGO_HEIGHT = 32
 
@@ -94,70 +96,10 @@ def _load_logo_image(height=LOGO_HEIGHT):
     try:
         img = Image.open(_resource_path("assets", "logo.png")).convert("RGBA")
         ratio = height / img.height
-        img = img.resize((max(1, round(img.width * ratio)), height), Image.LANCZOS)
-        return ImageTk.PhotoImage(img)
+        width = max(1, round(img.width * ratio))
+        return ctk.CTkImage(light_image=img, dark_image=img, size=(width, height))
     except Exception:
         return None
-
-
-class RoundedButton(tk.Canvas):
-    """A pill-shaped button - ttk has no border-radius support, so this
-    draws its own rounded rect on a Canvas instead."""
-
-    def __init__(self, parent, text, command, width=140, height=34, radius=17, font=None,
-                 canvas_bg=CARD_COLOR):
-        super().__init__(
-            parent, width=width, height=height, background=canvas_bg,
-            highlightthickness=0, cursor="hand2",
-        )
-        self._command = command
-        self._width = width
-        self._height = height
-        self._radius = radius
-        self._text = text
-        self._font = font or ("Segoe UI", 10, "bold")
-        self._enabled = True
-        self._draw(ACCENT_COLOR, TEXT_COLOR)
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
-        self.bind("<Button-1>", self._on_click)
-
-    @staticmethod
-    def _round_rect_points(x1, y1, x2, y2, r):
-        return [
-            x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
-            x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
-            x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
-        ]
-
-    def _draw(self, fill, textfill):
-        self.delete("all")
-        points = self._round_rect_points(1, 1, self._width - 1, self._height - 1, self._radius)
-        self.create_polygon(points, smooth=True, fill=fill, outline=fill)
-        self.create_text(
-            self._width / 2, self._height / 2, text=self._text, fill=textfill, font=self._font
-        )
-
-    def _on_enter(self, _e):
-        if self._enabled:
-            self._draw(ACCENT_ACTIVE, TEXT_COLOR)
-
-    def _on_leave(self, _e):
-        if self._enabled:
-            self._draw(ACCENT_COLOR, TEXT_COLOR)
-
-    def _on_click(self, _e):
-        if self._enabled and self._command:
-            self._command()
-
-    def config_state(self, enabled):
-        self._enabled = enabled
-        if enabled:
-            self.configure(cursor="hand2")
-            self._draw(ACCENT_COLOR, TEXT_COLOR)
-        else:
-            self.configure(cursor="arrow")
-            self._draw(ACCENT_DISABLED, DISABLED_TEXT_COLOR)
 
 
 def open_in_system_viewer(path):
@@ -167,6 +109,21 @@ def open_in_system_viewer(path):
         subprocess.Popen(["open", path])
     else:
         subprocess.Popen(["xdg-open", path])
+
+
+def _make_button(parent, text, command, width=140):
+    return ctk.CTkButton(
+        parent,
+        text=text,
+        command=command,
+        width=width,
+        height=34,
+        corner_radius=BUTTON_RADIUS,
+        fg_color=ACCENT_COLOR,
+        hover_color=ACCENT_ACTIVE,
+        text_color=TEXT_COLOR,
+        font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+    )
 
 
 class ImageSearchApp:
@@ -184,7 +141,7 @@ class ImageSearchApp:
         self.event_queue = queue.Queue()
         self.worker_thread = None
         self.cancel_requested = False
-        self.thumbnail_refs = []  # keep PhotoImage refs alive
+        self.thumbnail_refs = []  # keep CTkImage refs alive
 
         self._build_widgets()
         self.root.after(100, self._poll_queue)
@@ -192,70 +149,64 @@ class ImageSearchApp:
     # ---------- UI construction ----------
 
     def _build_widgets(self):
-        header = ttk.Frame(self.root, padding=(8, 8, 8, 0))
-        header.pack(fill=tk.X)
-        self._logo_photo = _load_logo_image()
-        if self._logo_photo:
-            ttk.Label(header, image=self._logo_photo).pack(side=tk.LEFT)
+        header = ctk.CTkFrame(self.root, fg_color="transparent")
+        header.pack(fill=tk.X, padx=12, pady=(12, 0))
+        self._logo_image = _load_logo_image()
+        if self._logo_image:
+            ctk.CTkLabel(header, image=self._logo_image, text="").pack(side=tk.LEFT)
 
-        top = ttk.Frame(self.root, style="Card.TFrame", padding=8)
-        top.pack(fill=tk.X, padx=8, pady=8)
+        top = ctk.CTkFrame(self.root, fg_color=CARD_COLOR, corner_radius=CARD_RADIUS)
+        top.pack(fill=tk.X, padx=12, pady=12)
 
         self.folder_var = tk.StringVar(value="No folder selected")
-        RoundedButton(top, "Choose Folder...", self._choose_folder, width=150).pack(
-            side=tk.LEFT
+        _make_button(top, "Choose Folder...", self._choose_folder, width=150).pack(
+            side=tk.LEFT, padx=(14, 8), pady=14
         )
-        ttk.Label(top, textvariable=self.folder_var, width=50, style="Card.TLabel").pack(
-            side=tk.LEFT, padx=8
-        )
-        self.index_button = RoundedButton(top, "Index Folder", self._start_indexing, width=130)
-        self.index_button.pack(side=tk.LEFT, padx=4)
-        self.index_button.config_state(False)
-        self.sharepoint_button = RoundedButton(
+        ctk.CTkLabel(
+            top, textvariable=self.folder_var, width=340, anchor="w",
+            text_color=MUTED_TEXT_COLOR,
+        ).pack(side=tk.LEFT, padx=8, pady=14)
+        self.index_button = _make_button(top, "Index Folder", self._start_indexing, width=130)
+        self.index_button.pack(side=tk.LEFT, padx=4, pady=14)
+        self.index_button.configure(state=tk.DISABLED)
+        self.sharepoint_button = _make_button(
             top, "Search Marketing Photos", self._browse_sharepoint, width=190
         )
-        self.sharepoint_button.pack(side=tk.LEFT, padx=4)
+        self.sharepoint_button.pack(side=tk.LEFT, padx=(4, 14), pady=14)
 
-        search_frame = ttk.Frame(self.root, style="Card.TFrame", padding=8)
-        search_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+        search_frame = ctk.CTkFrame(self.root, fg_color=CARD_COLOR, corner_radius=CARD_RADIUS)
+        search_frame.pack(fill=tk.X, padx=12, pady=(0, 12))
 
         self.query_var = tk.StringVar()
-        query_entry = ttk.Entry(search_frame, textvariable=self.query_var)
-        query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        query_entry = ctk.CTkEntry(
+            search_frame, textvariable=self.query_var, fg_color=FIELD_BG,
+            text_color=TEXT_COLOR, border_width=0, corner_radius=10,
+        )
+        query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(14, 8), pady=14)
         query_entry.bind("<Return>", lambda _e: self._start_text_search())
 
-        self.search_button = RoundedButton(
+        self.search_button = _make_button(
             search_frame, "Search", self._start_text_search, width=100
         )
-        self.search_button.pack(side=tk.LEFT, padx=(8, 0))
-        self.search_button.config_state(False)
+        self.search_button.pack(side=tk.LEFT, padx=(0, 14), pady=14)
+        self.search_button.configure(state=tk.DISABLED)
 
-        status_frame = ttk.Frame(self.root, padding=(8, 0, 8, 4))
-        status_frame.pack(fill=tk.X)
+        status_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        status_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
         self.status_var = tk.StringVar(value="Choose a folder to begin.")
-        ttk.Label(status_frame, textvariable=self.status_var).pack(side=tk.LEFT)
-        self.progress = ttk.Progressbar(status_frame, mode="determinate", length=200)
+        ctk.CTkLabel(
+            status_frame, textvariable=self.status_var, text_color=TEXT_COLOR, anchor="w",
+        ).pack(side=tk.LEFT)
+        self.progress = ctk.CTkProgressBar(
+            status_frame, width=200, fg_color=FIELD_BG, progress_color=ACCENT_COLOR,
+        )
+        self.progress.set(0)
         self.progress.pack(side=tk.RIGHT)
 
-        # Scrollable results grid
-        results_container = ttk.Frame(self.root)
-        results_container.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
-
-        canvas = tk.Canvas(results_container, highlightthickness=0, background=BG_COLOR)
-        scrollbar = ttk.Scrollbar(results_container, orient=tk.VERTICAL, command=canvas.yview)
-        self.results_frame = ttk.Frame(canvas)
-        self.results_frame.bind(
-            "<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        canvas.create_window((0, 0), window=self.results_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        # Scrollable results grid - CTkScrollableFrame already handles its
+        # own internal canvas, scrollbar, and mousewheel binding.
+        self.results_frame = ctk.CTkScrollableFrame(self.root, fg_color=BG_COLOR)
+        self.results_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
     # ---------- folder selection & indexing ----------
 
@@ -265,7 +216,7 @@ class ImageSearchApp:
             return
         self._sp_mode_active = False
         self.folder_var.set(folder)
-        self.index_button.config_state(True)
+        self.index_button.configure(state=tk.NORMAL)
 
         count = self.engine.load_cached_index(folder)
         self._update_search_buttons_state()
@@ -279,8 +230,8 @@ class ImageSearchApp:
         if not os.path.isdir(folder):
             return
         self._set_busy(True)
-        self.progress.config(mode="indeterminate")
-        self.progress.start(10)
+        self.progress.configure(mode="indeterminate")
+        self.progress.start()
 
         def work():
             def on_progress(done, total):
@@ -307,8 +258,8 @@ class ImageSearchApp:
             messagebox.showinfo("Image Search", "Index the folder first before searching.")
             return
         self._set_busy(True)
-        self.progress.config(mode="indeterminate")
-        self.progress.start(10)
+        self.progress.configure(mode="indeterminate")
+        self.progress.start()
 
         def work():
             def on_status(msg):
@@ -341,16 +292,18 @@ class ImageSearchApp:
         # "Index Folder" re-runs local-folder indexing, which doesn't apply
         # in SharePoint mode (that index is already built via the shared
         # thumbnail sync) - keep it disabled while SharePoint mode is active.
-        self.index_button.config_state(not busy and not self._sp_mode_active)
-        self.sharepoint_button.config_state(not busy)
+        self.index_button.configure(
+            state=tk.NORMAL if (not busy and not self._sp_mode_active) else tk.DISABLED
+        )
+        self.sharepoint_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
         if busy:
-            self.search_button.config_state(False)
+            self.search_button.configure(state=tk.DISABLED)
         else:
             self._update_search_buttons_state()
 
     def _update_search_buttons_state(self):
         has_index = self.engine.embeddings is not None and len(self.engine.paths) > 0
-        self.search_button.config_state(has_index)
+        self.search_button.configure(state=tk.NORMAL if has_index else tk.DISABLED)
 
     # ---------- SharePoint browsing ----------
 
@@ -518,8 +471,8 @@ class ImageSearchApp:
 
         self._sp_mode_active = True
         self._set_busy(True)
-        self.progress.config(mode="indeterminate")
-        self.progress.start(10)
+        self.progress.configure(mode="indeterminate")
+        self.progress.start()
 
         def work():
             try:
@@ -690,18 +643,19 @@ class ImageSearchApp:
                 if kind == "progress":
                     _, done, total = event
                     self.progress.stop()
-                    self.progress.config(mode="determinate", maximum=max(total, 1), value=done)
+                    self.progress.configure(mode="determinate")
+                    self.progress.set(done / max(total, 1))
                     self.status_var.set(f"Indexing... {done}/{total}")
                 elif kind == "status":
                     self.status_var.set(event[1])
                 elif kind == "index_done":
                     self.progress.stop()
-                    self.progress.config(value=0)
+                    self.progress.set(0)
                     self._set_busy(False)
                     self.status_var.set(f"Indexed {event[1]} images. Ready to search.")
                 elif kind == "search_done":
                     self.progress.stop()
-                    self.progress.config(value=0)
+                    self.progress.set(0)
                     self._set_busy(False)
                     self._render_results(event[1])
                     self.status_var.set(f"Found {len(event[1])} results.")
@@ -712,17 +666,18 @@ class ImageSearchApp:
                     self._sp_total_images = event[1]
                     self._sp_done_images = 0
                     self.progress.stop()
-                    self.progress.config(mode="determinate", maximum=max(event[1], 1), value=0)
+                    self.progress.configure(mode="determinate")
+                    self.progress.set(0)
                 elif kind == "sp_item_done":
                     self._sp_done_images += 1
-                    self.progress.config(value=self._sp_done_images)
+                    self.progress.set(self._sp_done_images / max(self._sp_total_images, 1))
                     self.status_var.set(
                         f"Indexing from SharePoint... {self._sp_done_images}/{self._sp_total_images}"
                     )
                 elif kind == "sp_index_done":
                     _, count, changed_folder_count, failed_count = event
                     self.progress.stop()
-                    self.progress.config(value=0)
+                    self.progress.set(0)
                     self.folder_var.set("SharePoint: Fotos & Videos (all subfolders)")
                     self._set_busy(False)
                     retry_note = (
@@ -747,7 +702,7 @@ class ImageSearchApp:
                     open_in_system_viewer(event[1])
                 elif kind == "error":
                     self.progress.stop()
-                    self.progress.config(value=0)
+                    self.progress.set(0)
                     self._set_busy(False)
                     self.status_var.set("Error.")
                     messagebox.showerror("Image Search", event[1])
@@ -764,18 +719,18 @@ class ImageSearchApp:
 
         for idx, (path, score, meta) in enumerate(results):
             row, col = divmod(idx, GRID_COLUMNS)
-            cell = ttk.Frame(self.results_frame, padding=4)
-            cell.grid(row=row, column=col, sticky="n")
+            cell = ctk.CTkFrame(self.results_frame, fg_color="transparent")
+            cell.grid(row=row, column=col, sticky="n", padx=4, pady=4)
 
             try:
                 img = Image.open(path)
                 img.thumbnail(THUMB_SIZE)
-                photo = ImageTk.PhotoImage(img)
+                photo = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
             except Exception:
                 continue
             self.thumbnail_refs.append(photo)
 
-            label = ttk.Label(cell, image=photo, cursor="hand2")
+            label = ctk.CTkLabel(cell, image=photo, text="", cursor="hand2")
             label.pack()
             if meta is None:
                 label.bind("<Double-Button-1>", lambda _e, p=path: open_in_system_viewer(p))
@@ -786,39 +741,10 @@ class ImageSearchApp:
                 )
 
             caption = f"{os.path.basename(path)}\n{score * 100:.1f}%"
-            ttk.Label(cell, text=caption, justify=tk.CENTER, wraplength=THUMB_SIZE[0]).pack()
-
-
-def _apply_theme(root):
-    root.configure(background=BG_COLOR)
-    style = ttk.Style()
-    style.theme_use("clam")
-
-    style.configure("TFrame", background=BG_COLOR)
-    style.configure("TLabel", background=BG_COLOR, foreground=TEXT_COLOR)
-    style.configure("Card.TFrame", background=CARD_COLOR)
-    style.configure("Card.TLabel", background=CARD_COLOR, foreground=MUTED_TEXT_COLOR)
-    style.configure(
-        "TEntry",
-        fieldbackground=FIELD_BG,
-        foreground=TEXT_COLOR,
-        insertcolor=TEXT_COLOR,
-        borderwidth=0,
-    )
-    style.configure(
-        "Horizontal.TProgressbar",
-        background=ACCENT_COLOR,
-        troughcolor=FIELD_BG,
-        borderwidth=0,
-    )
-    style.configure(
-        "Vertical.TScrollbar",
-        background=ACCENT_COLOR,
-        troughcolor=BG_COLOR,
-        arrowcolor=TEXT_COLOR,
-        borderwidth=0,
-    )
-    style.map("Vertical.TScrollbar", background=[("active", ACCENT_ACTIVE)])
+            ctk.CTkLabel(
+                cell, text=caption, justify=tk.CENTER, wraplength=THUMB_SIZE[0],
+                text_color=MUTED_TEXT_COLOR, font=ctk.CTkFont(size=11),
+            ).pack()
 
 
 def _thread_excepthook(args):
@@ -827,9 +753,10 @@ def _thread_excepthook(args):
 
 def main():
     threading.excepthook = _thread_excepthook
-    root = tk.Tk()
+    ctk.set_appearance_mode("dark")
+    root = ctk.CTk()
     try:
-        _apply_theme(root)
+        root.configure(fg_color=BG_COLOR)
     except Exception:
         pass
     ImageSearchApp(root)

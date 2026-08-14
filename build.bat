@@ -14,6 +14,7 @@ py -m PyInstaller --noconfirm --onedir --windowed --name Greenreb_Image_Search ^
     --collect-all torch ^
     --collect-all torchvision ^
     --collect-all msal ^
+    --collect-all customtkinter ^
     --add-data "model_cache;model_cache" ^
     --add-data "assets;assets" ^
     --version-file "version_info.txt" ^
