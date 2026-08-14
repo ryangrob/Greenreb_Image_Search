@@ -163,11 +163,44 @@ class ImageSearchEngine:
         self.embeddings = np.stack(embeddings) if embeddings else np.zeros((0, 512), dtype=np.float32)
         return len(self.paths)
 
-    def _rank(self, query_emb, top_k):
+    def _rank(self, query_emb, top_k, diversity=0.3):
+        """Ranks by relevance to query_emb, then greedily re-orders using
+        Maximal Marginal Relevance so near-duplicate photos of the same
+        subject (which score almost identically) don't crowd out variety -
+        each pick is penalized by its similarity to already-picked results,
+        not just scored against the query. `diversity` in [0, 1]: 0 is pure
+        relevance ranking (today's old behavior), higher values suppress
+        near-duplicates more aggressively. Displayed scores stay pure
+        query-relevance - only the ordering/selection is diversity-aware.
+        """
         if len(self.paths) == 0:
             return []
         sims = self.embeddings @ query_emb
-        order = np.argsort(-sims)[:top_k]
+
+        # Rank a wider pool by pure relevance first, then diversify just
+        # that pool down to top_k - cheap (a few hundred candidates) and
+        # keeps genuinely irrelevant images from ever being considered.
+        pool_size = min(len(self.paths), max(top_k * 6, 200))
+        pool_order = np.argsort(-sims)[:pool_size]
+        pool_embs = self.embeddings[pool_order]
+        pool_sims = sims[pool_order]
+
+        n = len(pool_order)
+        k = min(top_k, n)
+        selected = []
+        max_sim_to_selected = np.full(n, -1.0, dtype=np.float32)
+        remaining = np.ones(n, dtype=bool)
+
+        for _ in range(k):
+            mmr_scores = (1 - diversity) * pool_sims - diversity * max_sim_to_selected
+            mmr_scores[~remaining] = -np.inf
+            best = int(np.argmax(mmr_scores))
+            selected.append(best)
+            remaining[best] = False
+            sim_to_new = pool_embs @ pool_embs[best]
+            max_sim_to_selected = np.maximum(max_sim_to_selected, sim_to_new)
+
+        order = pool_order[selected]
         return [(self.paths[i], float(sims[i]), self.meta[i]) for i in order]
 
     def search_text(self, text, top_k=24, status_callback=None):
