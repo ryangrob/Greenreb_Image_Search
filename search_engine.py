@@ -18,6 +18,9 @@ CACHE_FILENAME = ".imagesearch_cache.json"
 # different photos of the same subject cluster around 0.65-0.80, while true
 # near-duplicates exceed 0.92. Set to 1.0 to disable demotion entirely.
 NEAR_DUPLICATE_THRESHOLD = 0.92
+# Caption-shaped phrasings a query is averaged over (see embed_query). The
+# bare "{}" keeps the result anchored to the literal query.
+QUERY_TEMPLATES = ("a photo of {}", "a picture of {}", "{}")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff"}
 
 
@@ -125,6 +128,24 @@ class ImageSearchEngine:
             feat = self.model.encode_text(tokens)
             feat = feat / feat.norm(dim=-1, keepdim=True)
         return feat.squeeze(0).cpu().numpy()
+
+    def embed_query(self, text):
+        """Embeds a search query as an average over several caption-shaped
+        phrasings rather than the bare words.
+
+        CLIP was trained on image captions, so it responds better to text
+        shaped like one ("a photo of beer") than to a bare noun ("beer").
+        Averaging a few templates also damps the effect of any single
+        awkward phrasing. The plain "{}" template stays in the mix so this
+        never strays far from the raw query.
+
+        Query-side only - image embeddings are untouched, so this needs no
+        re-indexing and stays compatible with every existing index.
+        """
+        feats = [self.embed_text(t.format(text)) for t in QUERY_TEMPLATES]
+        avg = np.mean(feats, axis=0)
+        norm = np.linalg.norm(avg)
+        return avg / norm if norm else avg
 
     def build_index(self, folder, progress_callback=None, status_callback=None, cancel_check=None):
         """Scans `folder`, reusing cached embeddings for unchanged files.
@@ -247,5 +268,5 @@ class ImageSearchEngine:
 
     def search_text(self, text, top_k=24, status_callback=None):
         self.load_model(status_callback)
-        query_emb = self.embed_text(text)
+        query_emb = self.embed_query(text)
         return self._rank(query_emb, top_k)
