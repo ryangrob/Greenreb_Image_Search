@@ -759,6 +759,10 @@ def main():
         root.configure(fg_color=BG_COLOR)
     except Exception:
         pass
+    try:
+        root.iconbitmap(_resource_path("assets", "app_icon.ico"))
+    except Exception:
+        pass
     ImageSearchApp(root)
     try:
         root.mainloop()
