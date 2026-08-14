@@ -15,6 +15,11 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SCOPES = ["Sites.Read.All", "Files.ReadWrite.All"]
 INDEX_FILENAME = ".imagesearch_sp_index.json"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+# Payloads at/above this go through a resumable upload session rather than a
+# simple PUT. Graph's chunked uploads require each chunk (except the last) to
+# be a multiple of 320 KiB.
+SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024
+UPLOAD_CHUNK_SIZE = 16 * 320 * 1024  # 5 MiB
 TOKEN_CACHE_PATH = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "msal_cache.bin"
 )
@@ -232,13 +237,20 @@ class SharePointClient:
     def upload_index_file(self, folder_item_id, data):
         """Uploads (creates/overwrites) the shared index file into a folder.
 
-        Uses the simple-upload PUT, which caps at 4MB - fine for base64'd
-        thumbnails at this scale, but would need the resumable upload-session
-        API if a folder's index ever grows past that.
+        Small payloads go via the simple-upload PUT; anything at/over
+        SIMPLE_UPLOAD_LIMIT uses Graph's resumable upload-session API
+        instead. A folder with a few hundred photos easily exceeds the
+        simple-upload ceiling once base64'd thumbnails are included, and
+        when that upload fails the folder's index never reaches SharePoint
+        at all - so every other user re-embeds that whole folder from
+        scratch, defeating the point of the shared index.
         """
         self._resolve_site_and_drive()
-        url = f"{GRAPH_BASE}/drives/{self._drive_id}/items/{folder_item_id}:/{INDEX_FILENAME}:/content"
         payload = json.dumps(data).encode("utf-8")
+        if len(payload) >= SIMPLE_UPLOAD_LIMIT:
+            return self._upload_index_file_chunked(folder_item_id, payload)
+
+        url = f"{GRAPH_BASE}/drives/{self._drive_id}/items/{folder_item_id}:/{INDEX_FILENAME}:/content"
         resp = requests.put(
             url,
             headers={**self._headers(), "Content-Type": "application/json"},
@@ -247,3 +259,38 @@ class SharePointClient:
         )
         resp.raise_for_status()
         return resp.json()
+
+    def _upload_index_file_chunked(self, folder_item_id, payload):
+        """Uploads a large index via Graph's resumable upload session."""
+        session_url = (
+            f"{GRAPH_BASE}/drives/{self._drive_id}/items/"
+            f"{folder_item_id}:/{INDEX_FILENAME}:/createUploadSession"
+        )
+        resp = requests.post(
+            session_url,
+            headers={**self._headers(), "Content-Type": "application/json"},
+            json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        upload_url = resp.json()["uploadUrl"]
+
+        total = len(payload)
+        start = 0
+        result = {}
+        while start < total:
+            end = min(start + UPLOAD_CHUNK_SIZE, total) - 1
+            chunk = payload[start : end + 1]
+            # The upload URL is already pre-authenticated - deliberately no
+            # Authorization header here (Graph rejects the request if sent).
+            chunk_resp = requests.put(
+                upload_url,
+                headers={"Content-Range": f"bytes {start}-{end}/{total}"},
+                data=chunk,
+                timeout=120,
+            )
+            chunk_resp.raise_for_status()
+            if chunk_resp.status_code in (200, 201) and chunk_resp.content:
+                result = chunk_resp.json()
+            start = end + 1
+        return result

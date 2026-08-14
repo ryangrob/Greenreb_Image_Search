@@ -9,6 +9,7 @@ model has been downloaded once.
 import base64
 import concurrent.futures
 import datetime
+import glob
 import json
 import os
 import queue
@@ -352,8 +353,70 @@ class ImageSearchApp:
             time.sleep(1.5)
             return self.sp_client.download_thumbnail(item, thumb_path)
 
+    def _upload_folder_index(self, folder_id, data, local_index_path, uploaded_ok):
+        """Uploads one folder's shared index, recording success/failure.
+
+        `uploaded_ok` is the set of folder ids known to have reached
+        SharePoint - persisted across runs so a folder whose upload failed
+        can be retried later even though delta will never report it as
+        changed again.
+        """
+        try:
+            self.sp_client.upload_index_file(folder_id, data)
+            uploaded_ok.add(folder_id)
+            return True
+        except Exception as exc:
+            uploaded_ok.discard(folder_id)
+            # Logged, not just flashed in the status bar: a failed upload here
+            # means this folder's work never reaches SharePoint, so every
+            # other user silently re-embeds the whole folder. That's worth
+            # leaving durable evidence of rather than letting it scroll past.
+            try:
+                size_mb = os.path.getsize(local_index_path) / (1024 * 1024)
+            except OSError:
+                size_mb = -1
+            _log_reuse(
+                f"UPLOAD FAILED folder={folder_id} size={size_mb:.2f}MB "
+                f"items={len(data.get('items', {}))} error={exc!r}"
+            )
+            self.event_queue.put(("status", f"Warning: couldn't upload shared index: {exc}"))
+            return False
+
+    def _repair_unuploaded_indexes(self, indexes_dir, uploaded_ok):
+        """Re-uploads any locally-built folder index that never made it to
+        SharePoint.
+
+        Without this, a folder whose upload failed once stays broken
+        permanently: delta only reports genuinely changed folders, so an
+        unchanged-but-never-uploaded folder is never revisited, and every
+        other user keeps re-embedding it from scratch.
+        """
+        pending = []
+        for path in glob.glob(os.path.join(indexes_dir, "*.json")):
+            folder_id = os.path.splitext(os.path.basename(path))[0]
+            if folder_id not in uploaded_ok:
+                pending.append((folder_id, path))
+        if not pending:
+            return 0
+
+        repaired = 0
+        for i, (folder_id, path) in enumerate(pending, 1):
+            self.event_queue.put(
+                ("status", f"Sharing index for folder {i}/{len(pending)} with the team...")
+            )
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            if self._upload_folder_index(folder_id, data, path, uploaded_ok):
+                repaired += 1
+        _log_reuse(f"REPAIR PASS: attempted={len(pending)} succeeded={repaired}")
+        return repaired
+
     def _apply_folder_changes(
-        self, folder_id, changed_items, deleted_ids, thumbs_dir, indexes_dir, failed_items
+        self, folder_id, changed_items, deleted_ids, thumbs_dir, indexes_dir, failed_items,
+        uploaded_ok,
     ):
         """Applies a delta-reported set of adds/updates/deletes to one
         SharePoint folder's shared, thumbnail-based index.
@@ -477,10 +540,7 @@ class ImageSearchApp:
         data = {"model": MODEL_TAG, "items": local_items}
         with open(local_index_path, "w", encoding="utf-8") as f:
             json.dump(data, f)
-        try:
-            self.sp_client.upload_index_file(folder_id, data)
-        except Exception as exc:
-            self.event_queue.put(("status", f"Warning: couldn't upload shared index: {exc}"))
+        self._upload_folder_index(folder_id, data, local_index_path, uploaded_ok)
 
         return local_items
 
@@ -499,6 +559,7 @@ class ImageSearchApp:
         delta_link_path = os.path.join(local_folder, "delta_link.txt")
         folder_map_path = os.path.join(local_folder, "item_folder_map.json")
         pending_retries_path = os.path.join(local_folder, "pending_retries.json")
+        uploaded_ok_path = os.path.join(local_folder, "uploaded_ok.json")
 
         self._sp_mode_active = True
         self._set_busy(True)
@@ -531,6 +592,17 @@ class ImageSearchApp:
                             pending_retries = json.load(f)
                     except (json.JSONDecodeError, OSError):
                         pending_retries = {}
+
+                # Folder ids whose shared index is confirmed to have reached
+                # SharePoint. Anything built locally but missing from here
+                # gets re-uploaded by the repair pass below.
+                uploaded_ok = set()
+                if os.path.exists(uploaded_ok_path):
+                    try:
+                        with open(uploaded_ok_path, "r", encoding="utf-8") as f:
+                            uploaded_ok = set(json.load(f))
+                    except (json.JSONDecodeError, OSError, TypeError):
+                        uploaded_ok = set()
 
                 self.event_queue.put(("status", "Checking SharePoint for changes..."))
                 delta_status = lambda msg: self.event_queue.put(("status", msg))
@@ -593,10 +665,15 @@ class ImageSearchApp:
                         thumbs_dir,
                         indexes_dir,
                         failed_items,
+                        uploaded_ok,
                     )
 
                 with open(pending_retries_path, "w", encoding="utf-8") as f:
                     json.dump(failed_items, f)
+
+                repaired = self._repair_unuploaded_indexes(indexes_dir, uploaded_ok)
+                with open(uploaded_ok_path, "w", encoding="utf-8") as f:
+                    json.dump(sorted(uploaded_ok), f)
 
                 # Only name+embedding are needed to build the searchable index below -
                 # discard each folder's thumbnail_b64 data (the bulk of its JSON) right
@@ -632,7 +709,8 @@ class ImageSearchApp:
                     f"new_delta_link={'received' if new_delta_link else 'MISSING'} "
                     f"raw_items={len(raw_items)} affected_folders={len(affected_folders)} "
                     f"item_folder_map_size={len(item_folder_map)} final_searchable_count={count} "
-                    f"failed_pending_retry={len(failed_items)}"
+                    f"failed_pending_retry={len(failed_items)} shared_indexes_repaired={repaired} "
+                    f"shared_indexes_confirmed={len(uploaded_ok)}"
                 )
                 if new_delta_link:
                     with open(delta_link_path, "w", encoding="utf-8") as f:
