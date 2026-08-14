@@ -114,7 +114,7 @@ class SharePointClient:
         ext = name[name.rfind(".") :].lower() if "." in name else ""
         return ext in IMAGE_EXTENSIONS
 
-    def get_delta_items(self, root_item_id, delta_link=None):
+    def get_delta_items(self, root_item_id, delta_link=None, status_callback=None):
         """Pages through Graph's delta query for a folder subtree.
 
         With delta_link=None, returns every current item (first-run/full
@@ -123,6 +123,10 @@ class SharePointClient:
         (items, new_delta_link) - the caller should persist new_delta_link
         for next time. Raises DeltaExpired if a saved delta_link is no
         longer valid (Graph returns 410 Gone) - retry with delta_link=None.
+
+        Calls status_callback(str) after each page so a full-tree listing
+        (which can take a couple minutes on a large library) shows visible
+        progress instead of looking stuck on "Checking for changes...".
         """
         self._resolve_site_and_drive()
         url = delta_link or f"{GRAPH_BASE}/drives/{self._drive_id}/items/{root_item_id}/delta"
@@ -132,6 +136,8 @@ class SharePointClient:
             while url:
                 data = self._get(url)
                 items.extend(data.get("value", []))
+                if status_callback:
+                    status_callback(f"Checking SharePoint for changes... ({len(items)} items found so far)")
                 url = data.get("@odata.nextLink")
                 if "@odata.deltaLink" in data:
                     new_delta_link = data["@odata.deltaLink"]
@@ -200,12 +206,21 @@ class SharePointClient:
         return True
 
     def download_index_file(self, folder_item_id):
-        """Returns the parsed shared index dict for a folder, or None if not present."""
+        """Returns the parsed shared index dict for a folder, or None if not present.
+
+        Fetches the specific filename directly via Graph's colon-path
+        addressing instead of listing every child in the folder just to
+        find one entry - one API call instead of a full (possibly paged)
+        folder listing, which adds up across hundreds of folders.
+        """
         self._resolve_site_and_drive()
-        children = self.list_children(folder_item_id, by_id=True)
-        entry = next((c for c in children if c.get("name") == INDEX_FILENAME), None)
-        if entry is None:
-            return None
+        url = f"{GRAPH_BASE}/drives/{self._drive_id}/items/{folder_item_id}:/{INDEX_FILENAME}"
+        try:
+            entry = self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
         download_url = entry.get("@microsoft.graph.downloadUrl")
         if not download_url:
             detail = self._get(f"{GRAPH_BASE}/drives/{self._drive_id}/items/{entry['id']}")

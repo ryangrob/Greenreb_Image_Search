@@ -15,6 +15,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -69,6 +70,7 @@ def _log_reuse(line):
 THUMB_SIZE = (128, 128)
 GRID_COLUMNS = 5
 DOWNLOAD_WORKERS = 8
+EMBED_BATCH_SIZE = 16
 DEFAULT_TOP_K = 50
 
 BG_COLOR = "#0d1b2a"
@@ -338,6 +340,18 @@ class ImageSearchApp:
             os.path.join(local_folder, "folder_indexes"),
         )
 
+    def _download_thumbnail_with_retry(self, item, thumb_path):
+        """One quick retry on a transient failure (e.g. a brief network
+        hiccup) before giving up - cuts down how often the pending-retry/
+        next-run mechanism has to be relied on for otherwise-fine
+        connections. Does NOT retry a clean "no thumbnail available" (a
+        return of False) since that isn't a transient error."""
+        try:
+            return self.sp_client.download_thumbnail(item, thumb_path)
+        except Exception:
+            time.sleep(1.5)
+            return self.sp_client.download_thumbnail(item, thumb_path)
+
     def _apply_folder_changes(
         self, folder_id, changed_items, deleted_ids, thumbs_dir, indexes_dir, failed_items
     ):
@@ -407,20 +421,37 @@ class ImageSearchApp:
         # concurrently would mostly just contend with itself.
         reembedded_count = 0
         if to_download:
+            downloaded = []  # (item, thumb_path) that downloaded successfully
             with concurrent.futures.ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
                 future_to_item = {
-                    pool.submit(self.sp_client.download_thumbnail, item, thumb_path): (item, thumb_path)
+                    pool.submit(self._download_thumbnail_with_retry, item, thumb_path): (item, thumb_path)
                     for item, thumb_path in to_download
                 }
                 for future in concurrent.futures.as_completed(future_to_item):
                     item, thumb_path = future_to_item[future]
-                    item_id = item["id"]
-                    etag = item.get("eTag")
                     try:
                         if not future.result():
                             raise RuntimeError("no thumbnail available")
-                        self.event_queue.put(("status", f"Indexing {item['name']}..."))
-                        emb = self.engine.embed_image_file(thumb_path)
+                        downloaded.append((item, thumb_path))
+                    except Exception as exc:
+                        self.event_queue.put(("status", f"Skipped {item['name']}: {exc}"))
+                        failed_items[item["id"]] = item
+                        self.event_queue.put(("sp_item_done",))
+
+            # Batch the actual CLIP embedding - a single forward pass over
+            # several images at once is meaningfully faster per-image on
+            # CPU than embedding one image at a time.
+            for batch_start in range(0, len(downloaded), EMBED_BATCH_SIZE):
+                batch = downloaded[batch_start : batch_start + EMBED_BATCH_SIZE]
+                self.event_queue.put(("status", f"Indexing {len(batch)} image(s)..."))
+                embeddings = self.engine.embed_image_files([tp for _, tp in batch])
+                for item, thumb_path in batch:
+                    item_id = item["id"]
+                    etag = item.get("eTag")
+                    emb = embeddings.get(thumb_path)
+                    try:
+                        if emb is None:
+                            raise RuntimeError("could not read downloaded image")
                         with open(thumb_path, "rb") as f:
                             thumb_b64 = base64.b64encode(f.read()).decode("ascii")
                         local_items[item_id] = {
@@ -502,14 +533,17 @@ class ImageSearchApp:
                         pending_retries = {}
 
                 self.event_queue.put(("status", "Checking SharePoint for changes..."))
+                delta_status = lambda msg: self.event_queue.put(("status", msg))
                 root = self.sp_client.get_search_root_item()
                 try:
                     raw_items, new_delta_link = self.sp_client.get_delta_items(
-                        root["id"], delta_link
+                        root["id"], delta_link, status_callback=delta_status
                     )
                 except DeltaExpired:
                     self.event_queue.put(("status", "Delta expired - doing a full resync..."))
-                    raw_items, new_delta_link = self.sp_client.get_delta_items(root["id"], None)
+                    raw_items, new_delta_link = self.sp_client.get_delta_items(
+                        root["id"], None, status_callback=delta_status
+                    )
 
                 changed_by_folder = {}
                 deleted_ids = []

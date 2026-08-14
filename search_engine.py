@@ -85,6 +85,35 @@ class ImageSearchEngine:
             feat = feat / feat.norm(dim=-1, keepdim=True)
         return feat.squeeze(0).cpu().numpy()
 
+    def embed_image_files(self, paths):
+        """Batch version of embed_image_file - runs one forward pass for
+        several images at once, which is meaningfully faster per-image on
+        CPU than embedding one at a time (better utilizes vectorized/
+        multi-core execution than many tiny batch-of-1 calls).
+
+        Each image is opened/preprocessed individually first so one corrupt
+        file doesn't fail the whole batch - paths that can't be read are
+        simply omitted from the result rather than raising. Returns
+        {path: embedding} covering only the paths that succeeded.
+        """
+        valid_paths = []
+        tensors = []
+        for path in paths:
+            try:
+                img = Image.open(path).convert("RGB")
+                tensors.append(self.preprocess(img))
+                valid_paths.append(path)
+            except Exception:
+                continue
+        if not tensors:
+            return {}
+        batch = torch.stack(tensors).to(self.device)
+        with torch.no_grad():
+            feats = self.model.encode_image(batch)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+        feats = feats.cpu().numpy()
+        return {path: feats[i] for i, path in enumerate(valid_paths)}
+
     def embed_text(self, text):
         tokens = self.tokenizer([text]).to(self.device)
         with torch.no_grad():
