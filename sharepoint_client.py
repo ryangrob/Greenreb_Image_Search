@@ -234,6 +234,20 @@ class SharePointClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_index_file_size(self, folder_item_id):
+        """Returns the byte size of a folder's shared index, or None if it
+        isn't there. Metadata-only (no content download), so it's a cheap
+        way to tell whether a folder's index already reached SharePoint.
+        """
+        self._resolve_site_and_drive()
+        url = f"{GRAPH_BASE}/drives/{self._drive_id}/items/{folder_item_id}:/{INDEX_FILENAME}"
+        try:
+            return self._get(url).get("size")
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
+
     def upload_index_file(self, folder_item_id, data):
         """Uploads (creates/overwrites) the shared index file into a folder.
 

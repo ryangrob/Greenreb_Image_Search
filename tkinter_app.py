@@ -391,14 +391,35 @@ class ImageSearchApp:
         unchanged-but-never-uploaded folder is never revisited, and every
         other user keeps re-embedding it from scratch.
         """
-        pending = []
+        candidates = []
         for path in glob.glob(os.path.join(indexes_dir, "*.json")):
             folder_id = os.path.splitext(os.path.basename(path))[0]
             if folder_id not in uploaded_ok:
-                pending.append((folder_id, path))
-        if not pending:
+                candidates.append((folder_id, path))
+        if not candidates:
             return 0
 
+        # Confirm against SharePoint before re-uploading. On the very first
+        # run after this check was introduced nothing is recorded as
+        # uploaded yet, so without this every folder would be re-uploaded
+        # (hundreds of MB) even though most are already fine. A
+        # metadata-only size lookup is far cheaper than an upload, so only
+        # genuinely missing or mismatched indexes get sent.
+        pending = []
+        for i, (folder_id, path) in enumerate(candidates, 1):
+            self.event_queue.put(
+                ("status", f"Verifying shared index {i}/{len(candidates)}...")
+            )
+            try:
+                remote_size = self.sp_client.get_index_file_size(folder_id)
+                if remote_size is not None and remote_size == os.path.getsize(path):
+                    uploaded_ok.add(folder_id)
+                    continue
+            except Exception:
+                pass  # can't confirm - fall through and re-upload to be safe
+            pending.append((folder_id, path))
+
+        already_ok = len(candidates) - len(pending)
         repaired = 0
         for i, (folder_id, path) in enumerate(pending, 1):
             self.event_queue.put(
@@ -411,7 +432,10 @@ class ImageSearchApp:
                 continue
             if self._upload_folder_index(folder_id, data, path, uploaded_ok):
                 repaired += 1
-        _log_reuse(f"REPAIR PASS: attempted={len(pending)} succeeded={repaired}")
+        _log_reuse(
+            f"REPAIR PASS: checked={len(candidates)} already_on_sharepoint={already_ok} "
+            f"needed_upload={len(pending)} succeeded={repaired}"
+        )
         return repaired
 
     def _apply_folder_changes(
