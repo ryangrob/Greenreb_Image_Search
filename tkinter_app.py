@@ -10,8 +10,10 @@ import base64
 import concurrent.futures
 import datetime
 import glob
+import hashlib
 import json
 import os
+import platform
 import queue
 import re
 import subprocess
@@ -36,7 +38,7 @@ import numpy as np
 from PIL import Image
 
 from search_engine import ImageSearchEngine, MODEL_TAG
-from sharepoint_client import DeltaExpired, SharePointClient
+from sharepoint_client import FEEDBACK_PREFIX, DeltaExpired, SharePointClient
 
 CRASH_LOG_PATH = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "crash.log"
@@ -116,6 +118,31 @@ def _load_logo_image(height=LOGO_HEIGHT):
         return ctk.CTkImage(light_image=img, dark_image=img, size=(width, height))
     except Exception:
         return None
+
+
+def query_key(text):
+    """Stable, non-readable key for a search query.
+
+    Click feedback is shared with the team through SharePoint, and the raw
+    query text would otherwise sit there as a readable log of what everyone
+    searched for. Hashing keeps matching exact (the same query always yields
+    the same key on every machine) while leaving nothing legible in the file.
+
+    Obfuscation, not encryption: this app is open source, so short common
+    words could be recovered by hashing a dictionary and comparing. It stops
+    the file being readable, not a determined attacker.
+    """
+    normalized = normalize_text(text)
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def machine_key():
+    """Opaque per-machine id used to name this machine's feedback file, so
+    the filenames don't advertise who searched for what either."""
+    raw = f"{platform.node()}|{os.environ.get('USERNAME', '')}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
 
 
 def normalize_text(text):
@@ -358,18 +385,45 @@ class ImageSearchApp:
     # ---------- search-time ranking signals ----------
 
     def _feedback_path(self):
+        """This machine's own contributions - the file that gets uploaded."""
         local_folder, _t, _f, _i = self._sp_cache_dirs()
         return os.path.join(local_folder, "click_feedback.json")
 
+    def _team_feedback_path(self):
+        """Everyone's contributions merged together - used for ranking."""
+        local_folder, _t, _f, _i = self._sp_cache_dirs()
+        return os.path.join(local_folder, "click_feedback_team.json")
+
+    def _read_json(self, path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    @staticmethod
+    def _merge_feedback(into, other):
+        """Adds one feedback map into another. Counts are additive, so
+        merging is order-independent and can't lose anyone's data."""
+        for key, items in (other or {}).items():
+            if not isinstance(items, dict):
+                continue
+            target = into.setdefault(key, {})
+            for item_id, count in items.items():
+                try:
+                    target[item_id] = target.get(item_id, 0) + int(count)
+                except (TypeError, ValueError):
+                    continue
+        return into
+
     def _load_feedback(self):
-        """{normalized query: {item_id: times opened}}"""
+        """{hashed query: {item_id: times opened}}, this machine + team."""
         if self._feedback is None:
-            self._feedback = {}
-            try:
-                with open(self._feedback_path(), "r", encoding="utf-8") as f:
-                    self._feedback = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                pass
+            merged = self._read_json(self._team_feedback_path())
+            # Local clicks may not be uploaded/merged yet, so overlay them.
+            self._merge_feedback(merged, self._read_json(self._feedback_path()))
+            self._feedback = merged
         return self._feedback
 
     def _record_click(self, item_id):
@@ -379,17 +433,45 @@ class ImageSearchApp:
         right answer, and it was previously discarded. Recording it lets
         frequently-searched topics improve with use, without any labelling.
         """
-        query = normalize_text(self._last_query)
-        if not query or not item_id:
+        key = query_key(self._last_query)
+        if not key or not item_id:
             return
-        feedback = self._load_feedback()
-        per_query = feedback.setdefault(query, {})
-        per_query[item_id] = per_query.get(item_id, 0) + 1
+        own = self._read_json(self._feedback_path())
+        own.setdefault(key, {})[item_id] = own.get(key, {}).get(item_id, 0) + 1
         try:
             with open(self._feedback_path(), "w", encoding="utf-8") as f:
-                json.dump(feedback, f, ensure_ascii=False)
+                json.dump(own, f)
         except OSError:
             pass
+        # Keep the in-memory view current so the next search reflects it.
+        if self._feedback is not None:
+            self._feedback.setdefault(key, {})[item_id] = (
+                self._feedback.get(key, {}).get(item_id, 0) + 1
+            )
+
+    def _sync_feedback(self, root_id):
+        """Publishes this machine's feedback and merges in everyone else's.
+
+        Each machine owns exactly one file, so no upload can clobber another
+        user's data and the merge is a simple sum.
+        """
+        own = self._read_json(self._feedback_path())
+        try:
+            if own:
+                self.sp_client.upload_json_file(
+                    root_id, f"{FEEDBACK_PREFIX}{machine_key()}.json", own
+                )
+            merged = {}
+            for name in self.sp_client.list_feedback_files(root_id):
+                remote = self.sp_client.download_json_file(root_id, name)
+                if remote:
+                    self._merge_feedback(merged, remote)
+            with open(self._team_feedback_path(), "w", encoding="utf-8") as f:
+                json.dump(merged, f)
+            self._feedback = None  # force reload with the merged data
+            _log_reuse(f"FEEDBACK SYNC: queries={len(merged)}")
+        except Exception as exc:
+            _log_reuse(f"FEEDBACK SYNC FAILED: {exc!r}")
 
     def _compute_bonus(self, query):
         """Per-image score adjustments the image embedding can't provide:
@@ -397,7 +479,7 @@ class ImageSearchApp:
         same query. Returns None when neither applies."""
         if not self.engine.meta:
             return None
-        feedback_for_query = self._load_feedback().get(normalize_text(query), {})
+        feedback_for_query = self._load_feedback().get(query_key(query), {})
         folder_cache = {}
         bonus = np.zeros(len(self.engine.meta), dtype=np.float32)
         any_bonus = False
@@ -897,6 +979,9 @@ class ImageSearchApp:
                     for item_id, entry in all_entries.items()
                 ]
                 count = self.engine.load_sp_items(sp_items)
+
+                self.event_queue.put(("status", "Syncing team search feedback..."))
+                self._sync_feedback(root["id"])
 
                 _log_reuse(
                     f"RUN COMPLETE: delta_link_was={'set' if delta_link else 'None (full listing)'} "

@@ -14,6 +14,9 @@ import config
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SCOPES = ["Sites.Read.All", "Files.ReadWrite.All"]
 INDEX_FILENAME = ".imagesearch_sp_index.json"
+# Each machine writes its own feedback file rather than all sharing one, so
+# concurrent users can never overwrite each other's contributions.
+FEEDBACK_PREFIX = ".imagesearch_feedback_"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 # Payloads at/above this go through a resumable upload session rather than a
 # simple PUT. Graph's chunked uploads require each chunk (except the last) to
@@ -210,8 +213,8 @@ class SharePointClient:
                 f.write(chunk)
         return True
 
-    def download_index_file(self, folder_item_id):
-        """Returns the parsed shared index dict for a folder, or None if not present.
+    def download_json_file(self, folder_item_id, filename):
+        """Returns a parsed JSON file from a folder, or None if not present.
 
         Fetches the specific filename directly via Graph's colon-path
         addressing instead of listing every child in the folder just to
@@ -219,7 +222,7 @@ class SharePointClient:
         folder listing, which adds up across hundreds of folders.
         """
         self._resolve_site_and_drive()
-        url = f"{GRAPH_BASE}/drives/{self._drive_id}/items/{folder_item_id}:/{INDEX_FILENAME}"
+        url = f"{GRAPH_BASE}/drives/{self._drive_id}/items/{folder_item_id}:/{filename}"
         try:
             entry = self._get(url)
         except requests.exceptions.HTTPError as exc:
@@ -233,6 +236,24 @@ class SharePointClient:
         resp = requests.get(download_url, timeout=60)
         resp.raise_for_status()
         return resp.json()
+
+    def download_index_file(self, folder_item_id):
+        """Returns the parsed shared index dict for a folder, or None."""
+        return self.download_json_file(folder_item_id, INDEX_FILENAME)
+
+    def list_feedback_files(self, folder_item_id):
+        """Names of every per-machine feedback file in a folder.
+
+        Each machine writes only its own file, so merging is a matter of
+        reading them all - no machine can overwrite another's contributions.
+        """
+        children = self.list_children(folder_item_id, by_id=True)
+        return [
+            c["name"]
+            for c in children
+            if c.get("name", "").startswith(FEEDBACK_PREFIX)
+            and c.get("name", "").endswith(".json")
+        ]
 
     def get_index_file_size(self, folder_item_id):
         """Returns the byte size of a folder's shared index, or None if it
@@ -249,7 +270,11 @@ class SharePointClient:
             raise
 
     def upload_index_file(self, folder_item_id, data):
-        """Uploads (creates/overwrites) the shared index file into a folder.
+        """Uploads (creates/overwrites) the shared index file into a folder."""
+        return self.upload_json_file(folder_item_id, INDEX_FILENAME, data)
+
+    def upload_json_file(self, folder_item_id, filename, data):
+        """Uploads (creates/overwrites) a JSON file into a folder.
 
         Small payloads go via the simple-upload PUT; anything at/over
         SIMPLE_UPLOAD_LIMIT uses Graph's resumable upload-session API
@@ -262,9 +287,9 @@ class SharePointClient:
         self._resolve_site_and_drive()
         payload = json.dumps(data).encode("utf-8")
         if len(payload) >= SIMPLE_UPLOAD_LIMIT:
-            return self._upload_index_file_chunked(folder_item_id, payload)
+            return self._upload_file_chunked(folder_item_id, filename, payload)
 
-        url = f"{GRAPH_BASE}/drives/{self._drive_id}/items/{folder_item_id}:/{INDEX_FILENAME}:/content"
+        url = f"{GRAPH_BASE}/drives/{self._drive_id}/items/{folder_item_id}:/{filename}:/content"
         resp = requests.put(
             url,
             headers={**self._headers(), "Content-Type": "application/json"},
@@ -274,11 +299,11 @@ class SharePointClient:
         resp.raise_for_status()
         return resp.json()
 
-    def _upload_index_file_chunked(self, folder_item_id, payload):
-        """Uploads a large index via Graph's resumable upload session."""
+    def _upload_file_chunked(self, folder_item_id, filename, payload):
+        """Uploads a large file via Graph's resumable upload session."""
         session_url = (
             f"{GRAPH_BASE}/drives/{self._drive_id}/items/"
-            f"{folder_item_id}:/{INDEX_FILENAME}:/createUploadSession"
+            f"{folder_item_id}:/{filename}:/createUploadSession"
         )
         resp = requests.post(
             session_url,
