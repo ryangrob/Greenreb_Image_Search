@@ -38,6 +38,12 @@ NEGATION_WEIGHT = 1.5
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff"}
 
 
+# Text encoder distilled to share the ViT-B-32 image embedding space, so it
+# can read 50+ languages against an index built with the English CLIP model -
+# no re-indexing required.
+MULTILINGUAL_MODEL = "sentence-transformers/clip-ViT-B-32-multilingual-v1"
+
+
 def _standardize(v):
     """Rescales scores to zero mean / unit spread so two different concepts
     can be compared and combined meaningfully."""
@@ -55,6 +61,8 @@ class ImageSearchEngine:
         self.paths = []
         self.meta = []  # parallel to paths: None for local-folder items, dict for SharePoint items
         self.embeddings = None  # np.ndarray, shape (N, D), L2-normalized
+        self._multilingual = None
+        self._multilingual_tried = False
 
     def load_model(self, status_callback=None):
         if self.model is not None:
@@ -284,7 +292,7 @@ class ImageSearchEngine:
         return len(self.paths)
 
     def _rank(self, query_emb, top_k, near_duplicate_threshold=NEAR_DUPLICATE_THRESHOLD,
-              bonus=None, subset=None, exclude_emb=None):
+              bonus=None, subset=None, exclude_emb=None, multilingual_emb=None):
         """Ranks purely by relevance to query_emb, demoting only genuine
         near-duplicates (e.g. burst shots of the same moment) to the end.
 
@@ -316,6 +324,13 @@ class ImageSearchEngine:
         if len(self.paths) == 0:
             return []
         sims = self.embeddings @ query_emb
+        if multilingual_emb is not None:
+            # Take whichever encoder is more confident about each image, so
+            # English keeps its current behaviour while other languages -
+            # which the English encoder reads as near-noise - still work.
+            sims = np.maximum(
+                _standardize(sims), _standardize(self.embeddings @ multilingual_emb)
+            )
         if exclude_emb is not None:
             # Standardise both sides before combining: raw CLIP similarities
             # occupy too narrow a range for a subtraction to reorder much.
@@ -355,6 +370,36 @@ class ImageSearchEngine:
         order = pool_order[selected]
         return [(self.paths[i], float(sims[i]), self.meta[i]) for i in order]
 
+    def load_multilingual(self, status_callback=None):
+        """Loads the multilingual text encoder, downloading it once if
+        needed. Returns None if unavailable - search then falls back to
+        English-only rather than failing.
+        """
+        if self._multilingual_tried:
+            return self._multilingual
+        self._multilingual_tried = True
+        try:
+            if status_callback:
+                status_callback("Preparing multilingual search (one-time download)...")
+            from sentence_transformers import SentenceTransformer
+
+            self._multilingual = SentenceTransformer(MULTILINGUAL_MODEL)
+        except Exception:
+            self._multilingual = None
+        return self._multilingual
+
+    def embed_query_multilingual(self, text):
+        """Query vector from the multilingual encoder, or None."""
+        model = self.load_multilingual()
+        if model is None:
+            return None
+        try:
+            v = np.asarray(model.encode(text), dtype=np.float32)
+            norm = np.linalg.norm(v)
+            return v / norm if norm else None
+        except Exception:
+            return None
+
     def embed_concept(self, prompts):
         """Averages several phrasings into one direction in embedding space,
         used to describe a collection ("people playing golf at night")
@@ -372,6 +417,9 @@ class ImageSearchEngine:
     def search_text(self, text, top_k=24, status_callback=None, bonus=None, subset=None):
         self.load_model(status_callback)
         query_emb, exclude_emb = self.embed_query(text)
+        wanted, _ = self.split_negation(text)
+        self.load_multilingual(status_callback)
         return self._rank(
-            query_emb, top_k, bonus=bonus, subset=subset, exclude_emb=exclude_emb
+            query_emb, top_k, bonus=bonus, subset=subset, exclude_emb=exclude_emb,
+            multilingual_emb=self.embed_query_multilingual(wanted),
         )

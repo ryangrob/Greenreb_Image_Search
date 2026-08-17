@@ -16,6 +16,7 @@ import os
 import platform
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -38,7 +39,12 @@ import numpy as np
 from PIL import Image
 
 from search_engine import ImageSearchEngine, MODEL_TAG
-from sharepoint_client import FEEDBACK_PREFIX, DeltaExpired, SharePointClient
+from sharepoint_client import (
+    FAVOURITES_PREFIX,
+    FEEDBACK_PREFIX,
+    DeltaExpired,
+    SharePointClient,
+)
 
 CRASH_LOG_PATH = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "crash.log"
@@ -94,6 +100,11 @@ FEEDBACK_BONUS_CAP = 0.10
 # product and object shots within every collection.
 COLLECTION_PERCENTILE = 92
 COLLECTION_MAX = 120
+# How much more "graphic with text on it" than "plain photograph" an image
+# has to look before it's kept out of collections. Slightly above zero so
+# only clear cases are excluded - a photo that merely contains a sign in
+# the background shouldn't be treated as finished artwork.
+TEXT_OVERLAY_MARGIN = 0.005
 DEFAULT_TOP_K = 50
 
 BG_COLOR = "#0d1b2a"
@@ -223,6 +234,7 @@ class ImageSearchApp:
         self._last_query = ""
         self._feedback = None
         self._favourites = None
+        self._settings = None
         self._view = "all"
         self._collections = {}
         self.all_card = None
@@ -258,7 +270,10 @@ class ImageSearchApp:
         self.sharepoint_button = _make_button(
             top, "Search Marketing Photos", self._browse_sharepoint, width=190
         )
-        self.sharepoint_button.pack(side=tk.LEFT, padx=(4, 14), pady=14)
+        self.sharepoint_button.pack(side=tk.LEFT, padx=4, pady=14)
+        _make_button(top, "Settings", self._open_settings, width=100).pack(
+            side=tk.LEFT, padx=(4, 14), pady=14
+        )
 
         # Sidebar (collection cards) beside the search area and results, so
         # switching collection keeps the same search box rather than moving it.
@@ -523,6 +538,73 @@ class ImageSearchApp:
 
     # ---------- search-time ranking signals ----------
 
+    # ---------- settings ----------
+
+    def _settings_path(self):
+        local_folder, _t, _f, _i = self._sp_cache_dirs()
+        return os.path.join(os.path.dirname(local_folder), "settings.json")
+
+    def _load_settings(self):
+        if self._settings is None:
+            self._settings = self._read_json(self._settings_path())
+        return self._settings
+
+    def _save_settings(self):
+        try:
+            os.makedirs(os.path.dirname(self._settings_path()), exist_ok=True)
+            with open(self._settings_path(), "w", encoding="utf-8") as f:
+                json.dump(self._load_settings(), f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def _download_folder(self):
+        folder = self._load_settings().get("download_folder") or ""
+        return folder if folder and os.path.isdir(folder) else ""
+
+    def _open_settings(self):
+        """Small modal for the one setting worth exposing: where opened
+        images should be saved."""
+        win = ctk.CTkToplevel(self.root)
+        win.title("Settings")
+        win.geometry("540x230")
+        win.configure(fg_color=BG_COLOR)
+        win.transient(self.root)
+        win.grab_set()
+
+        ctk.CTkLabel(
+            win, text="Save opened images to", text_color=TEXT_COLOR,
+            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+        ).pack(anchor="w", padx=20, pady=(20, 2))
+        ctk.CTkLabel(
+            win,
+            text="Double-clicking a result saves a copy here, then opens it.\n"
+                 "Leave empty to just open images without keeping a copy.",
+            text_color=MUTED_TEXT_COLOR, justify="left",
+        ).pack(anchor="w", padx=20, pady=(0, 10))
+
+        row = ctk.CTkFrame(win, fg_color=CARD_COLOR, corner_radius=CARD_RADIUS)
+        row.pack(fill=tk.X, padx=20)
+        folder_var = tk.StringVar(value=self._download_folder() or "Not set")
+        ctk.CTkLabel(
+            row, textvariable=folder_var, text_color=MUTED_TEXT_COLOR, anchor="w",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=14, pady=12)
+
+        def choose():
+            chosen = filedialog.askdirectory(title="Choose a download folder", parent=win)
+            if chosen:
+                self._load_settings()["download_folder"] = chosen
+                self._save_settings()
+                folder_var.set(chosen)
+
+        def clear():
+            self._load_settings().pop("download_folder", None)
+            self._save_settings()
+            folder_var.set("Not set")
+
+        _make_button(row, "Choose...", choose, width=110).pack(side=tk.LEFT, padx=(0, 8), pady=12)
+        _make_button(row, "Clear", clear, width=80).pack(side=tk.LEFT, padx=(0, 14), pady=12)
+        _make_button(win, "Done", win.destroy, width=100).pack(pady=18)
+
     # ---------- collections ----------
 
     def _load_category_defs(self):
@@ -566,6 +648,24 @@ class ImageSearchApp:
         people_score = self.engine.score_against(people) - self.engine.score_against(empty)
         has_people = people_score > 0
 
+        # Finished graphics - posters, adverts, anything with wording burnt
+        # into the image - are not raw source material, so they're kept out
+        # of collections entirely. They remain searchable.
+        with_text = self.engine.embed_concept([
+            "a poster with large text written on it",
+            "an advertisement with a headline and words",
+            "a graphic design with a slogan overlaid",
+            "a sign with writing on it",
+        ])
+        without_text = self.engine.embed_concept([
+            "a candid photograph of people with no text",
+            "a plain photograph with no writing",
+            "a natural photo without any words",
+        ])
+        is_graphic = (
+            self.engine.score_against(with_text) - self.engine.score_against(without_text)
+        ) > TEXT_OVERLAY_MARGIN
+
         scores = []
         for cat in defs:
             prompts = cat.get("prompts") or [cat.get("name", "")]
@@ -583,6 +683,8 @@ class ImageSearchApp:
 
         collections = {cat["name"]: [] for cat in defs}
         for i, meta in enumerate(self.engine.meta):
+            if is_graphic[i]:
+                continue  # finished artwork, not a photo to reuse
             folder = (meta or {}).get("folder") or ""
             placed = False
             if folder:
@@ -629,41 +731,85 @@ class ImageSearchApp:
         return os.path.join(local_folder, "favourites.json")
 
     def _load_favourites(self):
+        """This machine's saved images, plus any shared by the team."""
         if self._favourites is None:
-            data = self._read_json(self._favourites_path())
-            entries = data.get("items") if isinstance(data, dict) else None
-            self._favourites = entries if isinstance(entries, dict) else {}
+            merged = dict(self._read_json(self._team_favourites_path()).get("items") or {})
+            # Local saves may not have been shared yet, so they go on top.
+            merged.update(self._read_json(self._favourites_path()).get("items") or {})
+            self._favourites = merged
         return self._favourites
 
-    def _save_favourites(self):
-        try:
-            os.makedirs(os.path.dirname(self._favourites_path()), exist_ok=True)
-            with open(self._favourites_path(), "w", encoding="utf-8") as f:
-                json.dump({"items": self._load_favourites()}, f, ensure_ascii=False)
-        except OSError:
-            pass
+    def _own_favourites(self):
+        return self._read_json(self._favourites_path()).get("items") or {}
 
     def _is_favourite(self, key):
-        return key in self._load_favourites()
+        """Whether *you* saved this image.
+
+        Deliberately not the merged team view: the star is a toggle for your
+        own list, so it has to reflect what clicking it will change. The
+        Favourites collection still shows everything you and the team saved.
+        """
+        return key in self._own_favourites()
 
     def _toggle_favourite(self, key, path, meta):
-        favs = self._load_favourites()
-        if key in favs:
-            del favs[key]
+        """Adds or removes one image from this machine's own favourites.
+
+        Only this machine's file is written; entries shared by teammates are
+        left alone, so un-starring can't delete someone else's shortlist.
+        """
+        own = self._own_favourites()
+        if key in own:
+            del own[key]
             added = False
         else:
             # Store enough to render a favourite even when it isn't part of
             # the currently loaded index (e.g. before a SharePoint sync).
-            favs[key] = {
+            own[key] = {
                 "path": path,
                 "name": (meta or {}).get("name", os.path.basename(path)),
                 "folder": (meta or {}).get("folder", ""),
                 "item_id": (meta or {}).get("item_id", ""),
             }
             added = True
-        self._save_favourites()
+        try:
+            os.makedirs(os.path.dirname(self._favourites_path()), exist_ok=True)
+            with open(self._favourites_path(), "w", encoding="utf-8") as f:
+                json.dump({"items": own}, f, ensure_ascii=False)
+        except OSError:
+            pass
+        self._favourites = None  # rebuild the merged view
         self._update_favourites_button()
         return added
+
+    def _team_favourites_path(self):
+        local_folder, _t, _f, _i = self._sp_cache_dirs()
+        return os.path.join(local_folder, "favourites_team.json")
+
+    def _sync_favourites(self, root_id):
+        """Publishes this machine's favourites and merges in the team's.
+
+        Same one-file-per-machine approach as the click feedback: nobody
+        writes to anyone else's file, so two people saving at once cannot
+        clobber each other and the merge is a plain union.
+        """
+        own = self._read_json(self._favourites_path()).get("items") or {}
+        try:
+            if own:
+                self.sp_client.upload_json_file(
+                    root_id, f"{FAVOURITES_PREFIX}{machine_key()}.json", {"items": own}
+                )
+            merged = {}
+            for name in self.sp_client.list_shared_files(root_id, FAVOURITES_PREFIX):
+                remote = self.sp_client.download_json_file(root_id, name)
+                for key, entry in ((remote or {}).get("items") or {}).items():
+                    if isinstance(entry, dict):
+                        merged.setdefault(key, entry)
+            with open(self._team_favourites_path(), "w", encoding="utf-8") as f:
+                json.dump({"items": merged}, f, ensure_ascii=False)
+            self._favourites = None  # reload including the team's
+            _log_reuse(f"FAVOURITES SYNC: shared={len(own)} team_total={len(merged)}")
+        except Exception as exc:
+            _log_reuse(f"FAVOURITES SYNC FAILED: {exc!r}")
 
     def _favourite_indices(self):
         """Positions in the loaded index that are favourited."""
@@ -1272,8 +1418,9 @@ class ImageSearchApp:
                 ]
                 count = self.engine.load_sp_items(sp_items)
 
-                self.event_queue.put(("status", "Syncing team search feedback..."))
+                self.event_queue.put(("status", "Syncing team favourites and feedback..."))
                 self._sync_feedback(root["id"])
+                self._sync_favourites(root["id"])
 
                 _log_reuse(
                     f"RUN COMPLETE: delta_link_was={'set' if delta_link else 'None (full listing)'} "
@@ -1296,12 +1443,35 @@ class ImageSearchApp:
 
         self._run_in_background(work)
 
+    def _deliver_to_download_folder(self, source, name):
+        """Copies an opened image into the user's chosen folder, if set.
+
+        Returns the delivered path, or the original when no folder is
+        configured. Never overwrites: a second copy of the same filename
+        gets a numeric suffix rather than silently replacing what's there.
+        """
+        folder = self._download_folder()
+        if not folder:
+            return source
+        target = os.path.join(folder, name)
+        if os.path.exists(target):
+            stem, ext = os.path.splitext(name)
+            n = 2
+            while os.path.exists(os.path.join(folder, f"{stem} ({n}){ext}")):
+                n += 1
+            target = os.path.join(folder, f"{stem} ({n}){ext}")
+        try:
+            shutil.copy2(source, target)
+            return target
+        except OSError:
+            return source
+
     def _open_sp_result(self, item_id, name):
         self._record_click(item_id)
         _local_folder, _thumbs_dir, full_dir, _indexes_dir = self._sp_cache_dirs()
         dest = os.path.join(full_dir, f"{item_id}_{name}")
         if os.path.exists(dest):
-            open_in_system_viewer(dest)
+            self.event_queue.put(("sp_open_ready", dest, name))
             return
 
         self._set_busy(True)
@@ -1311,7 +1481,7 @@ class ImageSearchApp:
             try:
                 item = {"id": item_id}
                 self.sp_client.download_file(item, dest)
-                self.event_queue.put(("sp_open_ready", dest))
+                self.event_queue.put(("sp_open_ready", dest, name))
             except Exception as exc:
                 self.event_queue.put(("error", f"Failed to download {name}: {exc}"))
 
@@ -1386,8 +1556,12 @@ class ImageSearchApp:
                     self._rebuild_collection_cards()
                 elif kind == "sp_open_ready":
                     self._set_busy(False)
-                    self.status_var.set("Ready to search.")
-                    open_in_system_viewer(event[1])
+                    delivered = self._deliver_to_download_folder(event[1], event[2])
+                    if self._download_folder():
+                        self.status_var.set(f"Saved to {os.path.dirname(delivered)}")
+                    else:
+                        self.status_var.set("Ready to search.")
+                    open_in_system_viewer(delivered)
                 elif kind == "error":
                     self.progress.stop()
                     self.progress.set(0)

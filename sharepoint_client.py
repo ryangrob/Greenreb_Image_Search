@@ -17,6 +17,7 @@ INDEX_FILENAME = ".imagesearch_sp_index.json"
 # Each machine writes its own feedback file rather than all sharing one, so
 # concurrent users can never overwrite each other's contributions.
 FEEDBACK_PREFIX = ".imagesearch_feedback_"
+FAVOURITES_PREFIX = ".imagesearch_favourites_"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 # Payloads at/above this go through a resumable upload session rather than a
 # simple PUT. Graph's chunked uploads require each chunk (except the last) to
@@ -241,8 +242,8 @@ class SharePointClient:
         """Returns the parsed shared index dict for a folder, or None."""
         return self.download_json_file(folder_item_id, INDEX_FILENAME)
 
-    def list_feedback_files(self, folder_item_id):
-        """Names of every per-machine feedback file in a folder.
+    def list_shared_files(self, folder_item_id, prefix):
+        """Names of every per-machine shared file with a given prefix.
 
         Each machine writes only its own file, so merging is a matter of
         reading them all - no machine can overwrite another's contributions.
@@ -251,9 +252,11 @@ class SharePointClient:
         return [
             c["name"]
             for c in children
-            if c.get("name", "").startswith(FEEDBACK_PREFIX)
-            and c.get("name", "").endswith(".json")
+            if c.get("name", "").startswith(prefix) and c.get("name", "").endswith(".json")
         ]
+
+    def list_feedback_files(self, folder_item_id):
+        return self.list_shared_files(folder_item_id, FEEDBACK_PREFIX)
 
     def get_index_file_size(self, folder_item_id):
         """Returns the byte size of a folder's shared index, or None if it

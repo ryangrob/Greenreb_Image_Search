@@ -17,23 +17,14 @@
   ],
   "categories": [
     {
-      "name": "Golf - daytime",
+      "name": "Golf",
       "prompts": [
-        "people playing golf in a driving range bay in daylight",
-        "friends hitting golf balls outdoors on a sunny day",
-        "a person swinging a golf club in daylight"
+        "people playing golf in a driving range bay",
+        "friends hitting golf balls together",
+        "a person swinging a golf club",
+        "people playing golf at night under floodlights"
       ],
       "folder_keywords": [],
-      "require_people": true
-    },
-    {
-      "name": "Golf - night",
-      "prompts": [
-        "people playing golf at night under bright floodlights",
-        "a driving range lit up at night with people playing",
-        "friends golfing in the evening with glowing targets"
-      ],
-      "folder_keywords": ["nacht", "night", "abend"],
       "require_people": true
     },
     {
@@ -74,16 +65,6 @@
         "a young child playing a game"
       ],
       "folder_keywords": ["kid", "kinder", "children"],
-      "require_people": true
-    },
-    {
-      "name": "Party",
-      "prompts": [
-        "people celebrating at a party",
-        "a group of friends having a great time together",
-        "guests dancing and celebrating"
-      ],
-      "folder_keywords": ["party", "feier", "event", "geburtstag"],
       "require_people": true
     }
   ]
