@@ -105,11 +105,6 @@ COLLECTION_MAX = 120
 # only clear cases are excluded - a photo that merely contains a sign in
 # the background shouldn't be treated as finished artwork.
 TEXT_OVERLAY_MARGIN = 0.005
-
-# Results follow typing rather than waiting for Enter. The delay only avoids
-# re-encoding the query text on every keystroke; ranking itself is instant.
-LIVE_SEARCH_DELAY_MS = 350
-LIVE_SEARCH_MIN_CHARS = 3
 DEFAULT_TOP_K = 50
 
 BG_COLOR = "#0d1b2a"
@@ -240,8 +235,6 @@ class ImageSearchApp:
         self._feedback = None
         self._favourites = None
         self._settings = None
-        self._search_after_id = None
-        self._search_seq = 0
         self._view = "all"
         self._collections = {}
         self.all_card = None
@@ -313,7 +306,6 @@ class ImageSearchApp:
         )
         self.query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(14, 8), pady=14)
         self.query_entry.bind("<Return>", lambda _e: self._start_text_search())
-        self.query_var.trace_add("write", lambda *_: self._on_query_changed())
 
         self.search_button = _make_button(
             search_frame, "Search", self._start_text_search, width=100
@@ -476,51 +468,6 @@ class ImageSearchApp:
                 self.event_queue.put(("error", str(exc)))
 
         self._run_in_background(work)
-
-    def _on_query_changed(self):
-        """Runs the search shortly after typing stops.
-
-        Ranking is a single matrix multiply, so results can keep up with
-        typing. The delay is there to avoid re-encoding the text on every
-        keystroke, not because the search is slow.
-        """
-        if self._search_after_id is not None:
-            try:
-                self.root.after_cancel(self._search_after_id)
-            except Exception:
-                pass
-        self._search_after_id = self.root.after(LIVE_SEARCH_DELAY_MS, self._live_search)
-
-    def _live_search(self):
-        self._search_after_id = None
-        query = self.query_var.get().strip()
-        if len(query) < LIVE_SEARCH_MIN_CHARS:
-            return
-        if self.engine.embeddings is None or len(self.engine.paths) == 0:
-            return
-        if self.worker_thread is not None and self.worker_thread.is_alive():
-            return  # an indexing run is in progress; don't compete with it
-
-        subset = self._active_subset()
-        if subset is not None and not subset:
-            return
-
-        self._search_seq += 1
-        seq = self._search_seq
-        self._last_query = query
-
-        def work():
-            try:
-                bonus = self._compute_bonus(query)
-                results = self.engine.search_text(
-                    query, DEFAULT_TOP_K, bonus=bonus, subset=subset
-                )
-                # Discard if the user has typed more since this started.
-                self.event_queue.put(("live_results", seq, results))
-            except Exception:
-                _log_crash("live search", sys.exc_info())
-
-        threading.Thread(target=work, daemon=True).start()
 
     def _active_subset(self):
         """Indices the current collection restricts search to, or None."""
@@ -1680,11 +1627,6 @@ class ImageSearchApp:
                             f"Ready to search.{retry_note}"
                         )
                     self._refresh_collections()
-                elif kind == "live_results":
-                    _, seq, results = event
-                    if seq == self._search_seq:  # ignore superseded searches
-                        self._render_results(results)
-                        self.status_var.set(f"{len(results)} result(s).")
                 elif kind == "startup_ready":
                     self._sp_mode_active = True
                     self.folder_var.set("SharePoint: Fotos & Videos (all subfolders)")
