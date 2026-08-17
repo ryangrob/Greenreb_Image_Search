@@ -1,0 +1,90 @@
+{
+  "_comment": [
+    "Editable collection definitions. Copy this file to",
+    "%LOCALAPPDATA%\\ImageSearch\\categories.json to change them without",
+    "reinstalling the app - that copy wins over this bundled one.",
+    "",
+    "prompts         - what the photo should look like (matched visually).",
+    "folder_keywords - matched against the SharePoint folder name. A folder",
+    "                  match is treated as decisive, because a photo sitting",
+    "                  in a folder called 'Familie' is a family photo",
+    "                  regardless of what the pixels suggest. Matching is",
+    "                  accent-insensitive and substring-based, so 'famili'",
+    "                  also catches 'Familien' and 'Family'.",
+    "require_people  - when true, photos with no guests in them are kept out",
+    "                  of the collection (they stay searchable). Set false",
+    "                  for collections where empty shots are wanted."
+  ],
+  "categories": [
+    {
+      "name": "Golf - daytime",
+      "prompts": [
+        "people playing golf in a driving range bay in daylight",
+        "friends hitting golf balls outdoors on a sunny day",
+        "a person swinging a golf club in daylight"
+      ],
+      "folder_keywords": [],
+      "require_people": true
+    },
+    {
+      "name": "Golf - night",
+      "prompts": [
+        "people playing golf at night under bright floodlights",
+        "a driving range lit up at night with people playing",
+        "friends golfing in the evening with glowing targets"
+      ],
+      "folder_keywords": ["nacht", "night", "abend"],
+      "require_people": true
+    },
+    {
+      "name": "Food",
+      "prompts": [
+        "people eating a meal together at a restaurant",
+        "friends sharing food at a table",
+        "a delicious plated meal being enjoyed"
+      ],
+      "folder_keywords": ["food", "essen", "speise", "brunch"],
+      "require_people": false
+    },
+    {
+      "name": "Drinks",
+      "prompts": [
+        "people drinking cocktails and beer together",
+        "friends toasting with drinks",
+        "a group enjoying drinks at a bar"
+      ],
+      "folder_keywords": ["drink", "getr", "cocktail", "bier"],
+      "require_people": false
+    },
+    {
+      "name": "Family",
+      "prompts": [
+        "a happy family together having fun",
+        "parents and children enjoying an outing",
+        "a family group smiling together"
+      ],
+      "folder_keywords": ["famili", "family"],
+      "require_people": true
+    },
+    {
+      "name": "Kids",
+      "prompts": [
+        "children playing and having fun",
+        "kids laughing and enjoying themselves",
+        "a young child playing a game"
+      ],
+      "folder_keywords": ["kid", "kinder", "children"],
+      "require_people": true
+    },
+    {
+      "name": "Party",
+      "prompts": [
+        "people celebrating at a party",
+        "a group of friends having a great time together",
+        "guests dancing and celebrating"
+      ],
+      "folder_keywords": ["party", "feier", "event", "geburtstag"],
+      "require_people": true
+    }
+  ]
+}

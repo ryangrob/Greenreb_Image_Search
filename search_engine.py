@@ -285,6 +285,20 @@ class ImageSearchEngine:
         order = pool_order[selected]
         return [(self.paths[i], float(sims[i]), self.meta[i]) for i in order]
 
+    def embed_concept(self, prompts):
+        """Averages several phrasings into one direction in embedding space,
+        used to describe a collection ("people playing golf at night")
+        rather than a single search query."""
+        v = np.stack([self.embed_text(p) for p in prompts]).mean(axis=0)
+        norm = np.linalg.norm(v)
+        return v / norm if norm else v
+
+    def score_against(self, concept_vec):
+        """Similarity of every indexed image to a concept direction."""
+        if self.embeddings is None or len(self.paths) == 0:
+            return np.zeros(0, dtype=np.float32)
+        return self.embeddings @ concept_vec
+
     def search_text(self, text, top_k=24, status_callback=None, bonus=None, subset=None):
         self.load_model(status_callback)
         query_emb = self.embed_query(text)

@@ -217,8 +217,10 @@ class ImageSearchApp:
         self._feedback = None
         self._favourites = None
         self._view = "all"
+        self._collections = {}
         self.all_card = None
         self.fav_card = None
+        self.collection_cards = {}
 
         self._build_widgets()
         self.root.after(100, self._poll_queue)
@@ -260,10 +262,12 @@ class ImageSearchApp:
         sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
         sidebar.pack_propagate(False)
 
+        self.sidebar = sidebar
         self.all_card = self._make_collection_card(sidebar, "All photos", lambda: self._set_view("all"))
         self.fav_card = self._make_collection_card(
             sidebar, "Favourites", lambda: self._set_view("favourites")
         )
+        self.collection_cards = {}
 
         main = ctk.CTkFrame(body, fg_color="transparent")
         main.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -327,21 +331,56 @@ class ImageSearchApp:
             return
         self.fav_card.configure(text=f"  Favourites ({len(self._load_favourites())})")
 
+    def _refresh_collections(self):
+        """Groups the freshly loaded index into collections, off the UI
+        thread since it embeds the collection descriptions."""
+        def work():
+            try:
+                collections = self._build_categories()
+                self.event_queue.put(("collections_ready", collections))
+            except Exception:
+                _log_crash("building collections", sys.exc_info())
+
+        self._run_in_background(work)
+
+    def _rebuild_collection_cards(self):
+        """Recreates the auto-collection cards after an index finishes."""
+        for card in self.collection_cards.values():
+            card.destroy()
+        self.collection_cards = {}
+        for name, idxs in (self._collections or {}).items():
+            self.collection_cards[name] = self._make_collection_card(
+                self.sidebar, f"  {name} ({len(idxs)})", lambda n=name: self._set_view(n)
+            )
+
     def _set_view(self, view):
         """Switches which collection the search box searches."""
         self._view = view
-        is_fav = view == "favourites"
-        self.all_card.configure(fg_color=ACCENT_COLOR if not is_fav else CARD_COLOR)
-        self.fav_card.configure(fg_color=ACCENT_COLOR if is_fav else CARD_COLOR)
-        self.all_card.configure(text="  All photos")
+        self.all_card.configure(
+            text="  All photos", fg_color=ACCENT_COLOR if view == "all" else CARD_COLOR
+        )
+        self.fav_card.configure(fg_color=ACCENT_COLOR if view == "favourites" else CARD_COLOR)
         self._update_favourites_button()
-        if is_fav:
+        for name, card in self.collection_cards.items():
+            card.configure(fg_color=ACCENT_COLOR if view == name else CARD_COLOR)
+
+        if view == "favourites":
             self.query_entry.configure(placeholder_text="Search your favourites...")
             self._show_favourites()
+        elif view in (self._collections or {}):
+            self.query_entry.configure(placeholder_text=f"Search within {view}...")
+            self._show_collection(view)
         else:
             self.query_entry.configure(placeholder_text="Describe an image in English...")
             self._render_results([])
             self.status_var.set("Ready to search." if self.engine.paths else self.status_var.get())
+
+    def _show_collection(self, name):
+        idxs = (self._collections or {}).get(name, [])
+        results = [(self.engine.paths[i], 1.0, self.engine.meta[i]) for i in idxs[:DEFAULT_TOP_K]]
+        self._render_results(results)
+        extra = f" (showing first {DEFAULT_TOP_K})" if len(idxs) > DEFAULT_TOP_K else ""
+        self.status_var.set(f"{len(idxs)} photo(s) in {name}{extra}. Search to narrow it down.")
 
     def _show_favourites(self):
         """Lists every favourite, newest first, with no search term needed."""
@@ -420,6 +459,8 @@ class ImageSearchApp:
             if not subset:
                 self.status_var.set("No favourites yet - click the star on any result to save it.")
                 return
+        elif self._view in (self._collections or {}):
+            subset = self._collections[self._view]
 
         self._last_query = query
         self._set_busy(True)
@@ -474,6 +515,82 @@ class ImageSearchApp:
         self.search_button.configure(state=tk.NORMAL if has_index else tk.DISABLED)
 
     # ---------- search-time ranking signals ----------
+
+    # ---------- collections ----------
+
+    def _load_category_defs(self):
+        """Collection definitions, from the user's copy if they've made one.
+
+        A user-editable override means categories can be retuned (or new
+        ones added) without rebuilding and redistributing the app.
+        """
+        local_folder, _t, _f, _i = self._sp_cache_dirs()
+        override = os.path.join(os.path.dirname(local_folder), "categories.json")
+        for path in (override, _resource_path("assets", "categories.json")):
+            data = self._read_json(path)
+            cats = data.get("categories")
+            if isinstance(cats, list) and cats:
+                return cats
+        return []
+
+    def _build_categories(self):
+        """Assigns each indexed image to at most one collection.
+
+        Two signals, deliberately weighted differently:
+        - the SharePoint folder name, treated as decisive, because a photo
+          in a folder called "Familie" is a family photo whatever the
+          pixels suggest;
+        - otherwise visual similarity to the collection's description.
+
+        Collections marked require_people exclude photos with no guests in
+        them, so an empty venue stays searchable without turning up in a
+        highlight collection.
+        """
+        defs = self._load_category_defs()
+        if not defs or not self.engine.paths:
+            return {}
+
+        people = self.engine.embed_concept(
+            ["people enjoying themselves", "a group of happy people", "guests having fun"]
+        )
+        empty = self.engine.embed_concept(
+            ["an empty room with no people", "an empty venue interior", "a close up of an object"]
+        )
+        has_people = self.engine.score_against(people) - self.engine.score_against(empty) > 0
+
+        scores = []
+        for cat in defs:
+            prompts = cat.get("prompts") or [cat.get("name", "")]
+            scores.append(self.engine.score_against(self.engine.embed_concept(prompts)))
+        S = np.stack(scores, axis=1)
+
+        # Only images that match their best collection reasonably well are
+        # placed; the rest stay searchable but uncollected.
+        best = np.argmax(S, axis=1)
+        best_score = S[np.arange(len(S)), best]
+        threshold = float(np.percentile(best_score, 55)) if len(best_score) else 0.0
+
+        collections = {cat["name"]: [] for cat in defs}
+        for i, meta in enumerate(self.engine.meta):
+            folder = (meta or {}).get("folder") or ""
+            placed = False
+            if folder:
+                normalized = normalize_text(folder)
+                for ci, cat in enumerate(defs):
+                    if any(normalize_text(k) in normalized for k in cat.get("folder_keywords") or []):
+                        collections[cat["name"]].append(i)
+                        placed = True
+                        break
+            if placed:
+                continue
+            ci = int(best[i])
+            if best_score[i] <= threshold:
+                continue
+            if defs[ci].get("require_people", True) and not has_people[i]:
+                continue
+            collections[defs[ci]["name"]].append(i)
+
+        return {name: idxs for name, idxs in collections.items() if idxs}
 
     # ---------- favourites ----------
 
@@ -1242,6 +1359,10 @@ class ImageSearchApp:
                             f"Up to date - {count} image(s) already indexed. "
                             f"Ready to search.{retry_note}"
                         )
+                    self._refresh_collections()
+                elif kind == "collections_ready":
+                    self._collections = event[1]
+                    self._rebuild_collection_cards()
                 elif kind == "sp_open_ready":
                     self._set_busy(False)
                     self.status_var.set("Ready to search.")
