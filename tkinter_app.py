@@ -13,11 +13,13 @@ import glob
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 import traceback
+import unicodedata
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
@@ -72,6 +74,17 @@ THUMB_SIZE = (128, 128)
 GRID_COLUMNS = 5
 DOWNLOAD_WORKERS = 8
 EMBED_BATCH_SIZE = 16
+
+# Added to an image's similarity score when the query matches the name of the
+# SharePoint folder it lives in. CLIP cannot know event names ("Weihnachtsfeier
+# 2024"), so without this those photos are unreachable by name. Sized against
+# measured score spread (~0.15-0.30) to promote strongly without overwhelming a
+# genuinely better visual match.
+FOLDER_NAME_BONUS = 0.08
+# Added when people previously opened an image for this same query. Capped so a
+# popular result is promoted rather than permanently pinned to the top.
+FEEDBACK_BONUS = 0.04
+FEEDBACK_BONUS_CAP = 0.10
 DEFAULT_TOP_K = 50
 
 BG_COLOR = "#0d1b2a"
@@ -103,6 +116,34 @@ def _load_logo_image(height=LOGO_HEIGHT):
         return ctk.CTkImage(light_image=img, dark_image=img, size=(width, height))
     except Exception:
         return None
+
+
+def normalize_text(text):
+    """Lowercases and strips accents so folder-name matching is tolerant of
+    German spelling variants - "Weihnachtsfeier" vs "weihnachtsfeier",
+    "Grunreb" vs "Grünreb", "Strasse" vs "Straße"."""
+    text = (text or "").lower().replace("ß", "ss")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def folder_name_match(query, folder_name):
+    """How strongly a query matches a folder name, from 0.0 to 1.0.
+
+    Substring matching (not just whole words) because German compounds the
+    words a searcher is likely to type: "feier" should match
+    "Weihnachtsfeier", and "bier" should match "Bierfest".
+    """
+    q = normalize_text(query)
+    f = normalize_text(folder_name)
+    if not q or not f:
+        return 0.0
+    terms = [t for t in q.split() if len(t) > 2]
+    if not terms:
+        return 0.0
+    hits = sum(1 for t in terms if t in f)
+    return hits / len(terms)
 
 
 def open_in_system_viewer(path):
@@ -145,6 +186,8 @@ class ImageSearchApp:
         self.worker_thread = None
         self.cancel_requested = False
         self.thumbnail_refs = []  # keep CTkImage refs alive
+        self._last_query = ""
+        self._feedback = None
 
         self._build_widgets()
         self.root.after(100, self._poll_queue)
@@ -260,6 +303,7 @@ class ImageSearchApp:
         if self.engine.embeddings is None or len(self.engine.paths) == 0:
             messagebox.showinfo("Image Search", "Index the folder first before searching.")
             return
+        self._last_query = query
         self._set_busy(True)
         self.progress.configure(mode="indeterminate")
         self.progress.start()
@@ -269,7 +313,10 @@ class ImageSearchApp:
                 self.event_queue.put(("status", msg))
 
             try:
-                results = self.engine.search_text(query, DEFAULT_TOP_K, status_callback=on_status)
+                bonus = self._compute_bonus(query)
+                results = self.engine.search_text(
+                    query, DEFAULT_TOP_K, status_callback=on_status, bonus=bonus
+                )
                 self.event_queue.put(("search_done", results))
             except Exception as exc:
                 self.event_queue.put(("error", str(exc)))
@@ -307,6 +354,71 @@ class ImageSearchApp:
     def _update_search_buttons_state(self):
         has_index = self.engine.embeddings is not None and len(self.engine.paths) > 0
         self.search_button.configure(state=tk.NORMAL if has_index else tk.DISABLED)
+
+    # ---------- search-time ranking signals ----------
+
+    def _feedback_path(self):
+        local_folder, _t, _f, _i = self._sp_cache_dirs()
+        return os.path.join(local_folder, "click_feedback.json")
+
+    def _load_feedback(self):
+        """{normalized query: {item_id: times opened}}"""
+        if self._feedback is None:
+            self._feedback = {}
+            try:
+                with open(self._feedback_path(), "r", encoding="utf-8") as f:
+                    self._feedback = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        return self._feedback
+
+    def _record_click(self, item_id):
+        """Remembers that an image was opened for the last query run.
+
+        Opening a result is the clearest signal available that it was the
+        right answer, and it was previously discarded. Recording it lets
+        frequently-searched topics improve with use, without any labelling.
+        """
+        query = normalize_text(self._last_query)
+        if not query or not item_id:
+            return
+        feedback = self._load_feedback()
+        per_query = feedback.setdefault(query, {})
+        per_query[item_id] = per_query.get(item_id, 0) + 1
+        try:
+            with open(self._feedback_path(), "w", encoding="utf-8") as f:
+                json.dump(feedback, f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def _compute_bonus(self, query):
+        """Per-image score adjustments the image embedding can't provide:
+        the name of the folder an image sits in, and prior opens for this
+        same query. Returns None when neither applies."""
+        if not self.engine.meta:
+            return None
+        feedback_for_query = self._load_feedback().get(normalize_text(query), {})
+        folder_cache = {}
+        bonus = np.zeros(len(self.engine.meta), dtype=np.float32)
+        any_bonus = False
+
+        for i, meta in enumerate(self.engine.meta):
+            if not meta:
+                continue
+            folder = meta.get("folder") or ""
+            if folder:
+                if folder not in folder_cache:
+                    folder_cache[folder] = folder_name_match(query, folder)
+                score = folder_cache[folder]
+                if score:
+                    bonus[i] += FOLDER_NAME_BONUS * score
+                    any_bonus = True
+            opens = feedback_for_query.get(meta.get("item_id"))
+            if opens:
+                bonus[i] += min(FEEDBACK_BONUS * opens, FEEDBACK_BONUS_CAP)
+                any_bonus = True
+
+        return bonus if any_bonus else None
 
     # ---------- SharePoint browsing ----------
 
@@ -381,6 +493,39 @@ class ImageSearchApp:
             )
             self.event_queue.put(("status", f"Warning: couldn't upload shared index: {exc}"))
             return False
+
+    def _backfill_folder_names(self, folder_ids, folder_names):
+        """Looks up names for folders we don't have one for yet.
+
+        Delta only reports folders that changed, so on an incremental run
+        almost no folder names arrive - including for a library indexed
+        before folder names were captured at all. This fills the gap once;
+        afterwards the names are cached and this does nothing.
+        """
+        missing = [fid for fid in folder_ids if fid not in folder_names]
+        if not missing:
+            return 0
+
+        done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+            futures = {
+                pool.submit(self.sp_client.get_item_by_path, fid, True): fid for fid in missing
+            }
+            for future in concurrent.futures.as_completed(futures):
+                fid = futures[future]
+                done += 1
+                if done % 25 == 0 or done == len(missing):
+                    self.event_queue.put(
+                        ("status", f"Reading folder names... {done}/{len(missing)}")
+                    )
+                try:
+                    name = (future.result() or {}).get("name")
+                    if name:
+                        folder_names[fid] = name
+                except Exception:
+                    continue  # a folder we can't read just misses out on name matching
+        _log_reuse(f"FOLDER NAMES: looked_up={len(missing)} known_total={len(folder_names)}")
+        return len(missing)
 
     def _repair_unuploaded_indexes(self, indexes_dir, uploaded_ok):
         """Re-uploads any locally-built folder index that never made it to
@@ -584,6 +729,7 @@ class ImageSearchApp:
         folder_map_path = os.path.join(local_folder, "item_folder_map.json")
         pending_retries_path = os.path.join(local_folder, "pending_retries.json")
         uploaded_ok_path = os.path.join(local_folder, "uploaded_ok.json")
+        folder_names_path = os.path.join(local_folder, "folder_names.json")
 
         self._sp_mode_active = True
         self._set_busy(True)
@@ -641,6 +787,14 @@ class ImageSearchApp:
                         root["id"], None, status_callback=delta_status
                     )
 
+                folder_names = {}
+                if os.path.exists(folder_names_path):
+                    try:
+                        with open(folder_names_path, "r", encoding="utf-8") as f:
+                            folder_names = json.load(f)
+                    except (json.JSONDecodeError, OSError):
+                        folder_names = {}
+
                 changed_by_folder = {}
                 deleted_ids = []
                 for item in raw_items:
@@ -649,6 +803,12 @@ class ImageSearchApp:
                         deleted_ids.append(item_id)
                         continue
                     if "folder" in item:
+                        # Folder names are what make event-based searches
+                        # ("Weihnachtsfeier") possible at all - CLIP has no
+                        # way to know them from pixels. They arrive free in
+                        # the delta listing, so capture rather than discard.
+                        if item.get("name"):
+                            folder_names[item_id] = item["name"]
                         continue
                     if not self.sp_client.is_wanted_image(item):
                         continue
@@ -703,8 +863,13 @@ class ImageSearchApp:
                 # discard each folder's thumbnail_b64 data (the bulk of its JSON) right
                 # after parsing instead of retaining all ~33k images' worth of it in
                 # memory at once alongside the CLIP model.
+                all_folder_ids = set(item_folder_map.values())
+                self._backfill_folder_names(all_folder_ids, folder_names)
+                with open(folder_names_path, "w", encoding="utf-8") as f:
+                    json.dump(folder_names, f, ensure_ascii=False)
+
                 all_entries = {}
-                for folder_id in set(item_folder_map.values()):
+                for folder_id in all_folder_ids:
                     path = os.path.join(indexes_dir, f"{folder_id}.json")
                     if os.path.exists(path):
                         try:
@@ -714,6 +879,7 @@ class ImageSearchApp:
                                 all_entries[item_id] = {
                                     "name": entry["name"],
                                     "embedding": entry["embedding"],
+                                    "folder": folder_names.get(folder_id, ""),
                                 }
                         except (json.JSONDecodeError, OSError, KeyError):
                             pass
@@ -722,7 +888,11 @@ class ImageSearchApp:
                     {
                         "path": os.path.join(thumbs_dir, f"{item_id}.jpg"),
                         "embedding": np.array(entry["embedding"], dtype=np.float32),
-                        "meta": {"item_id": item_id, "name": entry["name"]},
+                        "meta": {
+                            "item_id": item_id,
+                            "name": entry["name"],
+                            "folder": entry.get("folder", ""),
+                        },
                     }
                     for item_id, entry in all_entries.items()
                 ]
@@ -750,6 +920,7 @@ class ImageSearchApp:
         self._run_in_background(work)
 
     def _open_sp_result(self, item_id, name):
+        self._record_click(item_id)
         _local_folder, _thumbs_dir, full_dir, _indexes_dir = self._sp_cache_dirs()
         dest = os.path.join(full_dir, f"{item_id}_{name}")
         if os.path.exists(dest):
@@ -876,7 +1047,11 @@ class ImageSearchApp:
                     lambda _e, m=meta: self._open_sp_result(m["item_id"], m["name"]),
                 )
 
-            caption = f"{os.path.basename(path)}\n{score * 100:.1f}%"
+            # The SharePoint filename is almost always a camera default
+            # (DSC05540.jpg), so the folder is the only human-meaningful
+            # label a result can carry - show it when we know it.
+            folder = (meta or {}).get("folder") if meta else None
+            caption = folder if folder else os.path.basename(path)
             ctk.CTkLabel(
                 cell, text=caption, justify=tk.CENTER, wraplength=THUMB_SIZE[0],
                 text_color=MUTED_TEXT_COLOR, font=ctk.CTkFont(size=11),

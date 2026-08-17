@@ -218,9 +218,17 @@ class ImageSearchEngine:
         self.embeddings = np.stack(embeddings) if embeddings else np.zeros((0, 512), dtype=np.float32)
         return len(self.paths)
 
-    def _rank(self, query_emb, top_k, near_duplicate_threshold=NEAR_DUPLICATE_THRESHOLD):
+    def _rank(self, query_emb, top_k, near_duplicate_threshold=NEAR_DUPLICATE_THRESHOLD,
+              bonus=None):
         """Ranks purely by relevance to query_emb, demoting only genuine
         near-duplicates (e.g. burst shots of the same moment) to the end.
+
+        `bonus` is an optional array parallel to self.paths, added to the
+        similarity before ranking. It carries signals the image embedding
+        cannot know about - the name of the SharePoint folder an image
+        lives in, and which images people previously opened for this query.
+        Kept out of this class deliberately: the caller owns those signals,
+        this method only applies them.
 
         Deliberately NOT a Maximal Marginal Relevance / "diversity" ranking.
         MMR penalizes every result by how similar it is to already-picked
@@ -240,6 +248,8 @@ class ImageSearchEngine:
         if len(self.paths) == 0:
             return []
         sims = self.embeddings @ query_emb
+        if bonus is not None:
+            sims = sims + bonus
 
         # Only the strongest matches can ever appear, so near-duplicate
         # checking runs over a small pool rather than the whole library.
@@ -266,7 +276,7 @@ class ImageSearchEngine:
         order = pool_order[selected]
         return [(self.paths[i], float(sims[i]), self.meta[i]) for i in order]
 
-    def search_text(self, text, top_k=24, status_callback=None):
+    def search_text(self, text, top_k=24, status_callback=None, bonus=None):
         self.load_model(status_callback)
         query_emb = self.embed_query(text)
-        return self._rank(query_emb, top_k)
+        return self._rank(query_emb, top_k, bonus=bonus)
