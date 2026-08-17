@@ -354,12 +354,53 @@ class ImageSearchApp:
             return
         self.fav_card.configure(text=f"  Favourites ({len(self._load_favourites())})")
 
-    def _refresh_collections(self):
-        """Groups the freshly loaded index into collections, off the UI
-        thread since it embeds the collection descriptions."""
+    def _collections_cache_path(self):
+        local_folder, _t, _f, _i = self._sp_cache_dirs()
+        return os.path.join(local_folder, "collections.json")
+
+    def _save_collections(self, collections):
+        """Stores collections by image id rather than position, so they
+        survive the index being rebuilt in a different order."""
+        try:
+            by_id = {
+                name: [self.engine.meta[i].get("item_id") for i in idxs if self.engine.meta[i]]
+                for name, idxs in collections.items()
+            }
+            with open(self._collections_cache_path(), "w", encoding="utf-8") as f:
+                json.dump(by_id, f, ensure_ascii=False)
+        except (OSError, IndexError) as exc:
+            _log_reuse(f"COLLECTIONS SAVE FAILED: {exc!r}")
+
+    def _load_collections(self):
+        """Restores cached collections without needing the CLIP model.
+
+        Grouping the library requires embedding the collection descriptions,
+        which means loading the model - far too slow to do before the app is
+        usable. The grouping only changes when the library does, so it is
+        computed during a sync and simply read back here.
+        """
+        by_id = self._read_json(self._collections_cache_path())
+        if not by_id:
+            return {}
+        position = {
+            (meta or {}).get("item_id"): i for i, meta in enumerate(self.engine.meta or [])
+        }
+        result = {}
+        for name, item_ids in by_id.items():
+            idxs = [position[i] for i in item_ids if i in position]
+            if idxs:
+                result[name] = idxs
+        return result
+
+    def _refresh_collections(self, from_cache=False):
+        """Groups the loaded index into collections, off the UI thread."""
         def work():
             try:
-                collections = self._build_categories()
+                if from_cache:
+                    collections = self._load_collections()
+                else:
+                    collections = self._build_categories()
+                    self._save_collections(collections)
                 self.event_queue.put(("collections_ready", collections))
             except Exception:
                 _log_crash("building collections", sys.exc_info())
@@ -608,6 +649,11 @@ class ImageSearchApp:
                 count = self._load_fast_cache()
                 if count:
                     self.event_queue.put(("startup_ready", count))
+                # Warm the CLIP model in the background. It's needed to
+                # encode a search query, and loading it on the first search
+                # would put several seconds squarely in the user's way -
+                # here it happens while they're still reading the window.
+                self.engine.load_model()
             except Exception:
                 _log_crash("startup load", sys.exc_info())
 
@@ -1635,7 +1681,7 @@ class ImageSearchApp:
                         f"{event[1]} photos ready to search. "
                         "Click 'Search Marketing Photos' to check for new ones."
                     )
-                    self._refresh_collections()
+                    self._refresh_collections(from_cache=True)
                 elif kind == "collections_ready":
                     self._collections = event[1]
                     self._rebuild_collection_cards()
