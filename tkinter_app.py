@@ -87,6 +87,13 @@ FOLDER_NAME_BONUS = 0.08
 # popular result is promoted rather than permanently pinned to the top.
 FEEDBACK_BONUS = 0.04
 FEEDBACK_BONUS_CAP = 0.10
+
+# Collections are curated highlight reels, not catch-alls: only images
+# scoring in the top slice for a collection are admitted, and each is capped
+# so browsing stays quick. Photos containing guests are ordered ahead of
+# product and object shots within every collection.
+COLLECTION_PERCENTILE = 92
+COLLECTION_MAX = 120
 DEFAULT_TOP_K = 50
 
 BG_COLOR = "#0d1b2a"
@@ -556,7 +563,8 @@ class ImageSearchApp:
         empty = self.engine.embed_concept(
             ["an empty room with no people", "an empty venue interior", "a close up of an object"]
         )
-        has_people = self.engine.score_against(people) - self.engine.score_against(empty) > 0
+        people_score = self.engine.score_against(people) - self.engine.score_against(empty)
+        has_people = people_score > 0
 
         scores = []
         for cat in defs:
@@ -564,11 +572,14 @@ class ImageSearchApp:
             scores.append(self.engine.score_against(self.engine.embed_concept(prompts)))
         S = np.stack(scores, axis=1)
 
-        # Only images that match their best collection reasonably well are
-        # placed; the rest stay searchable but uncollected.
+        # Deliberately strict: a collection is a curated highlight reel, not
+        # everything that vaguely matches. Only the strongest matches are
+        # admitted, so a browsable collection stays worth browsing.
         best = np.argmax(S, axis=1)
         best_score = S[np.arange(len(S)), best]
-        threshold = float(np.percentile(best_score, 55)) if len(best_score) else 0.0
+        threshold = (
+            float(np.percentile(best_score, COLLECTION_PERCENTILE)) if len(best_score) else 0.0
+        )
 
         collections = {cat["name"]: [] for cat in defs}
         for i, meta in enumerate(self.engine.meta):
@@ -590,7 +601,17 @@ class ImageSearchApp:
                 continue
             collections[defs[ci]["name"]].append(i)
 
-        return {name: idxs for name, idxs in collections.items() if idxs}
+        # Photos with guests in them lead; product and object shots follow.
+        # Sorting rather than excluding keeps an all-object collection (a
+        # folder-matched one, say) usable instead of empty.
+        result = {}
+        for ci, cat in enumerate(defs):
+            idxs = collections[cat["name"]]
+            if not idxs:
+                continue
+            idxs.sort(key=lambda i: (has_people[i], float(S[i, ci])), reverse=True)
+            result[cat["name"]] = idxs[:COLLECTION_MAX]
+        return result
 
     # ---------- favourites ----------
 
