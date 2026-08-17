@@ -219,7 +219,7 @@ class ImageSearchEngine:
         return len(self.paths)
 
     def _rank(self, query_emb, top_k, near_duplicate_threshold=NEAR_DUPLICATE_THRESHOLD,
-              bonus=None):
+              bonus=None, subset=None):
         """Ranks purely by relevance to query_emb, demoting only genuine
         near-duplicates (e.g. burst shots of the same moment) to the end.
 
@@ -229,6 +229,9 @@ class ImageSearchEngine:
         lives in, and which images people previously opened for this query.
         Kept out of this class deliberately: the caller owns those signals,
         this method only applies them.
+
+        `subset` optionally restricts ranking to specific indices - used to
+        search only within a saved collection rather than the whole library.
 
         Deliberately NOT a Maximal Marginal Relevance / "diversity" ranking.
         MMR penalizes every result by how similar it is to already-picked
@@ -251,10 +254,16 @@ class ImageSearchEngine:
         if bonus is not None:
             sims = sims + bonus
 
+        candidates = np.arange(len(self.paths))
+        if subset is not None:
+            candidates = np.asarray(sorted(subset), dtype=int)
+            if len(candidates) == 0:
+                return []
+
         # Only the strongest matches can ever appear, so near-duplicate
         # checking runs over a small pool rather than the whole library.
-        pool_size = min(len(self.paths), max(top_k * 6, 200))
-        pool_order = np.argsort(-sims)[:pool_size]
+        pool_size = min(len(candidates), max(top_k * 6, 200))
+        pool_order = candidates[np.argsort(-sims[candidates])[:pool_size]]
         pool_embs = self.embeddings[pool_order]
 
         k = min(top_k, len(pool_order))
@@ -276,7 +285,7 @@ class ImageSearchEngine:
         order = pool_order[selected]
         return [(self.paths[i], float(sims[i]), self.meta[i]) for i in order]
 
-    def search_text(self, text, top_k=24, status_callback=None, bonus=None):
+    def search_text(self, text, top_k=24, status_callback=None, bonus=None, subset=None):
         self.load_model(status_callback)
         query_emb = self.embed_query(text)
-        return self._rank(query_emb, top_k, bonus=bonus)
+        return self._rank(query_emb, top_k, bonus=bonus, subset=subset)

@@ -215,6 +215,10 @@ class ImageSearchApp:
         self.thumbnail_refs = []  # keep CTkImage refs alive
         self._last_query = ""
         self._feedback = None
+        self._favourites = None
+        self._view = "all"
+        self.all_card = None
+        self.fav_card = None
 
         self._build_widgets()
         self.root.after(100, self._poll_queue)
@@ -247,16 +251,34 @@ class ImageSearchApp:
         )
         self.sharepoint_button.pack(side=tk.LEFT, padx=(4, 14), pady=14)
 
-        search_frame = ctk.CTkFrame(self.root, fg_color=CARD_COLOR, corner_radius=CARD_RADIUS)
-        search_frame.pack(fill=tk.X, padx=12, pady=(0, 12))
+        # Sidebar (collection cards) beside the search area and results, so
+        # switching collection keeps the same search box rather than moving it.
+        body = ctk.CTkFrame(self.root, fg_color="transparent")
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+
+        sidebar = ctk.CTkFrame(body, fg_color="transparent", width=176)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
+        sidebar.pack_propagate(False)
+
+        self.all_card = self._make_collection_card(sidebar, "All photos", lambda: self._set_view("all"))
+        self.fav_card = self._make_collection_card(
+            sidebar, "Favourites", lambda: self._set_view("favourites")
+        )
+
+        main = ctk.CTkFrame(body, fg_color="transparent")
+        main.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        search_frame = ctk.CTkFrame(main, fg_color=CARD_COLOR, corner_radius=CARD_RADIUS)
+        search_frame.pack(fill=tk.X, pady=(0, 12))
 
         self.query_var = tk.StringVar()
-        query_entry = ctk.CTkEntry(
+        self.query_entry = ctk.CTkEntry(
             search_frame, textvariable=self.query_var, fg_color=FIELD_BG,
             text_color=TEXT_COLOR, border_width=0, corner_radius=10,
+            placeholder_text="Describe an image in English...",
         )
-        query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(14, 8), pady=14)
-        query_entry.bind("<Return>", lambda _e: self._start_text_search())
+        self.query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(14, 8), pady=14)
+        self.query_entry.bind("<Return>", lambda _e: self._start_text_search())
 
         self.search_button = _make_button(
             search_frame, "Search", self._start_text_search, width=100
@@ -264,8 +286,8 @@ class ImageSearchApp:
         self.search_button.pack(side=tk.LEFT, padx=(0, 14), pady=14)
         self.search_button.configure(state=tk.DISABLED)
 
-        status_frame = ctk.CTkFrame(self.root, fg_color="transparent")
-        status_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
+        status_frame = ctk.CTkFrame(main, fg_color="transparent")
+        status_frame.pack(fill=tk.X, pady=(0, 8))
         self.status_var = tk.StringVar(value="Choose a folder to begin.")
         ctk.CTkLabel(
             status_frame, textvariable=self.status_var, text_color=TEXT_COLOR, anchor="w",
@@ -278,8 +300,70 @@ class ImageSearchApp:
 
         # Scrollable results grid - CTkScrollableFrame already handles its
         # own internal canvas, scrollbar, and mousewheel binding.
-        self.results_frame = ctk.CTkScrollableFrame(self.root, fg_color=BG_COLOR)
-        self.results_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+        self.results_frame = ctk.CTkScrollableFrame(main, fg_color=BG_COLOR)
+        self.results_frame.pack(fill=tk.BOTH, expand=True)
+
+        self._update_favourites_button()
+        self._set_view("all")
+
+    def _make_collection_card(self, parent, text, command):
+        card = ctk.CTkButton(
+            parent,
+            text=text,
+            command=command,
+            height=48,
+            corner_radius=CARD_RADIUS,
+            fg_color=CARD_COLOR,
+            hover_color=ACCENT_COLOR,
+            text_color=TEXT_COLOR,
+            anchor="w",
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+        )
+        card.pack(fill=tk.X, pady=(0, 8))
+        return card
+
+    def _update_favourites_button(self):
+        if getattr(self, "fav_card", None) is None:
+            return
+        self.fav_card.configure(text=f"  Favourites ({len(self._load_favourites())})")
+
+    def _set_view(self, view):
+        """Switches which collection the search box searches."""
+        self._view = view
+        is_fav = view == "favourites"
+        self.all_card.configure(fg_color=ACCENT_COLOR if not is_fav else CARD_COLOR)
+        self.fav_card.configure(fg_color=ACCENT_COLOR if is_fav else CARD_COLOR)
+        self.all_card.configure(text="  All photos")
+        self._update_favourites_button()
+        if is_fav:
+            self.query_entry.configure(placeholder_text="Search your favourites...")
+            self._show_favourites()
+        else:
+            self.query_entry.configure(placeholder_text="Describe an image in English...")
+            self._render_results([])
+            self.status_var.set("Ready to search." if self.engine.paths else self.status_var.get())
+
+    def _show_favourites(self):
+        """Lists every favourite, newest first, with no search term needed."""
+        favs = self._load_favourites()
+        if not favs:
+            self._render_results([])
+            self.status_var.set("No favourites yet - click the star on any result to save it.")
+            return
+        by_key = {}
+        for i, meta in enumerate(self.engine.meta or []):
+            by_key[self._fav_key(self.engine.paths[i], meta)] = i
+
+        results = []
+        for key, entry in reversed(list(favs.items())):
+            idx = by_key.get(key)
+            if idx is not None:
+                results.append((self.engine.paths[idx], 1.0, self.engine.meta[idx]))
+            elif entry.get("path") and os.path.exists(entry["path"]):
+                # Favourited before the current index was loaded - still show it.
+                results.append((entry["path"], 1.0, entry))
+        self._render_results(results)
+        self.status_var.set(f"{len(results)} favourite(s).")
 
     # ---------- folder selection & indexing ----------
 
@@ -330,6 +414,13 @@ class ImageSearchApp:
         if self.engine.embeddings is None or len(self.engine.paths) == 0:
             messagebox.showinfo("Image Search", "Index the folder first before searching.")
             return
+        subset = None
+        if self._view == "favourites":
+            subset = self._favourite_indices()
+            if not subset:
+                self.status_var.set("No favourites yet - click the star on any result to save it.")
+                return
+
         self._last_query = query
         self._set_busy(True)
         self.progress.configure(mode="indeterminate")
@@ -342,7 +433,7 @@ class ImageSearchApp:
             try:
                 bonus = self._compute_bonus(query)
                 results = self.engine.search_text(
-                    query, DEFAULT_TOP_K, status_callback=on_status, bonus=bonus
+                    query, DEFAULT_TOP_K, status_callback=on_status, bonus=bonus, subset=subset
                 )
                 self.event_queue.put(("search_done", results))
             except Exception as exc:
@@ -383,6 +474,69 @@ class ImageSearchApp:
         self.search_button.configure(state=tk.NORMAL if has_index else tk.DISABLED)
 
     # ---------- search-time ranking signals ----------
+
+    # ---------- favourites ----------
+
+    @staticmethod
+    def _fav_key(path, meta):
+        """Stable id for a result. SharePoint items keep their driveItem id
+        so favourites survive re-indexing and cache clears; local-folder
+        images fall back to their path."""
+        if meta and meta.get("item_id"):
+            return meta["item_id"]
+        return path
+
+    def _favourites_path(self):
+        local_folder, _t, _f, _i = self._sp_cache_dirs()
+        return os.path.join(local_folder, "favourites.json")
+
+    def _load_favourites(self):
+        if self._favourites is None:
+            data = self._read_json(self._favourites_path())
+            entries = data.get("items") if isinstance(data, dict) else None
+            self._favourites = entries if isinstance(entries, dict) else {}
+        return self._favourites
+
+    def _save_favourites(self):
+        try:
+            os.makedirs(os.path.dirname(self._favourites_path()), exist_ok=True)
+            with open(self._favourites_path(), "w", encoding="utf-8") as f:
+                json.dump({"items": self._load_favourites()}, f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def _is_favourite(self, key):
+        return key in self._load_favourites()
+
+    def _toggle_favourite(self, key, path, meta):
+        favs = self._load_favourites()
+        if key in favs:
+            del favs[key]
+            added = False
+        else:
+            # Store enough to render a favourite even when it isn't part of
+            # the currently loaded index (e.g. before a SharePoint sync).
+            favs[key] = {
+                "path": path,
+                "name": (meta or {}).get("name", os.path.basename(path)),
+                "folder": (meta or {}).get("folder", ""),
+                "item_id": (meta or {}).get("item_id", ""),
+            }
+            added = True
+        self._save_favourites()
+        self._update_favourites_button()
+        return added
+
+    def _favourite_indices(self):
+        """Positions in the loaded index that are favourited."""
+        favs = self._load_favourites()
+        if not favs or not self.engine.meta:
+            return []
+        return [
+            i
+            for i, meta in enumerate(self.engine.meta)
+            if self._fav_key(self.engine.paths[i], meta) in favs
+        ]
 
     def _feedback_path(self):
         """This machine's own contributions - the file that gets uploaded."""
@@ -1122,15 +1276,35 @@ class ImageSearchApp:
                 continue
             self.thumbnail_refs.append(photo)
 
-            label = ctk.CTkLabel(cell, image=photo, text="", cursor="hand2")
+            holder = ctk.CTkFrame(cell, fg_color="transparent")
+            holder.pack()
+            label = ctk.CTkLabel(holder, image=photo, text="", cursor="hand2")
             label.pack()
-            if meta is None:
+            if meta is None or not meta.get("item_id"):
                 label.bind("<Double-Button-1>", lambda _e, p=path: open_in_system_viewer(p))
             else:
                 label.bind(
                     "<Double-Button-1>",
                     lambda _e, m=meta: self._open_sp_result(m["item_id"], m["name"]),
                 )
+
+            key = self._fav_key(path, meta)
+            star = ctk.CTkLabel(
+                holder,
+                text="★" if self._is_favourite(key) else "☆",
+                text_color="#ffd54a" if self._is_favourite(key) else "#ffffff",
+                font=ctk.CTkFont(size=20),
+                fg_color=CARD_COLOR,
+                corner_radius=8,
+                width=26,
+                height=24,
+                cursor="hand2",
+            )
+            star.place(relx=1.0, rely=0.0, anchor="ne", x=-3, y=3)
+            star.bind(
+                "<Button-1>",
+                lambda _e, k=key, p=path, m=meta, w=star: self._on_star_clicked(k, p, m, w),
+            )
 
             # The SharePoint filename is almost always a camera default
             # (DSC05540.jpg), so the folder is the only human-meaningful
@@ -1141,6 +1315,16 @@ class ImageSearchApp:
                 cell, text=caption, justify=tk.CENTER, wraplength=THUMB_SIZE[0],
                 text_color=MUTED_TEXT_COLOR, font=ctk.CTkFont(size=11),
             ).pack()
+
+    def _on_star_clicked(self, key, path, meta, widget):
+        added = self._toggle_favourite(key, path, meta)
+        widget.configure(
+            text="★" if added else "☆",
+            text_color="#ffd54a" if added else "#ffffff",
+        )
+        # Un-starring while viewing favourites should drop it from the list.
+        if self._view == "favourites" and not added:
+            self._show_favourites()
 
 
 def _thread_excepthook(args):
