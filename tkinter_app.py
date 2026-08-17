@@ -105,6 +105,11 @@ COLLECTION_MAX = 120
 # only clear cases are excluded - a photo that merely contains a sign in
 # the background shouldn't be treated as finished artwork.
 TEXT_OVERLAY_MARGIN = 0.005
+
+# Results follow typing rather than waiting for Enter. The delay only avoids
+# re-encoding the query text on every keystroke; ranking itself is instant.
+LIVE_SEARCH_DELAY_MS = 350
+LIVE_SEARCH_MIN_CHARS = 3
 DEFAULT_TOP_K = 50
 
 BG_COLOR = "#0d1b2a"
@@ -235,6 +240,8 @@ class ImageSearchApp:
         self._feedback = None
         self._favourites = None
         self._settings = None
+        self._search_after_id = None
+        self._search_seq = 0
         self._view = "all"
         self._collections = {}
         self.all_card = None
@@ -243,6 +250,7 @@ class ImageSearchApp:
 
         self._build_widgets()
         self.root.after(100, self._poll_queue)
+        self._startup_load()
 
     # ---------- UI construction ----------
 
@@ -305,6 +313,7 @@ class ImageSearchApp:
         )
         self.query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(14, 8), pady=14)
         self.query_entry.bind("<Return>", lambda _e: self._start_text_search())
+        self.query_var.trace_add("write", lambda *_: self._on_query_changed())
 
         self.search_button = _make_button(
             search_frame, "Search", self._start_text_search, width=100
@@ -468,6 +477,59 @@ class ImageSearchApp:
 
         self._run_in_background(work)
 
+    def _on_query_changed(self):
+        """Runs the search shortly after typing stops.
+
+        Ranking is a single matrix multiply, so results can keep up with
+        typing. The delay is there to avoid re-encoding the text on every
+        keystroke, not because the search is slow.
+        """
+        if self._search_after_id is not None:
+            try:
+                self.root.after_cancel(self._search_after_id)
+            except Exception:
+                pass
+        self._search_after_id = self.root.after(LIVE_SEARCH_DELAY_MS, self._live_search)
+
+    def _live_search(self):
+        self._search_after_id = None
+        query = self.query_var.get().strip()
+        if len(query) < LIVE_SEARCH_MIN_CHARS:
+            return
+        if self.engine.embeddings is None or len(self.engine.paths) == 0:
+            return
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            return  # an indexing run is in progress; don't compete with it
+
+        subset = self._active_subset()
+        if subset is not None and not subset:
+            return
+
+        self._search_seq += 1
+        seq = self._search_seq
+        self._last_query = query
+
+        def work():
+            try:
+                bonus = self._compute_bonus(query)
+                results = self.engine.search_text(
+                    query, DEFAULT_TOP_K, bonus=bonus, subset=subset
+                )
+                # Discard if the user has typed more since this started.
+                self.event_queue.put(("live_results", seq, results))
+            except Exception:
+                _log_crash("live search", sys.exc_info())
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _active_subset(self):
+        """Indices the current collection restricts search to, or None."""
+        if self._view == "favourites":
+            return self._favourite_indices()
+        if self._view in (self._collections or {}):
+            return self._collections[self._view]
+        return None
+
     def _start_text_search(self):
         query = self.query_var.get().strip()
         if not query:
@@ -475,14 +537,10 @@ class ImageSearchApp:
         if self.engine.embeddings is None or len(self.engine.paths) == 0:
             messagebox.showinfo("Image Search", "Index the folder first before searching.")
             return
-        subset = None
-        if self._view == "favourites":
-            subset = self._favourite_indices()
-            if not subset:
-                self.status_var.set("No favourites yet - click the star on any result to save it.")
-                return
-        elif self._view in (self._collections or {}):
-            subset = self._collections[self._view]
+        subset = self._active_subset()
+        if self._view == "favourites" and not subset:
+            self.status_var.set("No favourites yet - click the star on any result to save it.")
+            return
 
         self._last_query = query
         self._set_busy(True)
@@ -537,6 +595,76 @@ class ImageSearchApp:
         self.search_button.configure(state=tk.NORMAL if has_index else tk.DISABLED)
 
     # ---------- search-time ranking signals ----------
+
+    # ---------- fast local index ----------
+
+    def _fast_cache_paths(self):
+        local_folder, _t, _f, _i = self._sp_cache_dirs()
+        return (
+            os.path.join(local_folder, "index_embeddings.npy"),
+            os.path.join(local_folder, "index_meta.json"),
+        )
+
+    def _save_fast_cache(self, sp_items):
+        """Writes the searchable index in a form that loads quickly.
+
+        The per-folder JSON files are the shared, authoritative copy, but
+        parsing them all costs seconds: most of their bytes are base64
+        thumbnails that get discarded, and every embedding is stored as
+        text. Keeping a compact binary copy means opening the app doesn't
+        have to pay that.
+        """
+        emb_path, meta_path = self._fast_cache_paths()
+        try:
+            if sp_items:
+                np.save(emb_path, np.stack([i["embedding"] for i in sp_items]))
+            meta = {
+                "paths": [i["path"] for i in sp_items],
+                "meta": [i["meta"] for i in sp_items],
+            }
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False)
+        except (OSError, ValueError) as exc:
+            _log_reuse(f"FAST CACHE SAVE FAILED: {exc!r}")
+
+    def _load_fast_cache(self):
+        """Loads the compact index if present. Returns image count, or 0."""
+        emb_path, meta_path = self._fast_cache_paths()
+        if not (os.path.exists(emb_path) and os.path.exists(meta_path)):
+            return 0
+        try:
+            embeddings = np.load(emb_path)
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            paths, metas = meta.get("paths") or [], meta.get("meta") or []
+            if len(paths) != len(embeddings) or len(metas) != len(embeddings):
+                return 0
+            self.engine.folder = None
+            self.engine.paths = paths
+            self.engine.meta = metas
+            self.engine.embeddings = embeddings
+            return len(paths)
+        except Exception as exc:
+            _log_reuse(f"FAST CACHE LOAD FAILED: {exc!r}")
+            return 0
+
+    def _startup_load(self):
+        """Makes the app usable immediately, without signing in.
+
+        Everything needed to search is already on disk from the last run,
+        so waiting for a SharePoint sync before the first search is pure
+        dead time. The sync still happens - when the user asks for it - and
+        replaces this with fresh results.
+        """
+        def work():
+            try:
+                count = self._load_fast_cache()
+                if count:
+                    self.event_queue.put(("startup_ready", count))
+            except Exception:
+                _log_crash("startup load", sys.exc_info())
+
+        self._run_in_background(work)
 
     # ---------- settings ----------
 
@@ -1417,6 +1545,7 @@ class ImageSearchApp:
                     for item_id, entry in all_entries.items()
                 ]
                 count = self.engine.load_sp_items(sp_items)
+                self._save_fast_cache(sp_items)
 
                 self.event_queue.put(("status", "Syncing team favourites and feedback..."))
                 self._sync_feedback(root["id"])
@@ -1550,6 +1679,20 @@ class ImageSearchApp:
                             f"Up to date - {count} image(s) already indexed. "
                             f"Ready to search.{retry_note}"
                         )
+                    self._refresh_collections()
+                elif kind == "live_results":
+                    _, seq, results = event
+                    if seq == self._search_seq:  # ignore superseded searches
+                        self._render_results(results)
+                        self.status_var.set(f"{len(results)} result(s).")
+                elif kind == "startup_ready":
+                    self._sp_mode_active = True
+                    self.folder_var.set("SharePoint: Fotos & Videos (all subfolders)")
+                    self._set_busy(False)
+                    self.status_var.set(
+                        f"{event[1]} photos ready to search. "
+                        "Click 'Search Marketing Photos' to check for new ones."
+                    )
                     self._refresh_collections()
                 elif kind == "collections_ready":
                     self._collections = event[1]
