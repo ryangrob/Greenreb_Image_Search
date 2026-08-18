@@ -79,7 +79,13 @@ def _log_reuse(line):
 
 
 THUMB_SIZE = (128, 128)
-GRID_COLUMNS = 5
+GRID_COLUMNS = 5  # fallback used only before the results area has a real size
+GRID_CELL_PADDING = 24  # horizontal space a grid cell needs beyond the thumbnail itself
+RESIZE_DEBOUNCE_MS = 150
+# CTkScrollableFrame moves 1px per scroll "unit" on Windows and ~20 units per
+# wheel notch; multiplying the increment scales the distance per notch
+# without touching the wheel event handling itself.
+SCROLL_SPEED_MULTIPLIER = 3
 DOWNLOAD_WORKERS = 8
 EMBED_BATCH_SIZE = 16
 
@@ -99,14 +105,14 @@ FEEDBACK_BONUS_CAP = 0.10
 # so browsing stays quick. Photos containing guests are ordered ahead of
 # product and object shots within every collection.
 COLLECTION_PERCENTILE = 92
-COLLECTION_MAX = 120
+COLLECTION_MAX = 150
 # How much more "graphic with text on it" than "plain photograph" an image
 # has to look before it's kept out of collections. Slightly above zero so
 # only clear cases are excluded - a photo that merely contains a sign in
 # the background shouldn't be treated as finished artwork.
 TEXT_OVERLAY_MARGIN = -0.012
 HISTORY_MAX = 100
-DEFAULT_TOP_K = 50
+DEFAULT_TOP_K = 150
 
 BG_COLOR = "#0d1b2a"
 CARD_COLOR = "#0a141f"
@@ -238,6 +244,10 @@ class ImageSearchApp:
         self._settings = None
         self._history = None
         self._landscape_cache = {}
+        self._people_vec = None
+        self._empty_vec = None
+        self._current_columns = GRID_COLUMNS
+        self._resize_after_id = None
         self._view = "all"
         self._collections = {}
         self.all_card = None
@@ -345,6 +355,16 @@ class ImageSearchApp:
         # own internal canvas, scrollbar, and mousewheel binding.
         self.results_frame = ctk.CTkScrollableFrame(main, fg_color=BG_COLOR)
         self.results_frame.pack(fill=tk.BOTH, expand=True)
+        # CustomTkinter moves 1 pixel per scroll "unit" on Windows, which
+        # feels sluggish over a tall grid of 150 results - scaling the
+        # increment (rather than rebinding the wheel handler, which would
+        # stack a second handler on top of CTk's own) makes each notch move
+        # further without changing how scrolling behaves in any other way.
+        self.results_frame._parent_canvas.configure(
+            yscrollincrement=SCROLL_SPEED_MULTIPLIER
+        )
+        self._last_results = []
+        self.results_frame.bind("<Configure>", lambda _e: self._on_results_area_resized())
 
         self._update_favourites_button()
         self._set_view("all")
@@ -571,6 +591,7 @@ class ImageSearchApp:
                 results = self.engine.search_text(
                     query, DEFAULT_TOP_K, status_callback=on_status, bonus=bonus, subset=subset
                 )
+                results = self._order_by_orientation_and_people(results)
                 self.event_queue.put(("search_done", results))
             except Exception as exc:
                 self.event_queue.put(("error", str(exc)))
@@ -869,6 +890,52 @@ class ImageSearchApp:
                 return cats
         return []
 
+    def _people_score(self):
+        """Per-image "has guests in it" score for the whole loaded index,
+        cached since the concept vectors never change between calls."""
+        if self._people_vec is None:
+            self._people_vec = self.engine.embed_concept(
+                ["people enjoying themselves", "a group of happy people", "guests having fun"]
+            )
+            self._empty_vec = self.engine.embed_concept(
+                ["an empty room with no people", "an empty venue interior", "a close up of an object"]
+            )
+        return self.engine.score_against(self._people_vec) - self.engine.score_against(self._empty_vec)
+
+    def _order_by_orientation_and_people(self, results):
+        """Re-orders a set of search results: landscape-with-guests,
+        landscape, portrait-with-guests, portrait.
+
+        Applies the same rule collections already use, but to plain search
+        results too - a text search only ranks by relevance, so without
+        this a query like "golf gameplay nighttime" mixes orientations and
+        empty-venue shots in with photos of guests, in whatever order
+        similarity happened to produce.
+
+        Only touches the returned results (at most a couple hundred
+        images), not the whole library, and is a stable sort - within each
+        of the four groups, the original relevance order is preserved.
+        """
+        if not results:
+            return results
+        path_to_index = {p: i for i, p in enumerate(self.engine.paths)}
+        idxs = [path_to_index.get(path) for path, _score, _meta in results]
+
+        has_people = {}
+        valid = [i for i in idxs if i is not None]
+        if valid:
+            scores = self._people_score()
+            for i in valid:
+                has_people[i] = bool(scores[i] > 0)
+
+        def key(item, idx):
+            if idx is None:
+                return (False, False)
+            return (self._is_landscape(idx), has_people.get(idx, False))
+
+        order = sorted(range(len(results)), key=lambda n: key(results[n], idxs[n]), reverse=True)
+        return [results[n] for n in order]
+
     def _build_categories(self):
         """Assigns each indexed image to at most one collection.
 
@@ -886,14 +953,7 @@ class ImageSearchApp:
         if not defs or not self.engine.paths:
             return {}
 
-        people = self.engine.embed_concept(
-            ["people enjoying themselves", "a group of happy people", "guests having fun"]
-        )
-        empty = self.engine.embed_concept(
-            ["an empty room with no people", "an empty venue interior", "a close up of an object"]
-        )
-        people_score = self.engine.score_against(people) - self.engine.score_against(empty)
-        has_people = people_score > 0
+        has_people = self._people_score() > 0
 
         # Finished graphics - posters, adverts, anything with wording burnt
         # into the image - are not raw source material, so they're kept out
@@ -1751,6 +1811,14 @@ class ImageSearchApp:
 
         def work():
             try:
+                if self.sp_client is None:
+                    # Instant startup means a result can be opened before
+                    # "Search Marketing Photos" has ever run this session,
+                    # so the SharePoint connection may not exist yet.
+                    self.event_queue.put(("status", "Signing in to Microsoft..."))
+                    self.sp_client = SharePointClient()
+                    self.sp_client.sign_in()
+                    self.event_queue.put(("status", f"Downloading {name}..."))
                 item = {"id": item_id}
                 self.sp_client.download_file(item, dest)
                 self.event_queue.put(("sp_open_ready", dest, name))
@@ -1855,13 +1923,44 @@ class ImageSearchApp:
 
     # ---------- results rendering ----------
 
+    def _desired_columns(self):
+        """How many result columns fit the results area at its current
+        width, so the grid fills the window (and expands to fill it when
+        maximized) instead of sitting at a fixed column count."""
+        width = self.results_frame.winfo_width()
+        if width <= 1:
+            return GRID_COLUMNS
+        cell_width = THUMB_SIZE[0] + GRID_CELL_PADDING
+        return max(1, (width - GRID_CELL_PADDING) // cell_width)
+
+    def _on_results_area_resized(self):
+        """Re-lays out the current results at the new column count, once
+        resizing has paused rather than on every intermediate size during a
+        window drag."""
+        if self._resize_after_id is not None:
+            try:
+                self.root.after_cancel(self._resize_after_id)
+            except Exception:
+                pass
+        self._resize_after_id = self.root.after(RESIZE_DEBOUNCE_MS, self._apply_resize)
+
+    def _apply_resize(self):
+        self._resize_after_id = None
+        columns = self._desired_columns()
+        if columns != self._current_columns:
+            self._current_columns = columns
+            if self._last_results:
+                self._render_results(self._last_results)
+
     def _render_results(self, results):
+        self._last_results = results
+        columns = max(1, self._current_columns)
         for child in self.results_frame.winfo_children():
             child.destroy()
         self.thumbnail_refs.clear()
 
         for idx, (path, score, meta) in enumerate(results):
-            row, col = divmod(idx, GRID_COLUMNS)
+            row, col = divmod(idx, columns)
             cell = ctk.CTkFrame(self.results_frame, fg_color="transparent")
             cell.grid(row=row, column=col, sticky="n", padx=4, pady=4)
 
