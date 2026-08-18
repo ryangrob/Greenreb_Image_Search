@@ -18,6 +18,7 @@ py -m PyInstaller --noconfirm --onedir --windowed --name Greenreb_Image_Search ^
     --collect-all sentence_transformers ^
     --collect-all transformers ^
     --collect-all tokenizers ^
+    --hidden-import unicodedata ^
     --add-data "model_cache;model_cache" ^
     --add-data "assets;assets" ^
     --version-file "version_info.txt" ^
