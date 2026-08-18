@@ -104,7 +104,8 @@ COLLECTION_MAX = 120
 # has to look before it's kept out of collections. Slightly above zero so
 # only clear cases are excluded - a photo that merely contains a sign in
 # the background shouldn't be treated as finished artwork.
-TEXT_OVERLAY_MARGIN = 0.005
+TEXT_OVERLAY_MARGIN = -0.012
+HISTORY_MAX = 100
 DEFAULT_TOP_K = 50
 
 BG_COLOR = "#0d1b2a"
@@ -219,8 +220,8 @@ class ImageSearchApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Greenreb_Image_Search")
-        self.root.geometry("980x720")
-        self.root.minsize(760, 520)
+        self.root.geometry("1180x760")
+        self.root.minsize(1000, 560)
 
         self.engine = ImageSearchEngine()
         self.sp_client = None
@@ -235,6 +236,8 @@ class ImageSearchApp:
         self._feedback = None
         self._favourites = None
         self._settings = None
+        self._history = None
+        self._landscape_cache = {}
         self._view = "all"
         self._collections = {}
         self.all_card = None
@@ -261,10 +264,12 @@ class ImageSearchApp:
         _make_button(top, "Choose Folder...", self._choose_folder, width=150).pack(
             side=tk.LEFT, padx=(14, 8), pady=14
         )
+        # Sized so the buttons to its right still fit at the minimum window
+        # width rather than being clipped off the edge.
         ctk.CTkLabel(
-            top, textvariable=self.folder_var, width=340, anchor="w",
+            top, textvariable=self.folder_var, width=150, anchor="w",
             text_color=MUTED_TEXT_COLOR,
-        ).pack(side=tk.LEFT, padx=8, pady=14)
+        ).pack(side=tk.LEFT, padx=8, pady=14, fill=tk.X, expand=True)
         self.index_button = _make_button(top, "Index Folder", self._start_indexing, width=130)
         self.index_button.pack(side=tk.LEFT, padx=4, pady=14)
         self.index_button.configure(state=tk.DISABLED)
@@ -290,6 +295,14 @@ class ImageSearchApp:
         self.fav_card = self._make_collection_card(
             sidebar, "Favourites", lambda: self._set_view("favourites")
         )
+        self.history_card = self._make_collection_card(
+            sidebar, "Search history", lambda: self._set_view("history")
+        )
+        # Separates the three ways of looking at the whole library from the
+        # automatic collections below.
+        ctk.CTkFrame(sidebar, fg_color=ACCENT_ACTIVE, height=3, corner_radius=2).pack(
+            fill=tk.X, pady=(6, 10)
+        )
         self.collection_cards = {}
 
         main = ctk.CTkFrame(body, fg_color="transparent")
@@ -312,6 +325,9 @@ class ImageSearchApp:
         )
         self.search_button.pack(side=tk.LEFT, padx=(0, 14), pady=14)
         self.search_button.configure(state=tk.DISABLED)
+
+        self.suggestion_bar = ctk.CTkFrame(main, fg_color="transparent")
+        self.suggestion_bar.pack(fill=tk.X, pady=(0, 8))
 
         status_frame = ctk.CTkFrame(main, fg_color="transparent")
         status_frame.pack(fill=tk.X, pady=(0, 8))
@@ -353,6 +369,11 @@ class ImageSearchApp:
         if getattr(self, "fav_card", None) is None:
             return
         self.fav_card.configure(text=f"  Favourites ({len(self._load_favourites())})")
+
+    def _update_history_button(self):
+        if getattr(self, "history_card", None) is None:
+            return
+        self.history_card.configure(text=f"  Search history ({len(self._load_history())})")
 
     def _collections_cache_path(self):
         local_folder, _t, _f, _i = self._sp_cache_dirs()
@@ -424,11 +445,16 @@ class ImageSearchApp:
             text="  All photos", fg_color=ACCENT_COLOR if view == "all" else CARD_COLOR
         )
         self.fav_card.configure(fg_color=ACCENT_COLOR if view == "favourites" else CARD_COLOR)
+        self.history_card.configure(fg_color=ACCENT_COLOR if view == "history" else CARD_COLOR)
         self._update_favourites_button()
+        self._update_history_button()
         for name, card in self.collection_cards.items():
             card.configure(fg_color=ACCENT_COLOR if view == name else CARD_COLOR)
 
-        if view == "favourites":
+        if view == "history":
+            self.query_entry.configure(placeholder_text="Describe an image in English...")
+            self._show_history()
+        elif view == "favourites":
             self.query_entry.configure(placeholder_text="Search your favourites...")
             self._show_favourites()
         elif view in (self._collections or {}):
@@ -531,6 +557,7 @@ class ImageSearchApp:
             return
 
         self._last_query = query
+        self._record_search(query)
         self._set_busy(True)
         self.progress.configure(mode="indeterminate")
         self.progress.start()
@@ -583,6 +610,105 @@ class ImageSearchApp:
         self.search_button.configure(state=tk.NORMAL if has_index else tk.DISABLED)
 
     # ---------- search-time ranking signals ----------
+
+    # ---------- search history ----------
+
+    def _history_path(self):
+        local_folder, _t, _f, _i = self._sp_cache_dirs()
+        return os.path.join(local_folder, "search_history.json")
+
+    def _load_history(self):
+        """Most recent first: [{"term": ..., "at": iso timestamp}, ...]"""
+        if self._history is None:
+            data = self._read_json(self._history_path())
+            entries = data.get("searches") if isinstance(data, dict) else None
+            self._history = entries if isinstance(entries, list) else []
+        return self._history
+
+    def _record_search(self, term):
+        term = (term or "").strip()
+        if not term:
+            return
+        history = self._load_history()
+        # Repeating a search updates its time rather than adding a duplicate,
+        # so the list stays a record of what was looked for, not how often
+        # the same thing was retyped.
+        normalized = normalize_text(term)
+        history[:] = [h for h in history if normalize_text(h.get("term", "")) != normalized]
+        history.insert(0, {"term": term, "at": datetime.datetime.now().isoformat(timespec="minutes")})
+        del history[HISTORY_MAX:]
+        try:
+            with open(self._history_path(), "w", encoding="utf-8") as f:
+                json.dump({"searches": history}, f, ensure_ascii=False)
+        except OSError:
+            pass
+        self._refresh_suggestions()
+        self._update_history_button()
+
+    def _top_terms(self, count=5):
+        """The terms searched most often, for the shortcut buttons."""
+        counts = {}
+        for entry in self._load_history():
+            term = (entry.get("term") or "").strip()
+            if term:
+                counts[term] = counts.get(term, 0) + entry.get("uses", 1)
+        return [t for t, _ in sorted(counts.items(), key=lambda kv: -kv[1])][:count]
+
+    def _refresh_suggestions(self):
+        """Rebuilds the shortcut buttons under the search box."""
+        if getattr(self, "suggestion_bar", None) is None:
+            return
+        for child in self.suggestion_bar.winfo_children():
+            child.destroy()
+        terms = [h.get("term") for h in self._load_history()[:5] if h.get("term")]
+        if not terms:
+            return
+        ctk.CTkLabel(
+            self.suggestion_bar, text="Recent:", text_color=MUTED_TEXT_COLOR,
+            font=ctk.CTkFont(size=11),
+        ).pack(side=tk.LEFT, padx=(2, 6))
+        for term in terms:
+            ctk.CTkButton(
+                self.suggestion_bar, text=term, height=26, corner_radius=13,
+                fg_color=CARD_COLOR, hover_color=ACCENT_COLOR, text_color=TEXT_COLOR,
+                font=ctk.CTkFont(size=11), width=0,
+                command=lambda t=term: self._search_term(t),
+            ).pack(side=tk.LEFT, padx=3)
+
+    def _search_term(self, term):
+        """Runs a search for a saved term, switching back to the full library
+        so a stored search isn't silently narrowed by whatever collection
+        happened to be open."""
+        if self._view not in ("all", "favourites") and self._view != "history":
+            pass
+        if self._view == "history":
+            self._set_view("all")
+        self.query_var.set(term)
+        self._start_text_search()
+
+    def _show_history(self):
+        history = self._load_history()
+        for child in self.results_frame.winfo_children():
+            child.destroy()
+        self.thumbnail_refs.clear()
+        if not history:
+            self.status_var.set("No searches yet - your search history will appear here.")
+            return
+        self.status_var.set(f"{len(history)} previous search(es). Click one to run it again.")
+        for entry in history:
+            term = entry.get("term", "")
+            when = (entry.get("at") or "").replace("T", " ")
+            row = ctk.CTkFrame(self.results_frame, fg_color=CARD_COLOR, corner_radius=10)
+            row.pack(fill=tk.X, padx=4, pady=3)
+            ctk.CTkButton(
+                row, text=term, anchor="w", height=34, corner_radius=8,
+                fg_color="transparent", hover_color=ACCENT_COLOR, text_color=TEXT_COLOR,
+                font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+                command=lambda t=term: self._search_term(t),
+            ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 4), pady=4)
+            ctk.CTkLabel(
+                row, text=when, text_color=MUTED_TEXT_COLOR, font=ctk.CTkFont(size=11),
+            ).pack(side=tk.RIGHT, padx=12)
 
     # ---------- fast local index ----------
 
@@ -824,17 +950,41 @@ class ImageSearchApp:
                 continue
             collections[defs[ci]["name"]].append(i)
 
-        # Photos with guests in them lead; product and object shots follow.
-        # Sorting rather than excluding keeps an all-object collection (a
-        # folder-matched one, say) usable instead of empty.
+        # Ordering, strongest first: landscape with guests, landscape,
+        # portrait with guests, portrait. Landscape leads because that's
+        # what marketing material is usually laid out for; a tall phone
+        # photo rarely fits a banner however good it is.
         result = {}
         for ci, cat in enumerate(defs):
             idxs = collections[cat["name"]]
             if not idxs:
                 continue
-            idxs.sort(key=lambda i: (has_people[i], float(S[i, ci])), reverse=True)
+            idxs.sort(
+                key=lambda i: (self._is_landscape(i), bool(has_people[i]), float(S[i, ci])),
+                reverse=True,
+            )
             result[cat["name"]] = idxs[:COLLECTION_MAX]
         return result
+
+    def _is_landscape(self, index):
+        """Whether an image is wider than it is tall.
+
+        Read from the cached thumbnail's header only - the pixel data is
+        never decoded - and memoised, since the same image is compared many
+        times while sorting. Unknown sizes count as portrait so a missing
+        thumbnail can't jump the queue.
+        """
+        cached = self._landscape_cache.get(index)
+        if cached is not None:
+            return cached
+        try:
+            with Image.open(self.engine.paths[index]) as img:
+                width, height = img.size
+            landscape = width > height
+        except Exception:
+            landscape = False
+        self._landscape_cache[index] = landscape
+        return landscape
 
     # ---------- favourites ----------
 
