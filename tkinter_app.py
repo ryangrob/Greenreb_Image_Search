@@ -589,6 +589,42 @@ class ImageSearchApp:
         non_graphic = set(np.nonzero(~mask)[0].tolist())
         return non_graphic if subset is None else (set(subset) & non_graphic)
 
+    def _interleave_by_folder(self, results):
+        """Round-robins results across SharePoint folders instead of
+        leaving them in pure relevance order.
+
+        A query can legitimately have its best 40+ matches all sitting in
+        one folder (e.g. one heavily-photographed shoot) - the near-
+        duplicate filter in search_engine.py doesn't touch this, and
+        shouldn't, since these are genuinely different, non-duplicate
+        photos. Without this, that one folder fills the entire top of the
+        results grid before any other folder gets a look in.
+
+        Purely reorders - nothing is dropped or re-scored, and each
+        folder's own internal relevance order is preserved. Items with no
+        known folder (local-folder mode, or a name that wasn't captured)
+        never compete with each other for a turn; each is its own group.
+        """
+        if not results:
+            return results
+        groups = {}
+        order = []
+        for i, (path, score, meta) in enumerate(results):
+            folder = (meta or {}).get("folder") if meta else None
+            key = folder if folder else f"__solo_{i}"
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append((path, score, meta))
+
+        interleaved = []
+        while len(interleaved) < len(results):
+            for key in order:
+                queue = groups[key]
+                if queue:
+                    interleaved.append(queue.pop(0))
+        return interleaved
+
     def _start_text_search(self):
         query = self.query_var.get().strip()
         if not query:
@@ -619,6 +655,7 @@ class ImageSearchApp:
                     query, DEFAULT_TOP_K, status_callback=on_status, bonus=bonus,
                     subset=effective_subset,
                 )
+                results = self._interleave_by_folder(results)
                 results = self._order_by_orientation_and_people(results)
                 self.event_queue.put(("search_done", results))
             except Exception as exc:
