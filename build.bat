@@ -15,7 +15,6 @@ py -m PyInstaller --noconfirm --onedir --windowed --name Greenreb_Image_Search ^
     --collect-all torchvision ^
     --collect-all msal ^
     --collect-all customtkinter ^
-    --collect-all sentence_transformers ^
     --collect-all transformers ^
     --collect-all tokenizers ^
     --hidden-import unicodedata ^

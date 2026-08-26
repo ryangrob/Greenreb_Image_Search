@@ -246,6 +246,8 @@ class ImageSearchApp:
         self._landscape_cache = {}
         self._people_vec = None
         self._empty_vec = None
+        self._graphic_vec = None
+        self._plain_vec = None
         self._current_columns = GRID_COLUMNS
         self._resize_after_id = None
         self._view = "all"
@@ -364,7 +366,16 @@ class ImageSearchApp:
             yscrollincrement=SCROLL_SPEED_MULTIPLIER
         )
         self._last_results = []
-        self.results_frame.bind("<Configure>", lambda _e: self._on_results_area_resized())
+        # add="+" is essential here: CTkScrollableFrame already binds its own
+        # <Configure> handler on this same widget to keep the canvas's
+        # scrollregion in sync with the grid's actual height. A plain bind()
+        # call replaces that handler instead of stacking on top of it, which
+        # freezes the scrollregion at whatever it was on first render and
+        # makes it impossible to scroll past that point - only the first
+        # screenful of results was ever reachable.
+        self.results_frame.bind(
+            "<Configure>", lambda _e: self._on_results_area_resized(), add="+"
+        )
 
         self._update_favourites_button()
         self._set_view("all")
@@ -564,6 +575,20 @@ class ImageSearchApp:
             return self._collections[self._view]
         return None
 
+    def _exclude_graphic(self, subset):
+        """Narrows a search subset to exclude finished graphics (posters,
+        adverts, anything with text burnt into the image) - see
+        _graphic_mask. Collections already exclude these at build time, so
+        this mainly matters for "All photos" (subset is None, so it isn't
+        narrowed to anything else yet), but is applied uniformly so a
+        graphic can never surface from a text search regardless of view.
+        """
+        mask = self._graphic_mask()
+        if len(mask) == 0:
+            return subset
+        non_graphic = set(np.nonzero(~mask)[0].tolist())
+        return non_graphic if subset is None else (set(subset) & non_graphic)
+
     def _start_text_search(self):
         query = self.query_var.get().strip()
         if not query:
@@ -587,9 +612,12 @@ class ImageSearchApp:
                 self.event_queue.put(("status", msg))
 
             try:
+                self.engine.load_model(on_status)
+                effective_subset = self._exclude_graphic(subset)
                 bonus = self._compute_bonus(query)
                 results = self.engine.search_text(
-                    query, DEFAULT_TOP_K, status_callback=on_status, bonus=bonus, subset=subset
+                    query, DEFAULT_TOP_K, status_callback=on_status, bonus=bonus,
+                    subset=effective_subset,
                 )
                 results = self._order_by_orientation_and_people(results)
                 self.event_queue.put(("search_done", results))
@@ -902,6 +930,34 @@ class ImageSearchApp:
             )
         return self.engine.score_against(self._people_vec) - self.engine.score_against(self._empty_vec)
 
+    def _graphic_mask(self):
+        """Per-image "is this finished artwork with text on it" mask for
+        the whole loaded index. The concept vectors are cached since they
+        never change between calls, but the mask itself is recomputed each
+        time (same pattern as _people_score) since it depends on whichever
+        index is currently loaded.
+
+        Used to keep posters, adverts, and anything with wording burnt into
+        the image out of collections *and* out of plain search results -
+        they're not raw source material a marketer would want to reuse.
+        """
+        if self._graphic_vec is None:
+            self._graphic_vec = self.engine.embed_concept([
+                "a poster with large text written on it",
+                "an advertisement with a headline and words",
+                "a graphic design with a slogan overlaid",
+                "a sign with writing on it",
+            ])
+            self._plain_vec = self.engine.embed_concept([
+                "a candid photograph of people with no text",
+                "a plain photograph with no writing",
+                "a natural photo without any words",
+            ])
+        return (
+            self.engine.score_against(self._graphic_vec)
+            - self.engine.score_against(self._plain_vec)
+        ) > TEXT_OVERLAY_MARGIN
+
     def _order_by_orientation_and_people(self, results):
         """Re-orders a set of search results: landscape-with-guests,
         landscape, portrait-with-guests, portrait.
@@ -957,21 +1013,9 @@ class ImageSearchApp:
 
         # Finished graphics - posters, adverts, anything with wording burnt
         # into the image - are not raw source material, so they're kept out
-        # of collections entirely. They remain searchable.
-        with_text = self.engine.embed_concept([
-            "a poster with large text written on it",
-            "an advertisement with a headline and words",
-            "a graphic design with a slogan overlaid",
-            "a sign with writing on it",
-        ])
-        without_text = self.engine.embed_concept([
-            "a candid photograph of people with no text",
-            "a plain photograph with no writing",
-            "a natural photo without any words",
-        ])
-        is_graphic = (
-            self.engine.score_against(with_text) - self.engine.score_against(without_text)
-        ) > TEXT_OVERLAY_MARGIN
+        # of collections entirely, and out of plain search too (see
+        # _start_text_search).
+        is_graphic = self._graphic_mask()
 
         scores = []
         for cat in defs:
