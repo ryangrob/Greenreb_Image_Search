@@ -174,6 +174,12 @@ class SharePointClient:
     def download_file(self, item, dest_path):
         download_url = item.get("@microsoft.graph.downloadUrl")
         if not download_url:
+            # The drive id is only known after this lookup. Every other
+            # method that builds a /drives/... URL made it first; this one
+            # did not, so downloading an original worked only if a sync had
+            # already run in the same session - otherwise the request went
+            # to /drives/None/... and failed with 400 Bad Request.
+            self._resolve_site_and_drive()
             detail = self._get(f"{GRAPH_BASE}/drives/{self._drive_id}/items/{item['id']}")
             download_url = detail["@microsoft.graph.downloadUrl"]
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
@@ -304,6 +310,7 @@ class SharePointClient:
 
     def _upload_file_chunked(self, folder_item_id, filename, payload):
         """Uploads a large file via Graph's resumable upload session."""
+        self._resolve_site_and_drive()  # cheap once resolved; see download_file
         session_url = (
             f"{GRAPH_BASE}/drives/{self._drive_id}/items/"
             f"{folder_item_id}:/{filename}:/createUploadSession"

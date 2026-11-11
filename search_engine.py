@@ -3,11 +3,17 @@ of images and ranks them against a text query or a reference image."""
 
 import json
 import os
+import threading
 import time
 
 import numpy as np
-import torch
 from PIL import Image
+
+# torch is imported on first use, in load_model(), not here. It is by far the
+# heaviest import in the app - seconds on its own - and importing it at the
+# top of this file put all of that in front of the first window. Showing the
+# cached library needs only numpy; only searching needs the model.
+torch = None
 
 MODEL_NAME = "ViT-B-32"
 PRETRAINED = "openai"
@@ -50,7 +56,10 @@ class ImageSearchEngine:
         self.model = None
         self.preprocess = None
         self.tokenizer = None
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = None  # decided in load_model, once torch is imported
+        # Startup warms the model in the background while the user may
+        # already be searching; without this both threads would load it.
+        self._model_lock = threading.Lock()
         self.folder = None
         self.paths = []
         self.meta = []  # parallel to paths: None for local-folder items, dict for SharePoint items
@@ -59,17 +68,27 @@ class ImageSearchEngine:
     def load_model(self, status_callback=None):
         if self.model is not None:
             return
-        if status_callback:
-            status_callback("Loading CLIP model (first run downloads ~350MB)...")
-        import open_clip
+        with self._model_lock:
+            if self.model is not None:  # another thread finished while we waited
+                return
+            if status_callback:
+                status_callback("Loading the search model...")
+            global torch
+            if torch is None:
+                import torch as _torch
+                torch = _torch
+            import open_clip
 
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            MODEL_NAME, pretrained=PRETRAINED
-        )
-        model.eval().to(self.device)
-        self.model = model
-        self.preprocess = preprocess
-        self.tokenizer = open_clip.get_tokenizer(MODEL_NAME)
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                MODEL_NAME, pretrained=PRETRAINED
+            )
+            model.eval().to(self.device)
+            self.preprocess = preprocess
+            self.tokenizer = open_clip.get_tokenizer(MODEL_NAME)
+            # Assigned last: other threads treat a non-None model as "ready",
+            # so it must not be visible before the tokenizer and preprocess.
+            self.model = model
         if status_callback:
             status_callback("Model loaded.")
 
@@ -107,6 +126,7 @@ class ImageSearchEngine:
         return found
 
     def embed_image_file(self, path):
+        self.load_model()
         img = Image.open(path).convert("RGB")
         tensor = self.preprocess(img).unsqueeze(0).to(self.device)
         with torch.no_grad():
@@ -125,6 +145,7 @@ class ImageSearchEngine:
         simply omitted from the result rather than raising. Returns
         {path: embedding} covering only the paths that succeeded.
         """
+        self.load_model()
         valid_paths = []
         tensors = []
         for path in paths:
@@ -144,6 +165,7 @@ class ImageSearchEngine:
         return {path: feats[i] for i, path in enumerate(valid_paths)}
 
     def embed_text(self, text):
+        self.load_model()
         tokens = self.tokenizer([text]).to(self.device)
         with torch.no_grad():
             feat = self.model.encode_text(tokens)

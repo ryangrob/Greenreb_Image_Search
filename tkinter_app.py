@@ -12,6 +12,7 @@ import datetime
 import glob
 import hashlib
 import json
+import math
 import os
 import platform
 import queue
@@ -45,24 +46,97 @@ elif "HF_HOME" not in os.environ:
     if os.path.isdir(_SOURCE_MODEL_CACHE):
         os.environ["HF_HOME"] = _SOURCE_MODEL_CACHE
 
+_IMPORT_T0 = time.perf_counter()
 import customtkinter as ctk
+_T_CTK = time.perf_counter()
 import numpy as np
-from PIL import Image
+_T_NUMPY = time.perf_counter()
+from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageTk
+_T_PIL = time.perf_counter()
 
 from search_engine import ImageSearchEngine, MODEL_TAG
-from sharepoint_client import (
-    FAVOURITES_PREFIX,
-    FEEDBACK_PREFIX,
-    DeltaExpired,
-    SharePointClient,
-)
+_T_ENGINE = time.perf_counter()
+_SHAREPOINT = None
+
+
+def _sharepoint():
+    """The SharePoint module, imported the first time it is needed.
+
+    It pulls in msal, requests and cryptography - most of a second of import
+    time that used to sit in front of the first window, although starting up
+    only reads the photo library cache from disk and never talks to
+    SharePoint.
+    """
+    global _SHAREPOINT
+    if _SHAREPOINT is None:
+        import sharepoint_client
+        _SHAREPOINT = sharepoint_client
+    return _SHAREPOINT
 
 CRASH_LOG_PATH = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "crash.log"
 )
+BOOT_LOG_PATH = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "startup.log"
+)
 REUSE_LOG_PATH = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "reuse_debug.log"
 )
+
+
+_BOOT_T0 = _IMPORT_T0
+_BOOT_LOGGED = False
+
+
+def _process_age():
+    """Seconds since Windows created this process. Includes the time before
+    Python was running at all, which a timer started in this file can't see."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = (
+            [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        )
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel32.GetProcessTimes(
+            kernel32.GetCurrentProcess(), *[ctypes.byref(t) for t in times]
+        ):
+            return None
+        now = wintypes.FILETIME()
+        kernel32.GetSystemTimeAsFileTime(ctypes.byref(now))
+
+        def ticks(t):
+            return (t.dwHighDateTime << 32) | t.dwLowDateTime
+
+        return (ticks(now) - ticks(times[0])) / 1e7
+    except Exception:
+        return None
+
+
+def _boot_mark(label):
+    """Appends one line to startup.log: how long after launch `label` happened.
+
+    So "it starts slowly" can be answered with numbers - which phase took
+    the time - rather than by feel.
+    """
+    global _BOOT_LOGGED
+    try:
+        os.makedirs(os.path.dirname(BOOT_LOG_PATH), exist_ok=True)
+        if os.path.exists(BOOT_LOG_PATH) and os.path.getsize(BOOT_LOG_PATH) > 256_000:
+            os.remove(BOOT_LOG_PATH)
+        age = _process_age()
+        since_launch = f"   ({age:5.2f}s since launch)" if age is not None else ""
+        with open(BOOT_LOG_PATH, "a", encoding="utf-8") as f:
+            if not _BOOT_LOGGED:
+                stamp = datetime.datetime.now().isoformat(timespec="seconds")
+                f.write(f"--- {stamp}\n")
+                _BOOT_LOGGED = True
+            f.write(f"+{time.perf_counter() - _BOOT_T0:5.2f}s{since_launch}  {label}\n")
+    except OSError:
+        pass
 
 
 def _log_crash(context, exc_info):
@@ -147,7 +221,16 @@ RELEVANCE_HEAD = 24
 # dragging a photo onto one, or right-clicking it - rather than being
 # guessed from the image. An automatic grouping was close but never right,
 # and a shortlist someone curated is worth more than one nobody trusts.
-MANUAL_COLLECTIONS = ["Golf", "Food", "Drinks", "Family", "Kids"]
+# The collections a new install starts with. They are suggestions, not
+# fixtures: people can add their own and remove any of these.
+DEFAULT_COLLECTIONS = ["Golf", "Food", "Drinks", "Family & Kids", "Groups"]
+COLLECTION_NAME_MAX = 32
+# Collection names double as view keys (see _set_view), so these would
+# collide with the built-in views.
+RESERVED_COLLECTION_NAMES = {"all", "all photos", "favourites", "history", "search history"}
+# Collections that existed under an earlier name. Their photos are folded
+# into the new collection when read, so renaming never loses anything.
+LEGACY_COLLECTIONS = {"Family": "Family & Kids", "Kids": "Family & Kids"}
 # How far the pointer has to move with the button held before it counts as a
 # drag rather than a click, so double-clicking a photo still opens it.
 DRAG_THRESHOLD_PX = 8
@@ -187,7 +270,7 @@ MUTED_TEXT_COLOR = "#8fa3b8"
 CARD_RADIUS = 14
 BUTTON_RADIUS = 17
 
-LOGO_HEIGHT = 40
+LOGO_HEIGHT = 36
 
 
 def _build_stamp():
@@ -212,23 +295,43 @@ def _resource_path(*parts):
     return os.path.join(base, *parts)
 
 
-def _load_logo_image(height=LOGO_HEIGHT):
-    try:
-        img = Image.open(_resource_path("assets", "logo.png")).convert("RGBA")
-        # The file carries a wide transparent margin - the artwork is only
-        # 1048x764 inside a 1440x1282 canvas - so scaling the whole canvas
-        # left the mark itself around 24px tall and looking soft. Cropping
-        # to the artwork first lets it use the full height asked for.
+def _load_mark(height):
+    """The Topgolf shield on its own, as an RGBA image `height` px tall.
+
+    logo.png is the full lockup - the shield above the TOPGOLF wordmark -
+    inside a wide transparent margin. Drawn at header size the wordmark came
+    out about 7px tall: unreadable, and it made the whole mark look low
+    quality. The shield is the part that survives small sizes, so it is cut
+    out at the empty band separating it from the wordmark.
+    """
+    img = Image.open(_resource_path("assets", "logo.png")).convert("RGBA")
+    box = img.getbbox()
+    if box:
+        img = img.crop(box)
+    filled = (np.asarray(img)[:, :, 3] > 8).any(axis=1)
+    widest, start = None, None
+    for row, has_ink in enumerate(filled):
+        if not has_ink and start is None:
+            start = row
+        elif has_ink and start is not None:
+            if widest is None or row - start > widest[1] - widest[0]:
+                widest = (start, row)
+            start = None
+    # Only treat it as the shield/wordmark gap if it sits in the lower part;
+    # anything else means the artwork has changed shape, so keep it whole.
+    if widest is not None and widest[0] > img.height * 0.4:
+        img = img.crop((0, 0, img.width, widest[0]))
         box = img.getbbox()
         if box:
             img = img.crop(box)
-        ratio = height / img.height
-        width = max(1, round(img.width * ratio))
-        # Resampled here rather than left to the widget. The source mark is
-        # 1440px tall, and a plain scale to 40px aliases the fine strokes -
-        # LANCZOS keeps the edges clean at this size.
-        img = img.resize((width, height), Image.LANCZOS)
-        return ctk.CTkImage(light_image=img, dark_image=img, size=(width, height))
+    width = max(1, round(img.width * height / img.height))
+    return img.resize((width, height), Image.LANCZOS)
+
+
+def _load_logo_image(height=LOGO_HEIGHT):
+    try:
+        img = _load_mark(height)
+        return ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
     except Exception:
         return None
 
@@ -310,8 +413,47 @@ def _make_button(parent, text, command, width=140):
     )
 
 
+STAR_BADGE_SIZE = (26, 24)
+STAR_BADGE_INSET = 3
+CAPTION_FONT = ("Roboto", -12)  # what CustomTkinter used for captions on Windows
+
+
+def _hex_rgb(colour):
+    return tuple(int(colour[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def _draw_star_badge(filled):
+    """The favourite star on a small rounded badge, drawn at 8x and scaled
+    down so its edges are smooth. Drawn rather than typed, so it needs no
+    font and looks the same on every machine."""
+    w, h = STAR_BADGE_SIZE
+    k = 8
+    big = Image.new("RGBA", (w * k, h * k), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(big)
+    draw.rounded_rectangle(
+        (0, 0, w * k - 1, h * k - 1), radius=8 * k, fill=_hex_rgb(CARD_COLOR) + (230,)
+    )
+    cx, cy = w * k / 2, h * k / 2 + 0.4 * k
+    outer = 8.0 * k
+    inner = outer * 0.42
+    points = []
+    for i in range(10):
+        angle = -math.pi / 2 + i * math.pi / 5
+        radius = outer if i % 2 == 0 else inner
+        points.append((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
+    if filled:
+        draw.polygon(points, fill=(255, 213, 74, 255))
+    else:
+        try:
+            draw.polygon(points, outline=(255, 255, 255, 255), width=round(1.4 * k))
+        except TypeError:  # older Pillow: no outline width on polygons
+            draw.line(points + [points[0]], fill=(255, 255, 255, 255), width=round(1.4 * k),
+                      joint="curve")
+    return big.resize((w, h), Image.LANCZOS)
+
+
 class ImageSearchApp:
-    def __init__(self, root):
+    def __init__(self, root, boot=None):
         self.root = root
         self.root.title("Greenreb Image Search")
         self.root.geometry("1180x760")
@@ -333,7 +475,9 @@ class ImageSearchApp:
         self.worker_thread = None
         self.cancel_requested = False
         self.thumbnail_refs = []  # keep CTkImage refs alive
-        self._thumb_cache = {}  # path -> CTkImage, see _thumb_for
+        self._thumb_cache = {}  # path -> decoded PIL thumbnail, see _thumb_image
+        self._badges = None
+        self._render_favs = set()
         self._last_query = ""
         self._feedback = None
         self._favourites = None
@@ -350,6 +494,11 @@ class ImageSearchApp:
         self._render_after_id = None
         self._drag = None
         self._preview = None
+        self._sp_lock = threading.Lock()
+        # Set by BootSequence while the app starts behind its splash.
+        self._boot = boot
+        self._render_done_callback = None
+        self._warming = False
         self._view = "all"
         # Mirrors the state _set_busy puts the buttons in, so paths that
         # do not go through a button (the Enter key) can honour it too.
@@ -434,6 +583,18 @@ class ImageSearchApp:
         ctk.CTkFrame(sidebar, fg_color=ACCENT_ACTIVE, height=3, corner_radius=2).pack(
             fill=tk.X, pady=(6, 10)
         )
+        heading = ctk.CTkFrame(sidebar, fg_color="transparent")
+        heading.pack(fill=tk.X, pady=(0, 6))
+        ctk.CTkLabel(
+            heading, text="COLLECTIONS", text_color=MUTED_TEXT_COLOR,
+            font=ctk.CTkFont(size=11, weight="bold"),
+        ).pack(side=tk.LEFT, padx=(4, 0))
+        ctk.CTkButton(
+            heading, text="+", width=28, height=24, corner_radius=8,
+            fg_color=CARD_COLOR, hover_color=ACCENT_COLOR, text_color=TEXT_COLOR,
+            font=ctk.CTkFont(size=16, weight="bold"), command=self._new_collection,
+        ).pack(side=tk.RIGHT)
+        self._collections_hint = None
         self.collection_cards = {}
 
         main = ctk.CTkFrame(body, fg_color="transparent")
@@ -551,27 +712,21 @@ class ImageSearchApp:
             _log_reuse(f"COLLECTIONS SAVE FAILED: {exc!r}")
 
     def _load_collections(self):
-        """Restores cached collections without needing the CLIP model.
+        """The hand-curated collections, as positions in the loaded index.
 
-        Grouping the library requires embedding the collection descriptions,
-        which means loading the model - far too slow to do before the app is
-        usable. The grouping only changes when the library does, so it is
-        computed during a sync and simply read back here.
+        Stored by photo id (see _collection_ids), so they survive the index
+        being rebuilt in a different order. Empty collections are kept: they
+        are the drop targets, so they have to stay on screen before anything
+        has been put in them.
         """
-        by_id = self._read_json(self._collections_cache_path())
-        if not by_id:
-            return {name: [] for name in MANUAL_COLLECTIONS}
         position = {
             (meta or {}).get("item_id"): i for i, meta in enumerate(self.engine.meta or [])
         }
-        result = {name: [] for name in MANUAL_COLLECTIONS}
-        for name, item_ids in by_id.items():
-            if not isinstance(item_ids, list):
-                continue
-            # Empty collections are kept: they are the drop targets, so they
-            # have to stay on screen before anything has been put in them.
-            result[name] = [position[i] for i in item_ids if i in position]
-        return result
+        return {
+            name: [position[i] for i in ids if i in position]
+            for name, ids in self._collection_ids().items()
+        }
+
 
     def _refresh_collections(self, from_cache=False):
         """Groups the loaded index into collections, off the UI thread."""
@@ -588,14 +743,27 @@ class ImageSearchApp:
         self._run_in_background(work)
 
     def _rebuild_collection_cards(self):
-        """Recreates the auto-collection cards after an index finishes."""
+        """Recreates the collection cards in the sidebar."""
         for card in self.collection_cards.values():
             card.destroy()
         self.collection_cards = {}
+        if getattr(self, "_collections_hint", None) is not None:
+            self._collections_hint.destroy()
+            self._collections_hint = None
         for name, idxs in (self._collections or {}).items():
-            self.collection_cards[name] = self._make_collection_card(
-                self.sidebar, f"  {name} ({len(idxs)})", lambda n=name: self._set_view(n)
+            # Long names are shortened on the card only; the sidebar is narrow.
+            shown = name if len(name) <= 17 else name[:16].rstrip() + "…"
+            card = self._make_collection_card(
+                self.sidebar, f"  {shown} ({len(idxs)})", lambda n=name: self._set_view(n)
             )
+            card.bind("<Button-3>", lambda e, n=name: self._show_collection_menu(e, n))
+            self.collection_cards[name] = card
+        if not self.collection_cards:
+            self._collections_hint = ctk.CTkLabel(
+                self.sidebar, text="No collections.\nClick + to make one.",
+                text_color=MUTED_TEXT_COLOR, font=ctk.CTkFont(size=12), justify="left",
+            )
+            self._collections_hint.pack(anchor="w", padx=6, pady=(2, 0))
 
     def _set_view(self, view):
         """Switches which collection the search box searches."""
@@ -640,8 +808,7 @@ class ImageSearchApp:
                 "shared drive, or 'Choose Folder...' for photos on this computer."
             )
             return
-        step = max(1, total // ALL_PHOTOS_PREVIEW)
-        idxs = list(range(0, total, step))[:ALL_PHOTOS_PREVIEW]
+        idxs = self._startup_sample_indices()
         results = [(self.engine.paths[i], 1.0, self.engine.meta[i]) for i in idxs]
         self._render_results(self._interleave_by_folder(results))
         self.status_var.set(
@@ -867,7 +1034,7 @@ class ImageSearchApp:
         if not path:
             return
 
-        subset = self._exclude_graphic(self._active_subset())
+        active = self._active_subset()
         self._last_query = ""
         self._set_busy(True)
         self.progress.configure(mode="indeterminate")
@@ -879,6 +1046,10 @@ class ImageSearchApp:
                 self.event_queue.put(("status", msg))
 
             try:
+                # Off the UI thread: the graphic filter needs the model, and
+                # loading it here (not in the click handler) keeps the window
+                # responsive if Find similar is used before it has warmed up.
+                subset = self._exclude_graphic(active)
                 results = self.engine.search_image(
                     path, DEFAULT_TOP_K, status_callback=on_status, subset=subset
                 )
@@ -1090,17 +1261,45 @@ class ImageSearchApp:
         replaces this with fresh results.
         """
         def work():
+            count = 0
             try:
                 count = self._load_fast_cache()
-                if count:
-                    self.event_queue.put(("startup_ready", count))
-                # Warm the CLIP model in the background. It's needed to
-                # encode a search query, and loading it on the first search
-                # would put several seconds squarely in the user's way -
-                # here it happens while they're still reading the window.
-                self.engine.load_model()
             except Exception:
                 _log_crash("startup load", sys.exc_info())
+            if count:
+                self.event_queue.put(("startup_loaded", count))
+                # Decode the opening screen's thumbnails here, off the main
+                # thread: Pillow lets go of the interpreter while decoding,
+                # so the splash keeps animating and the window only has to
+                # build widgets once it is ready.
+                try:
+                    for i in self._startup_sample_indices():
+                        self._thumb_image(self.engine.paths[i])
+                except Exception:
+                    _log_crash("decoding startup thumbnails", sys.exc_info())
+            # The search model is no longer loaded here - see _warm_model.
+            self.event_queue.put(("startup_ready", count) if count else ("startup_empty",))
+
+        self._run_in_background(work)
+
+    def _warm_model(self):
+        """Loads the search model in the background.
+
+        Started once the window is on screen rather than during startup:
+        importing torch holds the interpreter for seconds, which would
+        freeze the intro animation if the two overlapped. A search started
+        before this finishes simply waits for it.
+        """
+        if self._warming or self.engine.model is not None:
+            return
+        self._warming = True
+
+        def work():
+            try:
+                self.engine.load_model()
+                _boot_mark("search model ready")
+            except Exception:
+                _log_crash("loading the search model", sys.exc_info())
 
         self._run_in_background(work)
 
@@ -1478,14 +1677,14 @@ class ImageSearchApp:
         clobber each other and the merge is a plain union.
         """
         own = self._read_json(self._favourites_path()).get("items") or {}
-        own_name = f"{FAVOURITES_PREFIX}{machine_key()}.json"
+        own_name = f"{_sharepoint().FAVOURITES_PREFIX}{machine_key()}.json"
         try:
             # Uploaded even when empty: skipping the upload left a removed
             # favourite sitting in this machine's shared file forever, so
             # un-starring never reached anyone else.
             self.sp_client.upload_json_file(root_id, own_name, {"items": own})
             merged = {}
-            for name in self.sp_client.list_shared_files(root_id, FAVOURITES_PREFIX):
+            for name in self.sp_client.list_shared_files(root_id, _sharepoint().FAVOURITES_PREFIX):
                 # This machine's own file is skipped: the local copy is
                 # authoritative for it. Merging it back in meant a favourite
                 # you had just un-starred returned through the team list and
@@ -1589,7 +1788,7 @@ class ImageSearchApp:
         try:
             if own:
                 self.sp_client.upload_json_file(
-                    root_id, f"{FEEDBACK_PREFIX}{machine_key()}.json", own
+                    root_id, f"{_sharepoint().FEEDBACK_PREFIX}{machine_key()}.json", own
                 )
             merged = {}
             for name in self.sp_client.list_feedback_files(root_id):
@@ -1642,9 +1841,15 @@ class ImageSearchApp:
 
         def work():
             try:
-                if self.sp_client is None:
-                    self.sp_client = SharePointClient()
-                self.sp_client.sign_in()
+                # Signs in on every sync, as it always has - not just when no
+                # connection exists - so a long-running session refreshes its
+                # Microsoft sign-in here. Under the same lock as everything
+                # else that signs in, so a preview opening meanwhile can't
+                # start a second sign-in alongside it.
+                with self._sp_lock:
+                    if self.sp_client is None:
+                        self.sp_client = _sharepoint().SharePointClient()
+                    self.sp_client.sign_in()
                 self.event_queue.put(("sp_signed_in",))
             except Exception as exc:
                 self.event_queue.put(("error", f"Sign-in failed: {exc}"))
@@ -1993,7 +2198,7 @@ class ImageSearchApp:
                     raw_items, new_delta_link = self.sp_client.get_delta_items(
                         root["id"], delta_link, status_callback=delta_status
                     )
-                except DeltaExpired:
+                except _sharepoint().DeltaExpired:
                     self.event_queue.put(("status", "Delta expired - doing a full resync..."))
                     raw_items, new_delta_link = self.sp_client.get_delta_items(
                         root["id"], None, status_callback=delta_status
@@ -2177,8 +2382,7 @@ class ImageSearchApp:
                     # "Check for new photos" has ever run this session,
                     # so the SharePoint connection may not exist yet.
                     self.event_queue.put(("status", "Signing in to Microsoft..."))
-                    self.sp_client = SharePointClient()
-                    self.sp_client.sign_in()
+                    self._ensure_sp_client()
                     self.event_queue.put(("status", f"Downloading {name}..."))
                 item = {"id": item_id}
                 self.sp_client.download_file(item, dest)
@@ -2232,24 +2436,10 @@ class ImageSearchApp:
                             shown = False
                     if not shown:
                         self.status_var.set(message)
-                elif kind == "preview_ready":
-                    preview = self._preview
-                    if preview is not None and preview["token"] is event[1]:
-                        try:
-                            img = self._fit(
-                                Image.open(event[2]).convert("RGB"), PREVIEW_MAX
-                            )
-                            photo = ctk.CTkImage(
-                                light_image=img, dark_image=img, size=img.size
-                            )
-                            preview["label"].configure(image=photo)
-                            preview["label"]._preview_ref = photo
-                            text = preview["caption"].cget("text")
-                            preview["caption"].configure(
-                                text=text.replace("   (sharpening...)", "")
-                            )
-                        except Exception:
-                            pass
+                elif kind == "preview_image":
+                    self._apply_preview(event[1], event[2], event[3])
+                elif kind == "preview_done":
+                    self._end_sharpening(event[1])
                 elif kind == "sp_signed_in":
                     self._set_busy(False)
                     self._index_sharepoint_tree()
@@ -2292,6 +2482,11 @@ class ImageSearchApp:
                     self._sp_mode_active = True
                     self.folder_var.set("SharePoint: Fotos & Videos (all subfolders)")
                     self._set_busy(False)
+                    if self._boot is not None:
+                        # Real width before the first layout, so the grid is
+                        # drawn once at the right column count, not redrawn.
+                        self.root.update_idletasks()
+                        self._render_done_callback = self._boot.render_done
                     # Fills the opening grid now the cached index is loaded,
                     # instead of leaving an empty window until the first search.
                     self._show_all_photos()
@@ -2299,9 +2494,22 @@ class ImageSearchApp:
                     # there from the start rather than only after a search.
                     self._refresh_suggestions()
                     self._refresh_collections(from_cache=True)
+                    if self._boot is None:
+                        self._warm_model()
+                elif kind == "startup_loaded":
+                    if self._boot is not None:
+                        self._boot.library_loaded(event[1])
+                elif kind == "startup_empty":
+                    self._refresh_collections(from_cache=True)
+                    if self._boot is not None:
+                        self._boot.library_empty()
+                    else:
+                        self._warm_model()
                 elif kind == "collections_ready":
                     self._collections = event[1]
                     self._rebuild_collection_cards()
+                    if self._boot is not None:
+                        self._boot.collections_done()
                 elif kind == "sp_open_ready":
                     self._set_busy(False)
                     delivered = self._deliver_to_download_folder(event[1], event[2])
@@ -2326,7 +2534,13 @@ class ImageSearchApp:
         """How many result columns fit the results area at its current
         width, so the grid fills the window (and expands to fill it when
         maximized) instead of sitting at a fixed column count."""
-        width = self.results_frame.winfo_width()
+        # The scroll canvas is the visible area; its size is settled by
+        # geometry management, so it is right even before the inner frame's
+        # own resize event has been processed.
+        try:
+            width = self.results_frame._parent_canvas.winfo_width()
+        except Exception:
+            width = self.results_frame.winfo_width()
         if width <= 1:
             return GRID_COLUMNS
         cell_width = THUMB_SIZE[0] + GRID_CELL_PADDING
@@ -2351,25 +2565,71 @@ class ImageSearchApp:
             if self._last_results:
                 self._render_results(self._last_results)
 
-    def _thumb_for(self, path):
-        """Returns a ready CTkImage for `path`, decoding it only once.
+    def _thumb_image(self, path):
+        """The decoded thumbnail as a PIL image, cached.
 
-        Changing the window width re-lays out the whole grid, and re-reading
-        150 JPEGs off disk each time is a visible stall - so each decoded
-        thumbnail is kept and handed back on later renders.
+        Never touches Tk, so it is safe from a worker thread - which is how
+        the opening screen's thumbnails get decoded while the splash plays.
         """
-        cached = self._thumb_cache.get(path)
-        if cached is not None:
-            return cached
-        img = Image.open(path)
-        img.thumbnail(THUMB_SIZE)
-        photo = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
-        # Bounded so a long session over a 31k-image library cannot grow
-        # without limit; dropping the whole cache is fine, it just refills.
-        if len(self._thumb_cache) >= THUMB_CACHE_MAX:
-            self._thumb_cache.clear()
-        self._thumb_cache[path] = photo
-        return photo
+        img = self._thumb_cache.get(path)
+        if img is None:
+            with Image.open(path) as source:
+                img = source.convert("RGB")
+            img.thumbnail(THUMB_SIZE)
+            # Bounded so a long session over a 33k-image library cannot grow
+            # without limit; dropping the whole cache is fine, it refills.
+            if len(self._thumb_cache) >= THUMB_CACHE_MAX:
+                self._thumb_cache.clear()
+            self._thumb_cache[path] = img
+        return img
+
+    def _star_badges(self):
+        if self._badges is None:
+            self._badges = {True: _draw_star_badge(True), False: _draw_star_badge(False)}
+        return self._badges
+
+    def _thumb_photo(self, path, favourite):
+        """A thumbnail with its favourite star composited in, ready for Tk.
+
+        Composited rather than laid over the photo as a second widget: the
+        badge's rounded corners blend into the photo instead of showing
+        square patches of background, and each result is one widget lighter.
+        """
+        img = self._thumb_image(path).convert("RGBA")
+        badge = self._star_badges()[bool(favourite)]
+        img.alpha_composite(badge, (img.width - badge.width - STAR_BADGE_INSET, STAR_BADGE_INSET))
+        return ImageTk.PhotoImage(img)
+
+    @staticmethod
+    def _in_star(event):
+        """Whether a click on a thumbnail landed on its star (with a little
+        slack, since the badge is small)."""
+        try:
+            width = event.widget.winfo_width()
+        except tk.TclError:
+            return False
+        badge_w, badge_h = STAR_BADGE_SIZE
+        return (event.x >= width - badge_w - STAR_BADGE_INSET - 4
+                and event.y <= STAR_BADGE_INSET + badge_h + 4)
+
+    def _on_thumb_release(self, event, key, path, meta):
+        dragged = self._drag is not None and self._drag.get("active")
+        self._drag_release(event)
+        if not dragged and self._in_star(event):
+            self._on_star_clicked(key, path, meta, event.widget)
+
+    def _on_thumb_double(self, event, path, meta):
+        if self._in_star(event):
+            return  # the clicks were for the star, not for opening the photo
+        self._show_preview(path, meta)
+
+    def _startup_sample_indices(self):
+        """The photos the opening view shows: a step through the whole
+        library rather than the first N, which would all be from whichever
+        folder indexed first."""
+        total = len(self.engine.paths)
+        step = max(1, total // ALL_PHOTOS_PREVIEW)
+        return list(range(0, total, step))[:ALL_PHOTOS_PREVIEW]
 
     # ---------- preview, clipboard ----------
 
@@ -2407,19 +2667,31 @@ class ImageSearchApp:
         size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
         return img.resize(size, Image.LANCZOS)
 
-    def _show_preview(self, path, meta):
-        """A large view inside the app.
+    def _preview_box(self):
+        """The largest the preview draws a photo: most of the screen, so it
+        is worth opening, while leaving the desktop visible around it."""
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        return max(640, int(sw * 0.82)), max(420, int(sh * 0.72))
 
-        Opens immediately from whatever is already on disk, then replaces
-        the image with an 800px copy fetched in the background. Waiting on
-        the full original (often 8MB) before showing anything made looking
-        at a photo feel like a download rather than a glance.
+    def _show_preview(self, path, meta):
+        """A large view inside the app, at full resolution.
+
+        Opens at once from what is already on disk and sharpens in steps:
+        the grid thumbnail, then SharePoint's 800px preview, then the
+        original itself (downloaded in the background, which also makes
+        Copy and Open original instant afterwards). Each step only ever
+        replaces a lower-quality one.
         """
         name = (meta or {}).get("name") or os.path.basename(path)
+        item_id = (meta or {}).get("item_id")
+        box = self._preview_box()
         win = ctk.CTkToplevel(self.root)
         win.title(name)
         win.configure(fg_color=BG_COLOR)
-        win.geometry("1180x840")
+        width, height = box[0] + 24, box[1] + 84
+        x = max(0, (win.winfo_screenwidth() - width) // 2)
+        y = max(0, (win.winfo_screenheight() - height) // 2 - 20)
+        win.geometry(f"{width}x{height}+{x}+{y}")
         try:
             win.after(200, lambda: win.iconbitmap(_resource_path("assets", "app_icon.ico")))
         except Exception:
@@ -2439,58 +2711,124 @@ class ImageSearchApp:
         )
         caption.pack(side=tk.LEFT)
         _make_button(bar, "Close", win.destroy, width=90).pack(side=tk.RIGHT, padx=(8, 0))
-        if meta and meta.get("item_id"):
-            _make_button(
-                bar, "Open full size",
-                lambda: self._open_sp_result(meta["item_id"], meta["name"]), width=140,
-            ).pack(side=tk.RIGHT, padx=(8, 0))
+        if item_id:
+            open_original = lambda: self._open_sp_result(item_id, meta["name"])
+        else:
+            open_original = lambda: open_in_system_viewer(path)
+        _make_button(bar, "Open original", open_original, width=140).pack(side=tk.RIGHT, padx=(8, 0))
         _make_button(
             bar, "Copy", lambda: self._copy_to_clipboard(path, meta, token=token), width=90,
         ).pack(side=tk.RIGHT, padx=(8, 0))
 
-        self._preview = {"token": token, "label": image_label, "win": win, "caption": caption}
+        self._preview = {
+            "token": token, "label": image_label, "win": win, "caption": caption,
+            "quality": -1, "box": box,
+        }
 
-        def draw(source_path):
-            try:
-                img = self._fit(Image.open(source_path).convert("RGB"), PREVIEW_MAX)
-            except Exception:
-                return
-            photo = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
-            image_label.configure(image=photo)
-            image_label._preview_ref = photo  # keep it alive with the widget
+        large = os.path.join(self._preview_dir(), f"{item_id}.jpg") if item_id else None
+        try:
+            if large and os.path.exists(large):
+                self._apply_preview(token, Image.open(large).convert("RGB"), 1)
+            else:
+                self._apply_preview(token, self._thumb_image(path), 0)
+        except Exception:
+            pass
 
-        draw(self._best_local_copy(path, meta))
-
-        item_id = (meta or {}).get("item_id")
+        caption.configure(text=f"{caption.cget('text')}   (sharpening...)")
         if item_id:
-            if not os.path.exists(os.path.join(self._preview_dir(), f"{item_id}.jpg")):
-                caption.configure(text=f"{caption.cget('text')}   (sharpening...)")
-                self._fetch_preview(item_id, token)
-            # Opening a preview is a deliberate act, so it is a good moment
-            # to pull the original in the background - Copy and Open full
-            # size are then instant instead of starting a download.
-            self._prefetch_full(item_id, (meta or {}).get("name") or name)
+            if not (large and os.path.exists(large)):
+                self._fetch_preview(item_id, token, box)
+            self._load_original_preview(item_id, name, token, box)
+        else:
+            self._load_original_preview(None, path, token, box)
 
-    def _prefetch_full(self, item_id, name):
+    def _apply_preview(self, token, img, quality):
+        """Shows `img` in the open preview - unless it was closed, replaced
+        by another preview, or already showing something sharper."""
+        preview = self._preview
+        if preview is None or preview["token"] is not token or quality <= preview["quality"]:
+            return
+        try:
+            fitted = self._fit(img, preview["box"]) if img.size != preview["box"] else img
+            photo = ctk.CTkImage(light_image=fitted, dark_image=fitted, size=fitted.size)
+            preview["label"].configure(image=photo)
+            preview["label"]._preview_ref = photo  # keep it alive with the widget
+            preview["quality"] = quality
+            if quality >= 2:
+                self._end_sharpening(token)
+        except Exception:
+            pass
+
+    def _end_sharpening(self, token):
+        preview = self._preview
+        if preview is None or preview["token"] is not token:
+            return
+        try:
+            text = preview["caption"].cget("text")
+            preview["caption"].configure(text=text.replace("   (sharpening...)", ""))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _open_upright(source):
+        """Opens a photo the right way up. Phones and many cameras save the
+        pixels as shot and record the rotation in an EXIF tag, so a portrait
+        photo opened naively comes out sideways."""
+        img = Image.open(source)
+        return ImageOps.exif_transpose(img) or img
+
+    def _decode_to_fit(self, source, box):
+        """Decodes a photo straight to roughly the size it will be shown at.
+        For JPEGs, draft() has the decoder skip detail that would be thrown
+        away anyway - a 24-megapixel original decodes many times faster."""
+        with Image.open(source) as probe:
+            try:
+                probe.draft("RGB", box)
+            except Exception:
+                pass
+            img = ImageOps.exif_transpose(probe) or probe
+            img = img.convert("RGB")
+        return self._fit(img, box)
+
+    def _load_original_preview(self, item_id, name_or_path, token, box):
+        """Fetches the original (or reads it, for a photo on this computer)
+        and hands it to the preview at the size it will be shown."""
         def work():
             try:
-                self._ensure_full_image(item_id, name)
+                if item_id:
+                    source = self._ensure_full_image(item_id, name_or_path)
+                else:
+                    source = name_or_path
+                img = self._decode_to_fit(source, box)
+                self.event_queue.put(("preview_image", token, img, 2))
             except Exception as exc:
-                _log_reuse(f"FULL PREFETCH FAILED: {exc!r}")
+                _log_reuse(f"ORIGINAL PREVIEW FAILED: {exc!r}")
+                self.event_queue.put(("preview_done", token))
 
         self._run_in_background(work)
 
-    def _fetch_preview(self, item_id, token):
-        """Pulls the 800px version of one photo in the background."""
+    def _ensure_sp_client(self):
+        """The SharePoint connection, signing in if needed. Locked: a preview
+        fetches two versions of a photo at once, and two threads must not
+        both start a sign-in."""
+        with self._sp_lock:
+            if self.sp_client is None:
+                client = _sharepoint().SharePointClient()
+                client.sign_in()
+                self.sp_client = client
+        return self.sp_client
+
+    def _fetch_preview(self, item_id, token, box):
+        """Pulls SharePoint's 800px version of one photo - the quick middle
+        step while the original downloads."""
         def work():
             try:
-                if self.sp_client is None:
-                    self.sp_client = SharePointClient()
-                    self.sp_client.sign_in()
+                client = self._ensure_sp_client()
                 dest = os.path.join(self._preview_dir(), f"{item_id}.jpg")
-                ok = self.sp_client.download_thumbnail({"id": item_id}, dest, size="large")
-                if ok:
-                    self.event_queue.put(("preview_ready", token, dest))
+                if client.download_thumbnail({"id": item_id}, dest, size="large"):
+                    with Image.open(dest) as im:
+                        img = im.convert("RGB")
+                    self.event_queue.put(("preview_image", token, self._fit(img, box), 1))
             except Exception as exc:
                 _log_reuse(f"PREVIEW FETCH FAILED: {exc!r}")
 
@@ -2505,10 +2843,7 @@ class ImageSearchApp:
         dest = os.path.join(full_dir, f"{item_id}_{name}")
         if os.path.exists(dest) and os.path.getsize(dest) > 0:
             return dest
-        if self.sp_client is None:
-            self.sp_client = SharePointClient()
-            self.sp_client.sign_in()
-        self.sp_client.download_file({"id": item_id}, dest)
+        self._ensure_sp_client().download_file({"id": item_id}, dest)
         return dest
 
     def _put_image_on_clipboard(self, source):
@@ -2518,7 +2853,7 @@ class ImageSearchApp:
         import ctypes
         from io import BytesIO
 
-        img = Image.open(source).convert("RGB")
+        img = self._open_upright(source).convert("RGB")
         buf = BytesIO()
         img.save(buf, "BMP")
         data = buf.getvalue()[14:]  # a DIB is a BMP minus its file header
@@ -2581,23 +2916,42 @@ class ImageSearchApp:
     # ---------- manual collections ----------
 
     def _collection_ids(self):
-        """{name: [item_id, ...]} exactly as stored on disk.
+        """{name: [item_id, ...]} in sidebar order, exactly as curated.
 
         Item ids rather than positions, so a collection survives the index
-        being rebuilt in a different order after a sync.
+        being rebuilt in a different order after a sync. Version 2 of the
+        file records which collections exist, so one that was removed stays
+        removed. Older files only listed photos per collection: they are read
+        into the new form - renamed collections folded together, any default
+        the old file lacked added - and written back on the next change.
         """
-        data = self._read_json(self._collections_cache_path()) or {}
-        out = {name: [] for name in MANUAL_COLLECTIONS}
+        data = self._read_json(self._collections_cache_path())
+        if data.get("version") == 2:
+            out = {}
+            for entry in data.get("collections") or []:
+                name = (entry or {}).get("name") if isinstance(entry, dict) else None
+                if isinstance(name, str) and name and name not in out:
+                    out[name] = [i for i in (entry.get("items") or []) if i]
+            return out
+        out = {name: [] for name in DEFAULT_COLLECTIONS}
         for name, ids in data.items():
-            if isinstance(ids, list):
-                out[name] = [i for i in ids if i]
+            if not isinstance(ids, list):
+                continue
+            bucket = out.setdefault(LEGACY_COLLECTIONS.get(name, name), [])
+            for item_id in ids:
+                if item_id and item_id not in bucket:
+                    bucket.append(item_id)
         return out
 
     def _write_collection_ids(self, by_id):
+        payload = {
+            "version": 2,
+            "collections": [{"name": name, "items": ids} for name, ids in by_id.items()],
+        }
         try:
             os.makedirs(os.path.dirname(self._collections_cache_path()), exist_ok=True)
             with open(self._collections_cache_path(), "w", encoding="utf-8") as f:
-                json.dump(by_id, f, ensure_ascii=False)
+                json.dump(payload, f, ensure_ascii=False)
             return True
         except OSError as exc:
             _log_reuse(f"COLLECTIONS SAVE FAILED: {exc!r}")
@@ -2605,7 +2959,98 @@ class ImageSearchApp:
             return False
 
     def _collection_names(self):
-        return list((self._collections or {}).keys()) or list(MANUAL_COLLECTIONS)
+        return list((self._collections or self._collection_ids()).keys())
+
+    def _reload_collections(self):
+        self._collections = self._load_collections()
+        self._rebuild_collection_cards()
+
+    def _ask_collection_name(self, title, prompt, current=None):
+        """Asks for a collection name. Returns None if cancelled or unusable,
+        after saying why when it is the latter."""
+        dialog = ctk.CTkInputDialog(title=title, text=prompt)
+        # CustomTkinter puts its own icon on new windows after ~200ms.
+        dialog.after(250, lambda: dialog.iconbitmap(_resource_path("assets", "app_icon.ico")))
+        raw = dialog.get_input()
+        if raw is None:
+            return None
+        name = " ".join(raw.split())
+        if not name:
+            return None
+        if len(name) > COLLECTION_NAME_MAX:
+            messagebox.showinfo(
+                "Image Search", f"Please keep collection names to {COLLECTION_NAME_MAX} characters."
+            )
+            return None
+        if name.lower() in RESERVED_COLLECTION_NAMES:
+            messagebox.showinfo(
+                "Image Search", f"“{name}” is already used by the app - please choose another name."
+            )
+            return None
+        taken = {n.lower() for n in self._collection_ids() if n != current}
+        if name.lower() in taken:
+            messagebox.showinfo("Image Search", f"There is already a collection called “{name}”.")
+            return None
+        return name
+
+    def _new_collection(self):
+        name = self._ask_collection_name("New collection", "Name for the new collection:")
+        if name is None:
+            return
+        by_id = self._collection_ids()
+        by_id[name] = []
+        if self._write_collection_ids(by_id):
+            self._reload_collections()
+            self.status_var.set(
+                f"Created {name} - drag photos onto it, or right-click a photo and choose 'Add to {name}'."
+            )
+
+    def _rename_collection(self, name):
+        new = self._ask_collection_name(
+            "Rename collection", f"New name for “{name}”:", current=name
+        )
+        if new is None or new == name:
+            return
+        by_id = self._collection_ids()
+        if name not in by_id:
+            return
+        by_id = {(new if key == name else key): ids for key, ids in by_id.items()}  # keeps its place
+        if self._write_collection_ids(by_id):
+            viewing = self._view == name
+            self._reload_collections()
+            if viewing:
+                self._set_view(new)
+            self.status_var.set(f"Renamed {name} to {new}.")
+
+    def _remove_collection(self, name):
+        by_id = self._collection_ids()
+        if name not in by_id:
+            return
+        count = len(by_id[name])
+        detail = (
+            f"The {count} photo(s) in it stay in the library - only the collection goes."
+            if count else "It is empty."
+        )
+        if not messagebox.askyesno(
+            "Remove collection", f"Remove “{name}”?\n\n{detail}", icon="warning"
+        ):
+            return
+        del by_id[name]
+        if self._write_collection_ids(by_id):
+            viewing = self._view == name
+            self._reload_collections()
+            if viewing:
+                self._set_view("all")
+            self.status_var.set(f"Removed {name}.")
+
+    def _show_collection_menu(self, event, name):
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Rename…", command=lambda: self._rename_collection(name))
+        menu.add_command(label="Remove…", command=lambda: self._remove_collection(name))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def _add_to_collection(self, name, path, meta):
         item_id = (meta or {}).get("item_id")
@@ -2661,11 +3106,11 @@ class ImageSearchApp:
         menu.add_command(label="Copy image", command=lambda: self._copy_to_clipboard(path, meta))
         if meta and meta.get("item_id"):
             menu.add_command(
-                label="Open full size",
+                label="Open original",
                 command=lambda: self._open_sp_result(meta["item_id"], meta["name"]),
             )
         else:
-            menu.add_command(label="Open full size", command=lambda: open_in_system_viewer(path))
+            menu.add_command(label="Open original", command=lambda: open_in_system_viewer(path))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -2737,7 +3182,10 @@ class ImageSearchApp:
             except Exception:
                 pass
             try:
-                ctk.CTkLabel(win, image=self._thumb_for(path), text="").pack()
+                photo = ImageTk.PhotoImage(self._thumb_image(path))
+                carried = tk.Label(win, image=photo, bd=0, highlightthickness=0)
+                carried.image = photo
+                carried.pack()
             except Exception:
                 tk.Label(win, text="Moving photo...", padx=10, pady=6).pack()
             return win
@@ -2778,66 +3226,53 @@ class ImageSearchApp:
         for child in self.results_frame.winfo_children():
             child.destroy()
         self.thumbnail_refs.clear()
+        # Read once per render, not once per photo: it is a file on disk.
+        self._render_favs = set(self._own_favourites())
+        # Measured now rather than trusting the last resize event, so the
+        # first layout after startup already has the right column count.
+        self._current_columns = self._desired_columns()
         self._render_chunk(results, 0, max(1, self._current_columns))
 
     def _render_chunk(self, results, start, columns):
         """Builds one screenful of results, then yields to the event loop
         before the next.
 
-        A full grid is 150 cells, each of which is several Tk widgets plus a
-        JPEG decode - building them in a single pass froze the window for
-        seconds after every search, with nothing on screen until the last
-        one was done. Rendering in chunks puts the top of the grid up
-        immediately and fills the rest in behind it, so a search feels
-        instant even though the same total work still happens.
+        Each result is three plain Tk widgets. They used to be five
+        CustomTkinter widgets, each drawing its own canvas and registering
+        with CustomTkinter's theme and scaling trackers - about 33ms per
+        photo, so 120 photos took four seconds to appear. Plain widgets in
+        the same colours take a fraction of a millisecond each, and the star
+        is drawn into the thumbnail rather than placed on top of it.
         """
         self._render_after_id = None
         end = min(start + RENDER_CHUNK, len(results))
 
         for idx in range(start, end):
             path, _score, meta = results[idx]
-            row, col = divmod(idx, columns)
-            cell = ctk.CTkFrame(self.results_frame, fg_color="transparent")
-            cell.grid(row=row, column=col, sticky="n", padx=4, pady=4)
-
+            key = self._fav_key(path, meta)
             try:
-                photo = self._thumb_for(path)
+                photo = self._thumb_photo(path, key in self._render_favs)
             except Exception:
                 continue
-            self.thumbnail_refs.append(photo)
+            row, col = divmod(idx, columns)
+            cell = tk.Frame(self.results_frame, bg=BG_COLOR, bd=0, highlightthickness=0)
+            cell.grid(row=row, column=col, sticky="n", padx=4, pady=4)
 
-            holder = ctk.CTkFrame(cell, fg_color="transparent")
-            holder.pack()
-            label = ctk.CTkLabel(holder, image=photo, text="", cursor="hand2")
-            label.pack()
-            # Double-click previews in-app. Opening the original meant an
-            # 8MB download before anything appeared; the full file is still
-            # one click away from inside the preview.
-            label.bind(
-                "<Double-Button-1>",
-                lambda _e, p=path, m=meta: self._show_preview(p, m),
+            label = tk.Label(
+                cell, image=photo, bd=0, highlightthickness=0, padx=0, pady=0,
+                bg=BG_COLOR, cursor="hand2",
             )
+            label.image = photo  # a PhotoImage only lives while something refers to it
+            label.pack()
+            # Double-click previews in-app; the original is one click away
+            # from inside the preview. A click on the star toggles it.
+            label.bind("<Double-Button-1>", lambda e, p=path, m=meta: self._on_thumb_double(e, p, m))
             label.bind("<Button-3>", lambda e, p=path, m=meta: self._show_result_menu(e, p, m))
             label.bind("<ButtonPress-1>", lambda e, p=path, m=meta: self._drag_start(e, p, m))
             label.bind("<B1-Motion>", self._drag_motion)
-            label.bind("<ButtonRelease-1>", self._drag_release)
-
-            key = self._fav_key(path, meta)
-            star = ctk.CTkLabel(
-                holder,
-                text="\u2605" if self._is_favourite(key) else "\u2606",
-                text_color="#ffd54a" if self._is_favourite(key) else "#ffffff",
-                font=ctk.CTkFont(size=20),
-                fg_color=CARD_COLOR,
-                corner_radius=8,
-                width=26,
-                height=24,
-                cursor="hand2",
-            )
-            star.place(relx=1.0, rely=0.0, anchor="ne", x=-3, y=3)
-            star.bind(
-                "<Button-1>",
-                lambda _e, k=key, p=path, m=meta, w=star: self._on_star_clicked(k, p, m, w),
+            label.bind(
+                "<ButtonRelease-1>",
+                lambda e, k=key, p=path, m=meta: self._on_thumb_release(e, k, p, m),
             )
 
             # The SharePoint filename is almost always a camera default
@@ -2845,25 +3280,601 @@ class ImageSearchApp:
             # label a result can carry - show it when we know it.
             folder = (meta or {}).get("folder") if meta else None
             caption = folder if folder else os.path.basename(path)
-            ctk.CTkLabel(
+            tk.Label(
                 cell, text=caption, justify=tk.CENTER, wraplength=THUMB_SIZE[0],
-                text_color=MUTED_TEXT_COLOR, font=ctk.CTkFont(size=12),
-            ).pack()
+                fg=MUTED_TEXT_COLOR, bg=BG_COLOR, font=CAPTION_FONT, bd=0,
+            ).pack(pady=(4, 4))
 
         if end < len(results):
             self._render_after_id = self.root.after(
                 1, lambda: self._render_chunk(results, end, columns)
             )
+        elif self._render_done_callback is not None:
+            callback, self._render_done_callback = self._render_done_callback, None
+            callback()
 
     def _on_star_clicked(self, key, path, meta, widget):
         added = self._toggle_favourite(key, path, meta)
-        widget.configure(
-            text="★" if added else "☆",
-            text_color="#ffd54a" if added else "#ffffff",
-        )
+        (self._render_favs.add if added else self._render_favs.discard)(key)
+        try:
+            photo = self._thumb_photo(path, added)
+            widget.configure(image=photo)
+            widget.image = photo
+        except Exception:
+            pass
         # Un-starring while viewing favourites should drop it from the list.
         if self._view == "favourites" and not added:
             self._show_favourites()
+
+# ---------- startup: splash and reveal ----------
+
+SPLASH_BG = "#0d1b2a"  # the window's own background, so the handover is seamless
+SPLASH_TRACK = "#1c2c3f"
+SPLASH_ACCENT = "#3d7bff"  # the icon's blue, lifted to read on the dark card
+SPLASH_FAINT = "#4f6377"
+SPLASH_BORDER = "#22344a"
+FRAME_MS = 8
+
+
+def _cubic_bezier(x1, y1, x2, y2):
+    """An easing function equivalent to CSS cubic-bezier(x1, y1, x2, y2)."""
+    cx = 3 * x1
+    bx = 3 * (x2 - x1) - cx
+    ax = 1 - cx - bx
+    cy = 3 * y1
+    by = 3 * (y2 - y1) - cy
+    ay = 1 - cy - by
+
+    def x_at(t):
+        return ((ax * t + bx) * t + cx) * t
+
+    def y_at(t):
+        return ((ay * t + by) * t + cy) * t
+
+    def ease(x):
+        if x <= 0:
+            return 0.0
+        if x >= 1:
+            return 1.0
+        t = x
+        for _ in range(8):  # Newton's method usually lands in a few steps
+            err = x_at(t) - x
+            if abs(err) < 1e-6:
+                return y_at(t)
+            slope = (3 * ax * t + 2 * bx) * t + cx
+            if abs(slope) < 1e-6:
+                break
+            t -= err / slope
+            if not 0.0 <= t <= 1.0:
+                break
+        lo, hi, t = 0.0, 1.0, x  # bisection where Newton cannot cope
+        for _ in range(40):
+            if x_at(t) < x:
+                lo = t
+            else:
+                hi = t
+            t = (lo + hi) / 2
+        return y_at(t)
+
+    return ease
+
+
+# A strong ease-out: most of the movement happens at once and then settles,
+# so an entrance reads as immediate. The stock "ease-out" is too timid.
+EASE_OUT = _cubic_bezier(0.23, 1, 0.32, 1)
+# For things travelling across the screen (the progress bar): accelerates
+# away and settles, instead of lurching off at full speed.
+EASE_IN_OUT = _cubic_bezier(0.65, 0, 0.35, 1)
+
+
+def _linear(x):
+    return x
+
+
+def _mix(start, end, amount):
+    """The colour `amount` of the way from `start` to `end` (both #rrggbb).
+    Tk can't fade a canvas item's opacity, but on a solid background
+    fading its colour into the background looks the same."""
+    a, b = _hex_rgb(start), _hex_rgb(end)
+    return "#%02x%02x%02x" % tuple(round(x + (y - x) * amount) for x, y in zip(a, b))
+
+
+def _fade_frames(image, levels):
+    """`image` at `levels` opacities, from invisible to solid, so it can be
+    faded by swapping frames rather than re-rendering on every tick."""
+    alpha = image.getchannel("A")
+    frames = []
+    for i in range(levels):
+        frame = image.copy()
+        frame.putalpha(alpha.point(lambda v, s=i / (levels - 1): round(v * s)))
+        frames.append(ImageTk.PhotoImage(frame))
+    return frames
+
+
+def _glow_frames(levels=12):
+    """A soft light for the tip of the progress bar, at a range of
+    strengths, so it can breathe without re-rendering each frame."""
+    w, h, k = 44, 18, 4
+    blob = Image.new("L", (w * k, h * k), 0)
+    ImageDraw.Draw(blob).ellipse((w * k * 0.22, h * k * 0.30, w * k * 0.78, h * k * 0.70), fill=255)
+    blob = blob.filter(ImageFilter.GaussianBlur(5 * k)).resize((w, h), Image.LANCZOS)
+    tint = Image.new("RGB", (w, h), _hex_rgb(SPLASH_ACCENT))
+    frames = []
+    for i in range(levels):
+        frame = tint.copy()
+        frame.putalpha(blob.point(lambda v, s=0.9 * i / (levels - 1): round(v * s)))
+        frames.append(ImageTk.PhotoImage(frame))
+    return frames
+
+
+def _animate(scheduler, duration_ms, step, done=None, ease=EASE_OUT):
+    """Calls step(progress) from 0 to 1 over duration_ms, then done().
+
+    Driven by the clock, not by counting frames: if the main thread is busy
+    and a frame comes late, the animation jumps to where it should be rather
+    than stretching out. done() always runs, even if a window vanished
+    mid-way, so a sequence built on these can never stall.
+    """
+    start = time.perf_counter()
+
+    def frame():
+        try:
+            elapsed = (time.perf_counter() - start) * 1000.0
+            if duration_ms > 0 and elapsed < duration_ms:
+                step(ease(elapsed / duration_ms))
+                scheduler.after(FRAME_MS, frame)
+                return
+            step(1.0)
+        except tk.TclError:
+            pass
+        if done is not None:
+            done()
+
+    frame()
+
+
+def _prefers_reduced_motion():
+    """Windows' "Animation effects" switch (Settings > Accessibility > Visual
+    effects). When it is off, movement is dropped and fades are shortened -
+    fades stay, because they help the eye follow what changed."""
+    try:
+        import ctypes
+
+        enabled = ctypes.c_int(1)
+        ok = ctypes.windll.user32.SystemParametersInfoW(
+            0x1042, 0, ctypes.byref(enabled), 0  # SPI_GETCLIENTAREAANIMATION
+        )
+        return bool(ok) and not enabled.value
+    except Exception:
+        return False
+
+
+def _fine_timer(on):
+    """Windows runs Tk's timers at about 15ms by default - 64 frames a second
+    at best, visibly steppy on a fast display. A 1ms resolution is asked for
+    only while the intro plays, then handed back."""
+    try:
+        import ctypes
+
+        winmm = ctypes.windll.winmm
+        (winmm.timeBeginPeriod if on else winmm.timeEndPeriod)(1)
+    except Exception:
+        pass
+
+
+def _round_corners(win, border=SPLASH_BORDER):
+    """Asks Windows 11 to draw a borderless window with rounded corners and a
+    hairline border, like its own flyouts. A no-op on Windows 10."""
+    try:
+        import ctypes
+
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        dwm = ctypes.windll.dwmapi
+        corner = ctypes.c_int(2)  # DWMWCP_ROUND
+        dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(corner), ctypes.sizeof(corner))
+        r, g, b = (int(border[i:i + 2], 16) for i in (1, 3, 5))
+        colour = ctypes.c_uint(r | (g << 8) | (b << 16))  # COLORREF is 0x00BBGGRR
+        dwm.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(colour), ctypes.sizeof(colour))
+    except Exception:
+        pass
+
+
+class BootSplash:
+    """The card on screen from the moment the app starts until its window is
+    ready.
+
+    Starting used to be a blank pause, then a small window that jumped to
+    full screen and filled in piece by piece. This makes it one composed
+    motion: the card arrives, its contents follow in a short cascade, the
+    bar reports real progress, and the card dissolves into a window that is
+    already finished.
+    """
+
+    WIDTH, HEIGHT = 460, 300
+    CARD_RISE = 8  # px the card travels as it arrives
+    ITEM_RISE = 8  # px each line of content travels as it follows
+    CARD_IN_MS = 220
+    ITEM_IN_MS = 420
+    STATUS_OUT_MS, STATUS_IN_MS = 130, 210
+    BAR_MS = 420
+    GLOW_PERIOD_S = 1.8
+
+    def __init__(self, root):
+        self.root = root
+        self.reduced = _prefers_reduced_motion()
+        self._closing = False
+        win = self.win = tk.Toplevel(root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.configure(bg=SPLASH_BG)
+        try:
+            win.attributes("-alpha", 0.0)
+            win.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        screen_w, screen_h = win.winfo_screenwidth(), win.winfo_screenheight()
+        self.x = (screen_w - self.WIDTH) // 2
+        # A little above centre: the optical centre of a screen sits higher
+        # than the geometric one, and a dead-centred card looks low.
+        self.y = (screen_h - self.HEIGHT) // 2 - screen_h // 40
+        self._place(0 if self.reduced else self.CARD_RISE)
+
+        w, h = self.WIDTH, self.HEIGHT
+        c = self.canvas = tk.Canvas(
+            win, width=w, height=h, bg=SPLASH_BG, highlightthickness=0, bd=0
+        )
+        c.pack()
+        # Everything starts in the background colour and is brought in by
+        # the entrance cascade; each entry is (start delay ms, apply(0..1)).
+        self._entrance = []
+
+        try:
+            self._shield_frames = _fade_frames(_load_mark(84), 14)
+            shield = c.create_image(w // 2, 86, image=self._shield_frames[0])
+            self._entrance.append(
+                (40, lambda q: self._fade_image(shield, self._shield_frames, w // 2, 86, q))
+            )
+        except Exception:
+            self._shield_frames = []
+
+        title = c.create_text(w // 2, 160, text="Image Search", fill=SPLASH_BG,
+                              font=("Segoe UI Semibold", -26))
+        self._entrance.append((90, lambda q: self._fade_text(title, TEXT_COLOR, w // 2, 160, q)))
+        subtitle = c.create_text(w // 2, 190, text="Marketing photo library", fill=SPLASH_BG,
+                                 font=("Segoe UI", -14))
+        self._entrance.append(
+            (130, lambda q: self._fade_text(subtitle, MUTED_TEXT_COLOR, w // 2, 190, q))
+        )
+
+        self._bar_w = 200
+        self._bar_x = (w - self._bar_w) // 2
+        self._bar_y = 228
+        track = c.create_rectangle(self._bar_x, self._bar_y, self._bar_x + self._bar_w,
+                                   self._bar_y + 3, fill=SPLASH_BG, width=0)
+        self._bar = c.create_rectangle(self._bar_x, self._bar_y, self._bar_x,
+                                       self._bar_y + 3, fill=SPLASH_BG, width=0)
+        try:
+            self._glow_frames = _glow_frames()
+            self._glow = c.create_image(self._bar_x, self._bar_y + 1.5,
+                                        image=self._glow_frames[0])
+        except Exception:
+            self._glow_frames, self._glow = [], None
+        self._glow_in = 0.0
+
+        def bar_in(q):
+            c.itemconfigure(track, fill=_mix(SPLASH_BG, SPLASH_TRACK, q))
+            c.itemconfigure(self._bar, fill=_mix(SPLASH_BG, SPLASH_ACCENT, q))
+            self._glow_in = q
+
+        self._entrance.append((170, bar_in))
+
+        self._status_xy = (w // 2, 252)
+        self._status = c.create_text(*self._status_xy, text="Starting…", fill=SPLASH_BG,
+                                     font=("Segoe UI", -12))
+        self._entrance.append(
+            (200, lambda q: self._fade_text(self._status, MUTED_TEXT_COLOR, *self._status_xy, q))
+        )
+        stamp = _build_stamp()
+        if stamp:
+            version = c.create_text(w - 16, h - 12, text=f"version {stamp}", anchor="se",
+                                    fill=SPLASH_BG, font=("Segoe UI", -11))
+            self._entrance.append(
+                (240, lambda q: c.itemconfigure(version, fill=_mix(SPLASH_BG, SPLASH_FAINT, q)))
+            )
+
+        self._drawn = 0.0
+        self._target = 0.12
+        self._bar_token = None
+        self._status_token = None
+        self._draw_bar(0.12)
+
+    # --- drawing primitives ---
+
+    def _place(self, offset):
+        self.win.geometry(f"{self.WIDTH}x{self.HEIGHT}+{self.x}+{self.y + offset}")
+
+    def _alpha(self, value):
+        self.win.attributes("-alpha", max(0.0, min(1.0, value)))
+
+    def _rise(self):
+        return 0 if self.reduced else self.ITEM_RISE
+
+    def _fade_text(self, item, colour, x, y, q):
+        self.canvas.itemconfigure(item, fill=_mix(SPLASH_BG, colour, q))
+        self.canvas.coords(item, x, y + self._rise() * (1 - q))
+
+    def _fade_image(self, item, frames, x, y, q):
+        self.canvas.itemconfigure(item, image=frames[round(q * (len(frames) - 1))])
+        self.canvas.coords(item, x, y + self._rise() * (1 - q))
+
+    def _draw_bar(self, fraction):
+        self._drawn = fraction
+        right = self._bar_x + round(self._bar_w * fraction)
+        self.canvas.coords(self._bar, self._bar_x, self._bar_y, right, self._bar_y + 3)
+        if self._glow is not None:
+            self.canvas.coords(self._glow, right, self._bar_y + 1.5)
+
+    # --- motion ---
+
+    def show(self, on_shown):
+        self.win.deiconify()
+        self.win.update_idletasks()
+        _round_corners(self.win)
+        self._breathe()
+        if self.reduced:
+            for _delay, apply in self._entrance:
+                apply(1.0)
+            _animate(self.root, 120, self._alpha, done=on_shown)
+            return
+        last = max((delay for delay, _ in self._entrance), default=0)
+        total = max(self.CARD_IN_MS, last + self.ITEM_IN_MS)
+
+        def frame(p):
+            t = p * total
+            card = EASE_OUT(min(1.0, t / self.CARD_IN_MS))
+            self._alpha(card)
+            self._place(round(self.CARD_RISE * (1 - card)))
+            for delay, apply in self._entrance:
+                apply(EASE_OUT(max(0.0, min(1.0, (t - delay) / self.ITEM_IN_MS))))
+
+        # One clock drives the whole cascade, each part easing on its own
+        # schedule, so the pieces can never drift out of step.
+        _animate(self.root, total, frame, done=on_shown, ease=_linear)
+
+    def _breathe(self):
+        """Keeps the light at the bar's tip gently pulsing while the app
+        loads - constant, slow motion that says "still working", not frozen."""
+        if self._glow is None or not self._glow_frames:
+            return
+        start = time.perf_counter()
+        frames = self._glow_frames
+
+        def tick():
+            if self._closing:
+                return
+            try:
+                if self.reduced:
+                    level = self._glow_in * 0.7
+                else:
+                    phase = (time.perf_counter() - start) / self.GLOW_PERIOD_S
+                    breath = 0.5 - 0.5 * math.cos(2 * math.pi * phase)  # smooth 0..1..0
+                    level = self._glow_in * (0.5 + 0.5 * breath)
+                self.canvas.itemconfigure(self._glow, image=frames[round(level * (len(frames) - 1))])
+                self.root.after(16, tick)
+            except tk.TclError:
+                pass
+
+        tick()
+
+    def set_status(self, text):
+        """Crossfades the status line: the old text lifts away, the new one
+        rises into place. An instant swap reads as a flicker."""
+        x, y = self._status_xy
+        if self.reduced:
+            self.canvas.itemconfigure(self._status, text=text)
+            return
+        token = self._status_token = object()
+        out_ms, in_ms = self.STATUS_OUT_MS, self.STATUS_IN_MS
+        swapped = [False]
+
+        def step(p):
+            if self._status_token is not token:
+                return  # a newer status has taken over
+            t = p * (out_ms + in_ms)
+            if t < out_ms:
+                q = EASE_OUT(t / out_ms)
+                self.canvas.itemconfigure(self._status, fill=_mix(MUTED_TEXT_COLOR, SPLASH_BG, q))
+                self.canvas.coords(self._status, x, y - 4 * q)
+                return
+            if not swapped[0]:
+                self.canvas.itemconfigure(self._status, text=text)
+                swapped[0] = True
+            q = EASE_OUT(min(1.0, (t - out_ms) / in_ms))
+            self.canvas.itemconfigure(self._status, fill=_mix(SPLASH_BG, MUTED_TEXT_COLOR, q))
+            self.canvas.coords(self._status, x, y + 4 * (1 - q))
+
+        _animate(self.root, out_ms + in_ms, step, ease=_linear)
+
+    def set_progress(self, target):
+        """Moves the bar to `target` (0-1). Eased in and out, since it is
+        travelling across the card; and only ever forwards - a bar that
+        slides back reads as something going wrong."""
+        target = max(self._target, min(1.0, target))
+        self._target = target
+        start = self._drawn
+        token = self._bar_token = object()
+
+        def step(p):
+            if self._bar_token is token:  # a newer target has taken over
+                self._draw_bar(start + (target - start) * p)
+
+        _animate(self.root, 0 if self.reduced else self.BAR_MS, step, ease=EASE_IN_OUT)
+
+    def hide(self, done=None):
+        """Fades out faster than it came in - leaving should never hold
+        anything up - and keeps drifting the way it arrived."""
+        drift = 0 if self.reduced else 6
+
+        def step(p):
+            self._alpha(1 - p)
+            self._place(-round(drift * p))
+
+        def finished():
+            self.destroy()
+            if done is not None:
+                done()
+
+        _animate(self.root, 120 if self.reduced else 200, step, done=finished)
+
+    def destroy(self):
+        self._closing = True
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+
+class BootSequence:
+    """Runs startup: splash in, build the window out of sight, reveal it.
+
+    The window is built and laid out while fully transparent, so by the time
+    it fades in it is already maximised, its sidebar is complete and its
+    first screen of photos is drawn. Nothing on it moves after it appears.
+    """
+
+    MIN_VISIBLE_MS = 350  # never flash the card in and straight out again
+    TIMEOUT_MS = 12000  # reveal regardless, rather than hide a problem
+
+    def __init__(self, root):
+        self.root = root
+        self.app = None
+        self.splash = None
+        self._shown_at = None
+        self._render_done = False
+        self._collections_done = False
+        self._revealing = False
+
+    def start(self):
+        _fine_timer(True)
+        try:
+            self.splash = BootSplash(self.root)
+            _boot_mark("splash built")
+            self.splash.show(on_shown=self._on_splash_shown)
+        except Exception:
+            _log_crash("showing the splash", sys.exc_info())
+            if self.splash is not None:
+                self.splash.destroy()
+            self.splash = None
+            self.root.after(0, self._on_splash_shown)
+        self.root.after(self.TIMEOUT_MS, self._reveal)
+
+    def _on_splash_shown(self):
+        _boot_mark("splash on screen")
+        self._shown_at = time.perf_counter()
+        # Built while the card is still: building the window holds the main
+        # thread for a few hundred ms, and a text change started now would
+        # freeze half-way through.
+        self.root.after(16, self._build)
+
+    def _build(self):
+        try:
+            self.app = ImageSearchApp(self.root, boot=self)
+        except Exception:
+            _log_crash("building the window", sys.exc_info())
+            self._fail()
+            return
+        _boot_mark("window built")
+        self._stage("Loading your photo library…", 0.4)
+
+    # --- called by the app as startup progresses ---
+
+    def library_loaded(self, count):
+        _boot_mark(f"photo library loaded ({count:,} photos)")
+        self._stage(f"Preparing {count:,} photos…", 0.75)
+
+    def library_empty(self):
+        _boot_mark("no photo library cached yet")
+        self._render_done = True
+        self._maybe_reveal()
+
+    def render_done(self):
+        _boot_mark("first screen of photos drawn")
+        self._render_done = True
+        self._maybe_reveal()
+
+    def collections_done(self):
+        self._collections_done = True
+        self._maybe_reveal()
+
+    def _maybe_reveal(self):
+        if self._render_done and self._collections_done:
+            self._reveal()
+
+    # --- the handover ---
+
+    def _stage(self, text, progress=None):
+        if self.splash is None:
+            return
+        if text is not None:
+            self.splash.set_status(text)
+        if progress is not None:
+            self.splash.set_progress(progress)
+
+    def _reveal(self):
+        if self._revealing or self.app is None:
+            return  # still building; the build's own progress will get here
+        self._revealing = True
+        shown_ms = 0 if self._shown_at is None else (time.perf_counter() - self._shown_at) * 1000
+        wait = max(0, self.MIN_VISIBLE_MS - shown_ms)
+        self._stage("Ready", 1.0)
+        # Long enough for the bar to visibly arrive before the card leaves.
+        self.root.after(int(wait) + 460, self._crossfade)
+
+    def _crossfade(self):
+        root = self.root
+        reduced = self.splash.reduced if self.splash is not None else _prefers_reduced_motion()
+        try:
+            if root.state() == "withdrawn":
+                root.deiconify()
+        except tk.TclError:
+            pass
+
+        def step(p):
+            root.attributes("-alpha", p)
+
+        # The window comes up as the card goes down: one crossfade, with the
+        # card's exit shorter than the window's entrance.
+        _animate(root, 150 if reduced else 320, step, done=self._finished)
+        if self.splash is not None:
+            self.splash.hide()
+            self.splash = None
+
+    def _finished(self):
+        _fine_timer(False)
+        try:
+            root = self.root
+            root.attributes("-alpha", 1.0)
+            root.lift()
+            root.focus_force()
+        except Exception:
+            pass
+        _boot_mark("window revealed")
+        if self.app is not None:
+            # After the reveal, not during it: importing torch holds the
+            # interpreter for seconds and would freeze the crossfade.
+            self.root.after(700, self.app._warm_model)
+
+    def _fail(self):
+        _fine_timer(False)
+        if self.splash is not None:
+            self.splash.destroy()
+            self.splash = None
+        messagebox.showerror(
+            "Image Search",
+            "Image Search could not start. The details were written to "
+            "crash.log in %LOCALAPPDATA%\\ImageSearch.",
+        )
+        self.root.destroy()
 
 
 def _thread_excepthook(args):
@@ -2872,6 +3883,11 @@ def _thread_excepthook(args):
 
 def main():
     threading.excepthook = _thread_excepthook
+    _boot_mark("python and libraries loaded")
+    _boot_mark(
+        f"    of which: customtkinter {_T_CTK - _IMPORT_T0:.2f}s, numpy {_T_NUMPY - _T_CTK:.2f}s, "
+        f"Pillow {_T_PIL - _T_NUMPY:.2f}s, search engine {_T_ENGINE - _T_PIL:.2f}s"
+    )
     # Windows groups a window under the executable that started it, so a
     # script run through pythonw shows the Python icon in the taskbar and in
     # Alt-Tab. Claiming an explicit identity makes it use this app's own icon.
@@ -2892,6 +3908,14 @@ def main():
     except Exception:
         pass
     root = ctk.CTk()
+    # Hidden and fully transparent until BootSequence reveals it: the window
+    # is built and laid out out of sight, so it never appears half-made.
+    try:
+        root.attributes("-alpha", 0.0)
+    except Exception:
+        pass
+    root.withdraw()
+    _boot_mark("window system started")
     try:
         root.configure(fg_color=BG_COLOR)
     except Exception:
@@ -2905,7 +3929,8 @@ def main():
             root.iconbitmap(_resource_path("assets", "app_icon.ico"))
         except Exception:
             pass
-    ImageSearchApp(root)
+    BootSequence(root).start()
+    root.after(0, lambda: _boot_mark("event loop running"))
     try:
         root.mainloop()
     except Exception:
