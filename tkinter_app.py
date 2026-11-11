@@ -33,6 +33,17 @@ from tkinter import filedialog, messagebox
 # HF_HOME once at import time - hence this sits above every other import.
 if getattr(sys, "frozen", False):
     os.environ["HF_HOME"] = os.path.join(sys._MEIPASS, "model_cache")
+elif "HF_HOME" not in os.environ:
+    # Running from source, the same pre-downloaded copy sits next to this
+    # file. Without this the weights are looked for in the default
+    # HuggingFace cache, which on a machine that has never downloaded them
+    # means either a 600MB wait or - where the network blocks it - the
+    # "Failed to download weights" crash recorded in crash.log.
+    _SOURCE_MODEL_CACHE = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "model_cache"
+    )
+    if os.path.isdir(_SOURCE_MODEL_CACHE):
+        os.environ["HF_HOME"] = _SOURCE_MODEL_CACHE
 
 import customtkinter as ctk
 import numpy as np
@@ -78,7 +89,13 @@ def _log_reuse(line):
         pass
 
 
-THUMB_SIZE = (128, 128)
+# Matches the long edge of the thumbnails SharePoint gives us (Graph
+# "medium" = 176px): displaying smaller than the source threw away detail
+# we already had on disk, and displaying larger would only upscale blur.
+THUMB_SIZE = (176, 176)
+# Decoded thumbnails kept for reuse across re-layouts; a few hundred
+# 176px images is a handful of MB, far cheaper than re-decoding them.
+THUMB_CACHE_MAX = 800
 GRID_COLUMNS = 5  # fallback used only before the results area has a real size
 GRID_CELL_PADDING = 24  # horizontal space a grid cell needs beyond the thumbnail itself
 RESIZE_DEBOUNCE_MS = 150
@@ -112,6 +129,51 @@ COLLECTION_MAX = 150
 # the background shouldn't be treated as finished artwork.
 TEXT_OVERLAY_MARGIN = -0.012
 HISTORY_MAX = 100
+# How many photos the opening view shows. Enough to fill a maximised
+# window several rows deep without making startup wait on decoding.
+ALL_PHOTOS_PREVIEW = 120
+# A collection with one or two photos in it reads as a bug rather than
+# a category, so small ones are kept off the sidebar.
+MIN_COLLECTION_SIZE = 10
+# How many results keep strict relevance order before the variety rules are
+# allowed to reorder anything. The engine ranks the whole library correctly;
+# interleaving by folder and grouping by orientation then moved genuinely
+# better matches down the grid to make room for variety. Keeping the opening
+# rows in pure relevance order means a query with a qualifier in it
+# ("nighttime", "no people") is answered by the top of the grid, and the
+# variety rules still shape the long tail underneath.
+RELEVANCE_HEAD = 24
+# The collections in the sidebar. They start empty and are filled by hand -
+# dragging a photo onto one, or right-clicking it - rather than being
+# guessed from the image. An automatic grouping was close but never right,
+# and a shortlist someone curated is worth more than one nobody trusts.
+MANUAL_COLLECTIONS = ["Golf", "Food", "Drinks", "Family", "Kids"]
+# How far the pointer has to move with the button held before it counts as a
+# drag rather than a click, so double-clicking a photo still opens it.
+DRAG_THRESHOLD_PX = 8
+# Largest the in-app preview will draw an image, in px.
+PREVIEW_MAX = (1120, 740)
+# Results built per pass before handing control back to the event loop.
+RENDER_CHUNK = 24
+
+# The two directions used both to score images ("does this photo have guests
+# in it") and to read a query ("is this asking for a scene or for a thing").
+PEOPLE_PROMPTS = [
+    "people enjoying themselves",
+    "a group of happy people",
+    "guests having fun",
+]
+EMPTY_PROMPTS = [
+    "an empty room with no people",
+    "an empty venue interior",
+    "a close up of an object",
+]
+OBJECT_PROMPTS = [
+    "a close up photograph of food on a plate",
+    "a drink in a glass on a bar",
+    "a product shot of a single object",
+    "a detail photograph of equipment",
+]
 DEFAULT_TOP_K = 150
 
 BG_COLOR = "#0d1b2a"
@@ -125,7 +187,22 @@ MUTED_TEXT_COLOR = "#8fa3b8"
 CARD_RADIUS = 14
 BUTTON_RADIUS = 17
 
-LOGO_HEIGHT = 32
+LOGO_HEIGHT = 40
+
+
+def _build_stamp():
+    """A short "which version is this" marker for the header.
+
+    Running from source and running the built .exe look identical on
+    screen, and the two can be weeks apart - so the window says when the
+    code it is running was last changed, and nobody has to guess.
+    """
+    try:
+        target = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
+        stamp = datetime.datetime.fromtimestamp(os.path.getmtime(target))
+        return stamp.strftime("%d %b %H:%M")
+    except Exception:
+        return ""
 
 
 def _resource_path(*parts):
@@ -138,8 +215,19 @@ def _resource_path(*parts):
 def _load_logo_image(height=LOGO_HEIGHT):
     try:
         img = Image.open(_resource_path("assets", "logo.png")).convert("RGBA")
+        # The file carries a wide transparent margin - the artwork is only
+        # 1048x764 inside a 1440x1282 canvas - so scaling the whole canvas
+        # left the mark itself around 24px tall and looking soft. Cropping
+        # to the artwork first lets it use the full height asked for.
+        box = img.getbbox()
+        if box:
+            img = img.crop(box)
         ratio = height / img.height
         width = max(1, round(img.width * ratio))
+        # Resampled here rather than left to the widget. The source mark is
+        # 1440px tall, and a plain scale to 40px aliases the fine strokes -
+        # LANCZOS keeps the edges clean at this size.
+        img = img.resize((width, height), Image.LANCZOS)
         return ctk.CTkImage(light_image=img, dark_image=img, size=(width, height))
     except Exception:
         return None
@@ -225,9 +313,16 @@ def _make_button(parent, text, command, width=140):
 class ImageSearchApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Greenreb_Image_Search")
+        self.root.title("Greenreb Image Search")
         self.root.geometry("1180x760")
         self.root.minsize(1000, 560)
+        # Opens filling the screen: more of the grid is visible at once, and
+        # the 1180x760 default looked small on a desk of large monitors.
+        # The geometry above stays as the size it restores to.
+        try:
+            self.root.state("zoomed")
+        except Exception:
+            pass
 
         self.engine = ImageSearchEngine()
         self.sp_client = None
@@ -238,6 +333,7 @@ class ImageSearchApp:
         self.worker_thread = None
         self.cancel_requested = False
         self.thumbnail_refs = []  # keep CTkImage refs alive
+        self._thumb_cache = {}  # path -> CTkImage, see _thumb_for
         self._last_query = ""
         self._feedback = None
         self._favourites = None
@@ -247,10 +343,17 @@ class ImageSearchApp:
         self._people_vec = None
         self._empty_vec = None
         self._graphic_vec = None
+        self._object_vec = None
         self._plain_vec = None
         self._current_columns = GRID_COLUMNS
         self._resize_after_id = None
+        self._render_after_id = None
+        self._drag = None
+        self._preview = None
         self._view = "all"
+        # Mirrors the state _set_busy puts the buttons in, so paths that
+        # do not go through a button (the Enter key) can honour it too.
+        self._busy = False
         self._collections = {}
         self.all_card = None
         self.fav_card = None
@@ -268,6 +371,22 @@ class ImageSearchApp:
         self._logo_image = _load_logo_image()
         if self._logo_image:
             ctk.CTkLabel(header, image=self._logo_image, text="").pack(side=tk.LEFT)
+        # The header was a small logo adrift in an otherwise empty band; naming
+        # the app there makes the window read as a product rather than a tool.
+        ctk.CTkLabel(
+            header, text="Image Search",
+            font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
+            text_color=TEXT_COLOR,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        stamp = _build_stamp()
+        subtitle = "Marketing photo library"
+        if stamp:
+            subtitle = f"{subtitle}   \u00b7   version {stamp}"
+        ctk.CTkLabel(
+            header, text=subtitle,
+            font=ctk.CTkFont(family="Segoe UI", size=13),
+            text_color=MUTED_TEXT_COLOR,
+        ).pack(side=tk.LEFT, padx=(12, 0), pady=(4, 0))
 
         top = ctk.CTkFrame(self.root, fg_color=CARD_COLOR, corner_radius=CARD_RADIUS)
         top.pack(fill=tk.X, padx=12, pady=12)
@@ -286,7 +405,7 @@ class ImageSearchApp:
         self.index_button.pack(side=tk.LEFT, padx=4, pady=14)
         self.index_button.configure(state=tk.DISABLED)
         self.sharepoint_button = _make_button(
-            top, "Search Marketing Photos", self._browse_sharepoint, width=190
+            top, "Check for new photos", self._browse_sharepoint, width=190
         )
         self.sharepoint_button.pack(side=tk.LEFT, padx=4, pady=14)
         _make_button(top, "Settings", self._open_settings, width=100).pack(
@@ -332,6 +451,12 @@ class ImageSearchApp:
         self.query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(14, 8), pady=14)
         self.query_entry.bind("<Return>", lambda _e: self._start_text_search())
 
+        self.image_search_button = _make_button(
+            search_frame, "Find similar...", self._start_image_search, width=130
+        )
+        self.image_search_button.pack(side=tk.LEFT, padx=(0, 8), pady=14)
+        self.image_search_button.configure(state=tk.DISABLED)
+
         self.search_button = _make_button(
             search_frame, "Search", self._start_text_search, width=100
         )
@@ -343,7 +468,9 @@ class ImageSearchApp:
 
         status_frame = ctk.CTkFrame(main, fg_color="transparent")
         status_frame.pack(fill=tk.X, pady=(0, 8))
-        self.status_var = tk.StringVar(value="Choose a folder to begin.")
+        self.status_var = tk.StringVar(
+            value="Loading your photo library..."
+        )
         ctk.CTkLabel(
             status_frame, textvariable=self.status_var, text_color=TEXT_COLOR, anchor="w",
         ).pack(side=tk.LEFT)
@@ -433,26 +560,27 @@ class ImageSearchApp:
         """
         by_id = self._read_json(self._collections_cache_path())
         if not by_id:
-            return {}
+            return {name: [] for name in MANUAL_COLLECTIONS}
         position = {
             (meta or {}).get("item_id"): i for i, meta in enumerate(self.engine.meta or [])
         }
-        result = {}
+        result = {name: [] for name in MANUAL_COLLECTIONS}
         for name, item_ids in by_id.items():
-            idxs = [position[i] for i in item_ids if i in position]
-            if idxs:
-                result[name] = idxs
+            if not isinstance(item_ids, list):
+                continue
+            # Empty collections are kept: they are the drop targets, so they
+            # have to stay on screen before anything has been put in them.
+            result[name] = [position[i] for i in item_ids if i in position]
         return result
 
     def _refresh_collections(self, from_cache=False):
         """Groups the loaded index into collections, off the UI thread."""
         def work():
             try:
-                if from_cache:
-                    collections = self._load_collections()
-                else:
-                    collections = self._build_categories()
-                    self._save_collections(collections)
+                # Always read what was curated by hand. The automatic
+                # grouping (_build_categories) is no longer applied - it
+                # needed the CLIP model and produced sets nobody chose.
+                collections = self._load_collections()
                 self.event_queue.put(("collections_ready", collections))
             except Exception:
                 _log_crash("building collections", sys.exc_info())
@@ -493,11 +621,43 @@ class ImageSearchApp:
             self._show_collection(view)
         else:
             self.query_entry.configure(placeholder_text="Describe an image in English...")
+            self._show_all_photos()
+
+    def _show_all_photos(self):
+        """Opening view: a cross-section of the library rather than a blank grid.
+
+        Showing nothing until the first search makes an app holding tens of
+        thousands of photos look empty, and gives no sense of what is in
+        there. Stepping through the whole library (rather than taking the
+        first N, which would all come from whichever folder indexed first)
+        and then interleaving by folder gives a varied sample in one screen.
+        """
+        total = len(self.engine.paths)
+        if not total:
             self._render_results([])
-            self.status_var.set("Ready to search." if self.engine.paths else self.status_var.get())
+            self.status_var.set(
+                "No photos loaded yet. Click 'Check for new photos' to load the "
+                "shared drive, or 'Choose Folder...' for photos on this computer."
+            )
+            return
+        step = max(1, total // ALL_PHOTOS_PREVIEW)
+        idxs = list(range(0, total, step))[:ALL_PHOTOS_PREVIEW]
+        results = [(self.engine.paths[i], 1.0, self.engine.meta[i]) for i in idxs]
+        self._render_results(self._interleave_by_folder(results))
+        self.status_var.set(
+            f"{total:,} photos ready. Type what you are looking for, "
+            "or pick a collection on the left."
+        )
 
     def _show_collection(self, name):
         idxs = (self._collections or {}).get(name, [])
+        if not idxs:
+            self._render_results([])
+            self.status_var.set(
+                f"{name} is empty - drag photos onto it, or right-click a photo "
+                f"and choose 'Add to {name}'."
+            )
+            return
         results = [(self.engine.paths[i], 1.0, self.engine.meta[i]) for i in idxs[:DEFAULT_TOP_K]]
         self._render_results(results)
         extra = f" (showing first {DEFAULT_TOP_K})" if len(idxs) > DEFAULT_TOP_K else ""
@@ -629,6 +789,14 @@ class ImageSearchApp:
         query = self.query_var.get().strip()
         if not query:
             return
+        # The Search button is disabled while indexing, but <Return> in the
+        # entry reaches this directly - without this guard a search could run
+        # against an index the sync is in the middle of replacing.
+        if self._busy:
+            self.status_var.set(
+                "Still loading photos - one moment, then try that search again."
+            )
+            return
         if self.engine.embeddings is None or len(self.engine.paths) == 0:
             messagebox.showinfo("Image Search", "Index the folder first before searching.")
             return
@@ -655,9 +823,70 @@ class ImageSearchApp:
                     query, DEFAULT_TOP_K, status_callback=on_status, bonus=bonus,
                     subset=effective_subset,
                 )
-                results = self._interleave_by_folder(results)
-                results = self._order_by_orientation_and_people(results)
+                if self._query_wants_objects(query):
+                    self._last_search_mode = "objects"
+                    # Relevance-preserving: splits on "has guests in it" and
+                    # keeps each half in the engine's order, so this can be
+                    # applied to the whole list without scrambling it.
+                    results = self._order_for_object_query(results)
+                    head, tail = results[:RELEVANCE_HEAD], results[RELEVANCE_HEAD:]
+                    results = head + self._interleave_by_folder(tail)
+                else:
+                    self._last_search_mode = "scene"
+                    head, tail = results[:RELEVANCE_HEAD], results[RELEVANCE_HEAD:]
+                    tail = self._interleave_by_folder(tail)
+                    tail = self._order_by_orientation_and_people(tail)
+                    results = head + tail
                 self.event_queue.put(("search_done", results))
+            except Exception as exc:
+                self.event_queue.put(("error", str(exc)))
+
+        self._run_in_background(work)
+
+    def _start_image_search(self):
+        """Searches with a photo instead of words.
+
+        Some things are far easier to show than to describe - the look of a
+        campaign, a particular lighting, a composition. The reference image
+        is embedded with the same model as the library, so it ranks exactly
+        as a typed query would.
+        """
+        if self._busy:
+            self.status_var.set("Still loading photos - one moment, then try again.")
+            return
+        if self.engine.embeddings is None or len(self.engine.paths) == 0:
+            messagebox.showinfo("Image Search", "Load the photo library first.")
+            return
+        path = filedialog.askopenfilename(
+            title="Pick a photo to find similar ones",
+            filetypes=[
+                ("Images", "*.jpg *.jpeg *.png *.bmp *.gif *.webp *.tif *.tiff"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        subset = self._exclude_graphic(self._active_subset())
+        self._last_query = ""
+        self._set_busy(True)
+        self.progress.configure(mode="indeterminate")
+        self.progress.start()
+        self.status_var.set(f"Finding photos like {os.path.basename(path)}...")
+
+        def work():
+            def on_status(msg):
+                self.event_queue.put(("status", msg))
+
+            try:
+                results = self.engine.search_image(
+                    path, DEFAULT_TOP_K, status_callback=on_status, subset=subset
+                )
+                # Same shape as a text search: the best matches stay in the
+                # engine's order, variety is applied only below them.
+                head, tail = results[:RELEVANCE_HEAD], results[RELEVANCE_HEAD:]
+                self._last_search_mode = "image"
+                self.event_queue.put(("search_done", head + self._interleave_by_folder(tail)))
             except Exception as exc:
                 self.event_queue.put(("error", str(exc)))
 
@@ -679,6 +908,7 @@ class ImageSearchApp:
         self.worker_thread.start()
 
     def _set_busy(self, busy):
+        self._busy = busy
         # "Index Folder" re-runs local-folder indexing, which doesn't apply
         # in SharePoint mode (that index is already built via the shared
         # thumbnail sync) - keep it disabled while SharePoint mode is active.
@@ -693,7 +923,10 @@ class ImageSearchApp:
 
     def _update_search_buttons_state(self):
         has_index = self.engine.embeddings is not None and len(self.engine.paths) > 0
-        self.search_button.configure(state=tk.NORMAL if has_index else tk.DISABLED)
+        state = tk.NORMAL if has_index else tk.DISABLED
+        self.search_button.configure(state=state)
+        if getattr(self, "image_search_button", None) is not None:
+            self.image_search_button.configure(state=state)
 
     # ---------- search-time ranking signals ----------
 
@@ -959,12 +1192,8 @@ class ImageSearchApp:
         """Per-image "has guests in it" score for the whole loaded index,
         cached since the concept vectors never change between calls."""
         if self._people_vec is None:
-            self._people_vec = self.engine.embed_concept(
-                ["people enjoying themselves", "a group of happy people", "guests having fun"]
-            )
-            self._empty_vec = self.engine.embed_concept(
-                ["an empty room with no people", "an empty venue interior", "a close up of an object"]
-            )
+            self._people_vec = self.engine.embed_concept(PEOPLE_PROMPTS)
+            self._empty_vec = self.engine.embed_concept(EMPTY_PROMPTS)
         return self.engine.score_against(self._people_vec) - self.engine.score_against(self._empty_vec)
 
     def _graphic_mask(self):
@@ -994,6 +1223,50 @@ class ImageSearchApp:
             self.engine.score_against(self._graphic_vec)
             - self.engine.score_against(self._plain_vec)
         ) > TEXT_OVERLAY_MARGIN
+
+    def _query_wants_objects(self, query):
+        """True when the query asks for a thing rather than for a scene.
+
+        This is a lifestyle photo library, so nearly every image has guests
+        somewhere in it. Ordering people-first is right for "birthday party"
+        and wrong for "burger", where the wanted photo is the dish, not the
+        table it is sitting on. Comparing the query itself against the two
+        directions decides which rule applies - rather than a hand-written
+        list of food words, which would never cover a whole menu in two
+        languages.
+        """
+        if self._people_vec is None:
+            self._people_vec = self.engine.embed_concept(PEOPLE_PROMPTS)
+            self._empty_vec = self.engine.embed_concept(EMPTY_PROMPTS)
+        if self._object_vec is None:
+            self._object_vec = self.engine.embed_concept(OBJECT_PROMPTS)
+        try:
+            q = self.engine.embed_concept([query])
+        except Exception:
+            return False
+        return float(q @ self._object_vec) > float(q @ self._people_vec)
+
+    def _order_for_object_query(self, results):
+        """Puts photos that are actually OF the thing ahead of photos that
+        merely contain it.
+
+        A stable partition on "has guests in it", so relevance order is kept
+        inside each half and the people shots stay directly underneath
+        rather than being thrown away - the opposite of the orientation
+        sort below, which is what a query for a scene wants.
+        """
+        if not results:
+            return results
+        path_to_index = {p: i for i, p in enumerate(self.engine.paths)}
+        scores = self._people_score()
+
+        def has_people(path):
+            idx = path_to_index.get(path)
+            return bool(idx is not None and idx < len(scores) and scores[idx] > 0)
+
+        objects = [r for r in results if not has_people(r[0])]
+        people = [r for r in results if has_people(r[0])]
+        return objects + people
 
     def _order_by_orientation_and_people(self, results):
         """Re-orders a set of search results: landscape-with-guests,
@@ -1205,13 +1478,20 @@ class ImageSearchApp:
         clobber each other and the merge is a plain union.
         """
         own = self._read_json(self._favourites_path()).get("items") or {}
+        own_name = f"{FAVOURITES_PREFIX}{machine_key()}.json"
         try:
-            if own:
-                self.sp_client.upload_json_file(
-                    root_id, f"{FAVOURITES_PREFIX}{machine_key()}.json", {"items": own}
-                )
+            # Uploaded even when empty: skipping the upload left a removed
+            # favourite sitting in this machine's shared file forever, so
+            # un-starring never reached anyone else.
+            self.sp_client.upload_json_file(root_id, own_name, {"items": own})
             merged = {}
             for name in self.sp_client.list_shared_files(root_id, FAVOURITES_PREFIX):
+                # This machine's own file is skipped: the local copy is
+                # authoritative for it. Merging it back in meant a favourite
+                # you had just un-starred returned through the team list and
+                # could never be removed from the Favourites view.
+                if os.path.basename(name) == own_name:
+                    continue
                 remote = self.sp_client.download_json_file(root_id, name)
                 for key, entry in ((remote or {}).get("items") or {}).items():
                     if isinstance(entry, dict):
@@ -1894,7 +2174,7 @@ class ImageSearchApp:
             try:
                 if self.sp_client is None:
                     # Instant startup means a result can be opened before
-                    # "Search Marketing Photos" has ever run this session,
+                    # "Check for new photos" has ever run this session,
                     # so the SharePoint connection may not exist yet.
                     self.event_queue.put(("status", "Signing in to Microsoft..."))
                     self.sp_client = SharePointClient()
@@ -1933,7 +2213,43 @@ class ImageSearchApp:
                     self.progress.set(0)
                     self._set_busy(False)
                     self._render_results(event[1])
-                    self.status_var.set(f"Found {len(event[1])} results.")
+                    mode = getattr(self, "_last_search_mode", "")
+                    note = ""
+                    if mode == "objects":
+                        note = "  \u00b7  Close-ups first, people shots below."
+                    elif mode == "image":
+                        note = "  \u00b7  Most visually similar first."
+                    self.status_var.set(f"Found {len(event[1])} results.{note}")
+                elif kind == "clipboard_status":
+                    message, target = event[2], event[1]
+                    preview = self._preview
+                    shown = False
+                    if target is not None and preview is not None and preview["token"] is target:
+                        try:
+                            preview["caption"].configure(text=message)
+                            shown = True
+                        except Exception:
+                            shown = False
+                    if not shown:
+                        self.status_var.set(message)
+                elif kind == "preview_ready":
+                    preview = self._preview
+                    if preview is not None and preview["token"] is event[1]:
+                        try:
+                            img = self._fit(
+                                Image.open(event[2]).convert("RGB"), PREVIEW_MAX
+                            )
+                            photo = ctk.CTkImage(
+                                light_image=img, dark_image=img, size=img.size
+                            )
+                            preview["label"].configure(image=photo)
+                            preview["label"]._preview_ref = photo
+                            text = preview["caption"].cget("text")
+                            preview["caption"].configure(
+                                text=text.replace("   (sharpening...)", "")
+                            )
+                        except Exception:
+                            pass
                 elif kind == "sp_signed_in":
                     self._set_busy(False)
                     self._index_sharepoint_tree()
@@ -1976,10 +2292,12 @@ class ImageSearchApp:
                     self._sp_mode_active = True
                     self.folder_var.set("SharePoint: Fotos & Videos (all subfolders)")
                     self._set_busy(False)
-                    self.status_var.set(
-                        f"{event[1]} photos ready to search. "
-                        "Click 'Search Marketing Photos' to check for new ones."
-                    )
+                    # Fills the opening grid now the cached index is loaded,
+                    # instead of leaving an empty window until the first search.
+                    self._show_all_photos()
+                    # Past searches are on disk, so the shortcut chips can be
+                    # there from the start rather than only after a search.
+                    self._refresh_suggestions()
                     self._refresh_collections(from_cache=True)
                 elif kind == "collections_ready":
                     self._collections = event[1]
@@ -2033,22 +2351,457 @@ class ImageSearchApp:
             if self._last_results:
                 self._render_results(self._last_results)
 
+    def _thumb_for(self, path):
+        """Returns a ready CTkImage for `path`, decoding it only once.
+
+        Changing the window width re-lays out the whole grid, and re-reading
+        150 JPEGs off disk each time is a visible stall - so each decoded
+        thumbnail is kept and handed back on later renders.
+        """
+        cached = self._thumb_cache.get(path)
+        if cached is not None:
+            return cached
+        img = Image.open(path)
+        img.thumbnail(THUMB_SIZE)
+        photo = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+        # Bounded so a long session over a 31k-image library cannot grow
+        # without limit; dropping the whole cache is fine, it just refills.
+        if len(self._thumb_cache) >= THUMB_CACHE_MAX:
+            self._thumb_cache.clear()
+        self._thumb_cache[path] = photo
+        return photo
+
+    # ---------- preview, clipboard ----------
+
+    def _preview_dir(self):
+        local_folder, _t, _f, _i = self._sp_cache_dirs()
+        return os.path.join(local_folder, "preview")
+
+    def _best_local_copy(self, path, meta):
+        """The sharpest version of a photo already on this machine.
+
+        Prefers a downloaded original, then the 800px preview, then the
+        thumbnail the grid is drawn from - so copying or previewing never
+        waits on the network when it does not have to.
+        """
+        item_id = (meta or {}).get("item_id")
+        name = (meta or {}).get("name") or ""
+        if item_id:
+            _lf, _t, full_dir, _i = self._sp_cache_dirs()
+            full = os.path.join(full_dir, f"{item_id}_{name}")
+            if os.path.exists(full):
+                return full
+            large = os.path.join(self._preview_dir(), f"{item_id}.jpg")
+            if os.path.exists(large):
+                return large
+        return path
+
+    def _fit(self, img, box):
+        """Scales an image to fill `box` as closely as its shape allows.
+
+        PIL's thumbnail() only ever shrinks, so a 176px cached thumbnail
+        stayed 176px inside a 1120px preview window - the reason the first
+        version of this opened postage-stamp sized.
+        """
+        scale = min(box[0] / img.width, box[1] / img.height)
+        size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+        return img.resize(size, Image.LANCZOS)
+
+    def _show_preview(self, path, meta):
+        """A large view inside the app.
+
+        Opens immediately from whatever is already on disk, then replaces
+        the image with an 800px copy fetched in the background. Waiting on
+        the full original (often 8MB) before showing anything made looking
+        at a photo feel like a download rather than a glance.
+        """
+        name = (meta or {}).get("name") or os.path.basename(path)
+        win = ctk.CTkToplevel(self.root)
+        win.title(name)
+        win.configure(fg_color=BG_COLOR)
+        win.geometry("1180x840")
+        try:
+            win.after(200, lambda: win.iconbitmap(_resource_path("assets", "app_icon.ico")))
+        except Exception:
+            pass
+
+        token = object()
+        holder = ctk.CTkFrame(win, fg_color=BG_COLOR)
+        holder.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 0))
+        image_label = ctk.CTkLabel(holder, text="", fg_color=BG_COLOR)
+        image_label.pack(fill=tk.BOTH, expand=True)
+
+        bar = ctk.CTkFrame(win, fg_color="transparent")
+        bar.pack(fill=tk.X, padx=12, pady=12)
+        caption = ctk.CTkLabel(
+            bar, text=(meta or {}).get("folder") or name,
+            text_color=MUTED_TEXT_COLOR, anchor="w",
+        )
+        caption.pack(side=tk.LEFT)
+        _make_button(bar, "Close", win.destroy, width=90).pack(side=tk.RIGHT, padx=(8, 0))
+        if meta and meta.get("item_id"):
+            _make_button(
+                bar, "Open full size",
+                lambda: self._open_sp_result(meta["item_id"], meta["name"]), width=140,
+            ).pack(side=tk.RIGHT, padx=(8, 0))
+        _make_button(
+            bar, "Copy", lambda: self._copy_to_clipboard(path, meta, token=token), width=90,
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+
+        self._preview = {"token": token, "label": image_label, "win": win, "caption": caption}
+
+        def draw(source_path):
+            try:
+                img = self._fit(Image.open(source_path).convert("RGB"), PREVIEW_MAX)
+            except Exception:
+                return
+            photo = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+            image_label.configure(image=photo)
+            image_label._preview_ref = photo  # keep it alive with the widget
+
+        draw(self._best_local_copy(path, meta))
+
+        item_id = (meta or {}).get("item_id")
+        if item_id:
+            if not os.path.exists(os.path.join(self._preview_dir(), f"{item_id}.jpg")):
+                caption.configure(text=f"{caption.cget('text')}   (sharpening...)")
+                self._fetch_preview(item_id, token)
+            # Opening a preview is a deliberate act, so it is a good moment
+            # to pull the original in the background - Copy and Open full
+            # size are then instant instead of starting a download.
+            self._prefetch_full(item_id, (meta or {}).get("name") or name)
+
+    def _prefetch_full(self, item_id, name):
+        def work():
+            try:
+                self._ensure_full_image(item_id, name)
+            except Exception as exc:
+                _log_reuse(f"FULL PREFETCH FAILED: {exc!r}")
+
+        self._run_in_background(work)
+
+    def _fetch_preview(self, item_id, token):
+        """Pulls the 800px version of one photo in the background."""
+        def work():
+            try:
+                if self.sp_client is None:
+                    self.sp_client = SharePointClient()
+                    self.sp_client.sign_in()
+                dest = os.path.join(self._preview_dir(), f"{item_id}.jpg")
+                ok = self.sp_client.download_thumbnail({"id": item_id}, dest, size="large")
+                if ok:
+                    self.event_queue.put(("preview_ready", token, dest))
+            except Exception as exc:
+                _log_reuse(f"PREVIEW FETCH FAILED: {exc!r}")
+
+        self._run_in_background(work)
+
+    def _ensure_full_image(self, item_id, name):
+        """Local path to the original photo, downloading it if needed.
+
+        Called from a worker thread - it can block on an 8MB download.
+        """
+        _lf, _t, full_dir, _i = self._sp_cache_dirs()
+        dest = os.path.join(full_dir, f"{item_id}_{name}")
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            return dest
+        if self.sp_client is None:
+            self.sp_client = SharePointClient()
+            self.sp_client.sign_in()
+        self.sp_client.download_file({"id": item_id}, dest)
+        return dest
+
+    def _put_image_on_clipboard(self, source):
+        """Writes one image to the Windows clipboard as a device independent
+        bitmap - the format Office pastes as a picture rather than as a
+        file reference. Returns its pixel size."""
+        import ctypes
+        from io import BytesIO
+
+        img = Image.open(source).convert("RGB")
+        buf = BytesIO()
+        img.save(buf, "BMP")
+        data = buf.getvalue()[14:]  # a DIB is a BMP minus its file header
+        buf.close()
+
+        kernel32, user32 = ctypes.windll.kernel32, ctypes.windll.user32
+        # Handles are pointer-sized; without these the values are truncated
+        # on 64-bit Python and the clipboard write corrupts.
+        kernel32.GlobalAlloc.restype = ctypes.c_void_p
+        kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        user32.SetClipboardData.restype = ctypes.c_void_p
+        user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+
+        handle = kernel32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
+        pointer = kernel32.GlobalLock(handle)
+        ctypes.memmove(pointer, data, len(data))
+        kernel32.GlobalUnlock(handle)
+        if not user32.OpenClipboard(0):
+            raise OSError("clipboard busy")
+        try:
+            user32.EmptyClipboard()
+            user32.SetClipboardData(8, handle)  # CF_DIB
+        finally:
+            user32.CloseClipboard()
+        return img.width, img.height
+
+    def _copy_to_clipboard(self, path, meta, token=None):
+        """Copies the photo at full resolution.
+
+        Always the original, never the thumbnail the grid is drawn from -
+        a 176px copy pasted into a deck is useless. If the original is not
+        on this machine yet it is fetched first, so this can take a moment
+        the first time and is instant afterwards.
+        """
+        item_id = (meta or {}).get("item_id")
+        name = (meta or {}).get("name") or os.path.basename(path)
+
+        def report(msg):
+            self.event_queue.put(("clipboard_status", token, msg))
+
+        def work():
+            try:
+                source = path
+                if item_id:
+                    cached = os.path.join(self._sp_cache_dirs()[2], f"{item_id}_{name}")
+                    if not os.path.exists(cached):
+                        report("Fetching the full-resolution photo...")
+                    source = self._ensure_full_image(item_id, name)
+                width, height = self._put_image_on_clipboard(source)
+                report(f"Copied at full resolution - {width} x {height}.")
+            except Exception as exc:
+                _log_reuse(f"CLIPBOARD COPY FAILED: {exc!r}")
+                report("Could not copy this photo to the clipboard.")
+
+        self._run_in_background(work)
+
+    # ---------- manual collections ----------
+
+    def _collection_ids(self):
+        """{name: [item_id, ...]} exactly as stored on disk.
+
+        Item ids rather than positions, so a collection survives the index
+        being rebuilt in a different order after a sync.
+        """
+        data = self._read_json(self._collections_cache_path()) or {}
+        out = {name: [] for name in MANUAL_COLLECTIONS}
+        for name, ids in data.items():
+            if isinstance(ids, list):
+                out[name] = [i for i in ids if i]
+        return out
+
+    def _write_collection_ids(self, by_id):
+        try:
+            os.makedirs(os.path.dirname(self._collections_cache_path()), exist_ok=True)
+            with open(self._collections_cache_path(), "w", encoding="utf-8") as f:
+                json.dump(by_id, f, ensure_ascii=False)
+            return True
+        except OSError as exc:
+            _log_reuse(f"COLLECTIONS SAVE FAILED: {exc!r}")
+            self.status_var.set("Could not save that collection - see crash.log.")
+            return False
+
+    def _collection_names(self):
+        return list((self._collections or {}).keys()) or list(MANUAL_COLLECTIONS)
+
+    def _add_to_collection(self, name, path, meta):
+        item_id = (meta or {}).get("item_id")
+        if not item_id:
+            self.status_var.set("Only photos from the shared drive can be collected.")
+            return
+        by_id = self._collection_ids()
+        ids = by_id.setdefault(name, [])
+        if item_id in ids:
+            self.status_var.set(f"Already in {name}.")
+            return
+        ids.append(item_id)
+        if not self._write_collection_ids(by_id):
+            return
+        self._collections = self._load_collections()
+        self._rebuild_collection_cards()
+        self.status_var.set(f"Added to {name} - {len(ids)} photo(s).")
+        if self._view == name:
+            self._show_collection(name)
+
+    def _remove_from_collection(self, name, meta):
+        item_id = (meta or {}).get("item_id")
+        by_id = self._collection_ids()
+        ids = by_id.get(name) or []
+        if not item_id or item_id not in ids:
+            return
+        ids.remove(item_id)
+        if not self._write_collection_ids(by_id):
+            return
+        self._collections = self._load_collections()
+        self._rebuild_collection_cards()
+        self.status_var.set(f"Removed from {name} - {len(ids)} photo(s) left.")
+        if self._view == name:
+            self._show_collection(name)
+
+    def _show_result_menu(self, event, path, meta):
+        """Right-click menu on a result: the keyboard-and-mouse route into a
+        collection, for anyone who would rather not drag."""
+        menu = tk.Menu(self.root, tearoff=0)
+        for name in self._collection_names():
+            menu.add_command(
+                label=f"Add to {name}",
+                command=lambda n=name: self._add_to_collection(n, path, meta),
+            )
+        if self._view in self._collection_names():
+            menu.add_separator()
+            menu.add_command(
+                label=f"Remove from {self._view}",
+                command=lambda: self._remove_from_collection(self._view, meta),
+            )
+        menu.add_separator()
+        menu.add_command(label="Preview", command=lambda: self._show_preview(path, meta))
+        menu.add_command(label="Copy image", command=lambda: self._copy_to_clipboard(path, meta))
+        if meta and meta.get("item_id"):
+            menu.add_command(
+                label="Open full size",
+                command=lambda: self._open_sp_result(meta["item_id"], meta["name"]),
+            )
+        else:
+            menu.add_command(label="Open full size", command=lambda: open_in_system_viewer(path))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    # ---------- drag a photo onto a collection ----------
+
+    def _drag_start(self, event, path, meta):
+        # Only records where the press happened. The drag does not begin
+        # until the pointer actually moves, so a double-click still opens
+        # the photo instead of being swallowed here.
+        self._drag = {
+            "path": path, "meta": meta,
+            "x": event.x_root, "y": event.y_root,
+            "active": False, "win": None, "hover": None,
+        }
+
+    def _card_under_pointer(self, x_root, y_root):
+        for name, card in (self.collection_cards or {}).items():
+            try:
+                cx, cy = card.winfo_rootx(), card.winfo_rooty()
+                if (cx <= x_root <= cx + card.winfo_width()
+                        and cy <= y_root <= cy + card.winfo_height()):
+                    return name
+            except Exception:
+                continue
+        return None
+
+    def _set_drag_hover(self, name):
+        drag = self._drag
+        if drag is None or drag.get("hover") == name:
+            return
+        previous = drag.get("hover")
+        if previous and previous in (self.collection_cards or {}):
+            self.collection_cards[previous].configure(
+                fg_color=ACCENT_COLOR if self._view == previous else CARD_COLOR
+            )
+        if name and name in (self.collection_cards or {}):
+            self.collection_cards[name].configure(fg_color=ACCENT_ACTIVE)
+        drag["hover"] = name
+
+    def _drag_motion(self, event):
+        drag = self._drag
+        if drag is None:
+            return
+        if not drag["active"]:
+            moved = abs(event.x_root - drag["x"]) + abs(event.y_root - drag["y"])
+            if moved < DRAG_THRESHOLD_PX:
+                return
+            drag["active"] = True
+            drag["win"] = self._make_drag_preview(drag["path"])
+        win = drag.get("win")
+        if win is not None:
+            try:
+                win.geometry(f"+{event.x_root + 12}+{event.y_root + 12}")
+            except Exception:
+                pass
+        self._set_drag_hover(self._card_under_pointer(event.x_root, event.y_root))
+
+    def _make_drag_preview(self, path):
+        """A small translucent window that follows the pointer, so it is
+        obvious something is being carried."""
+        try:
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            try:
+                win.attributes("-alpha", 0.85)
+                win.attributes("-topmost", True)
+            except Exception:
+                pass
+            try:
+                ctk.CTkLabel(win, image=self._thumb_for(path), text="").pack()
+            except Exception:
+                tk.Label(win, text="Moving photo...", padx=10, pady=6).pack()
+            return win
+        except Exception:
+            return None
+
+    def _drag_release(self, event):
+        drag = self._drag
+        self._drag = None
+        if drag is None:
+            return
+        win = drag.get("win")
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        hover = drag.get("hover")
+        if hover and hover in (self.collection_cards or {}):
+            self.collection_cards[hover].configure(
+                fg_color=ACCENT_COLOR if self._view == hover else CARD_COLOR
+            )
+        if not drag["active"]:
+            return  # a plain click, not a drag
+        target = self._card_under_pointer(event.x_root, event.y_root)
+        if target:
+            self._add_to_collection(target, drag["path"], drag["meta"])
+
     def _render_results(self, results):
         self._last_results = results
-        columns = max(1, self._current_columns)
+        # A fill from the previous render may still be in flight.
+        if self._render_after_id is not None:
+            try:
+                self.root.after_cancel(self._render_after_id)
+            except Exception:
+                pass
+            self._render_after_id = None
         for child in self.results_frame.winfo_children():
             child.destroy()
         self.thumbnail_refs.clear()
+        self._render_chunk(results, 0, max(1, self._current_columns))
 
-        for idx, (path, score, meta) in enumerate(results):
+    def _render_chunk(self, results, start, columns):
+        """Builds one screenful of results, then yields to the event loop
+        before the next.
+
+        A full grid is 150 cells, each of which is several Tk widgets plus a
+        JPEG decode - building them in a single pass froze the window for
+        seconds after every search, with nothing on screen until the last
+        one was done. Rendering in chunks puts the top of the grid up
+        immediately and fills the rest in behind it, so a search feels
+        instant even though the same total work still happens.
+        """
+        self._render_after_id = None
+        end = min(start + RENDER_CHUNK, len(results))
+
+        for idx in range(start, end):
+            path, _score, meta = results[idx]
             row, col = divmod(idx, columns)
             cell = ctk.CTkFrame(self.results_frame, fg_color="transparent")
             cell.grid(row=row, column=col, sticky="n", padx=4, pady=4)
 
             try:
-                img = Image.open(path)
-                img.thumbnail(THUMB_SIZE)
-                photo = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+                photo = self._thumb_for(path)
             except Exception:
                 continue
             self.thumbnail_refs.append(photo)
@@ -2057,18 +2810,22 @@ class ImageSearchApp:
             holder.pack()
             label = ctk.CTkLabel(holder, image=photo, text="", cursor="hand2")
             label.pack()
-            if meta is None or not meta.get("item_id"):
-                label.bind("<Double-Button-1>", lambda _e, p=path: open_in_system_viewer(p))
-            else:
-                label.bind(
-                    "<Double-Button-1>",
-                    lambda _e, m=meta: self._open_sp_result(m["item_id"], m["name"]),
-                )
+            # Double-click previews in-app. Opening the original meant an
+            # 8MB download before anything appeared; the full file is still
+            # one click away from inside the preview.
+            label.bind(
+                "<Double-Button-1>",
+                lambda _e, p=path, m=meta: self._show_preview(p, m),
+            )
+            label.bind("<Button-3>", lambda e, p=path, m=meta: self._show_result_menu(e, p, m))
+            label.bind("<ButtonPress-1>", lambda e, p=path, m=meta: self._drag_start(e, p, m))
+            label.bind("<B1-Motion>", self._drag_motion)
+            label.bind("<ButtonRelease-1>", self._drag_release)
 
             key = self._fav_key(path, meta)
             star = ctk.CTkLabel(
                 holder,
-                text="★" if self._is_favourite(key) else "☆",
+                text="\u2605" if self._is_favourite(key) else "\u2606",
                 text_color="#ffd54a" if self._is_favourite(key) else "#ffffff",
                 font=ctk.CTkFont(size=20),
                 fg_color=CARD_COLOR,
@@ -2090,8 +2847,13 @@ class ImageSearchApp:
             caption = folder if folder else os.path.basename(path)
             ctk.CTkLabel(
                 cell, text=caption, justify=tk.CENTER, wraplength=THUMB_SIZE[0],
-                text_color=MUTED_TEXT_COLOR, font=ctk.CTkFont(size=11),
+                text_color=MUTED_TEXT_COLOR, font=ctk.CTkFont(size=12),
             ).pack()
+
+        if end < len(results):
+            self._render_after_id = self.root.after(
+                1, lambda: self._render_chunk(results, end, columns)
+            )
 
     def _on_star_clicked(self, key, path, meta, widget):
         added = self._toggle_favourite(key, path, meta)
@@ -2110,16 +2872,39 @@ def _thread_excepthook(args):
 
 def main():
     threading.excepthook = _thread_excepthook
+    # Windows groups a window under the executable that started it, so a
+    # script run through pythonw shows the Python icon in the taskbar and in
+    # Alt-Tab. Claiming an explicit identity makes it use this app's own icon.
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Greenreb.ImageSearch"
+        )
+    except Exception:
+        pass
     ctk.set_appearance_mode("dark")
+    # CustomTkinter re-scales every widget when the window moves to a monitor
+    # with a different display scaling, which on a multi-monitor desk means
+    # the whole grid is rebuilt mid-drag and the window judders. The app is
+    # laid out in plain pixels and does not need that, so it is turned off.
+    try:
+        ctk.deactivate_automatic_dpi_awareness()
+    except Exception:
+        pass
     root = ctk.CTk()
     try:
         root.configure(fg_color=BG_COLOR)
     except Exception:
         pass
     try:
-        root.iconbitmap(_resource_path("assets", "app_icon.ico"))
+        # default=... applies the icon to every window the app opens (the
+        # preview and settings windows too), not just the main one.
+        root.iconbitmap(default=_resource_path("assets", "app_icon.ico"))
     except Exception:
-        pass
+        try:
+            root.iconbitmap(_resource_path("assets", "app_icon.ico"))
+        except Exception:
+            pass
     ImageSearchApp(root)
     try:
         root.mainloop()

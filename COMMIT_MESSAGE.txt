@@ -1,0 +1,45 @@
+Improve search ranking, add curated collections and in-app preview
+
+Search
+- Keep the top 24 results in the engine's own relevance order, and apply
+  the folder interleave and orientation/people grouping only below them.
+  Both were reordering the whole list, so a qualifier like "nighttime"
+  survived in only the first few results before daytime shots took over.
+- Choose the ordering from the query: one asking for a thing ("burger")
+  leads with close-ups, one asking for a scene ("birthday party") leads
+  with guests. Decided by comparing the query against two concept
+  directions rather than a word list, which would not survive a menu in
+  two languages.
+- Add reference-image search: the query is embedded from a picture
+  instead of words and ranked identically.
+
+Collections
+- Collections are curated by hand rather than classified automatically:
+  drag a photo onto one, or right-click it. Empty collections stay in the
+  sidebar because they are the drop targets.
+
+Favourites
+- Stop the sync merging this machine's own shared file back in. An
+  un-starred favourite returned through the team list and could never be
+  removed.
+
+Interface
+- Open on a cross-section of the library instead of an empty grid.
+- Render results in chunks, so a search paints immediately instead of
+  freezing while several hundred widgets are built.
+- Reuse decoded thumbnails across re-layouts, and draw them at 176px to
+  match the resolution actually cached.
+- Preview in-app on double-click, sharpening to an 800px copy as it
+  arrives; Copy puts the full-resolution original on the clipboard.
+- Rename "Search Marketing Photos" to "Check for new photos": it started
+  a sync that disabled searching, which is the opposite of what it said.
+- Make the Enter key honour the busy state it was bypassing.
+- Stop CustomTkinter rescaling every widget when the window moves to a
+  monitor with different display scaling.
+- Claim an explicit AppUserModelID so the taskbar shows the app's own
+  icon, and crop the logo to its artwork instead of its padded canvas.
+- Show the build date in the header, so it is clear whether a run came
+  from source or from a built exe.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01EQRRGmFMLud8MiUGanT7Cf

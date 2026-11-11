@@ -369,6 +369,19 @@ class ImageSearchEngine:
             return np.zeros(0, dtype=np.float32)
         return self.embeddings @ concept_vec
 
+    def search_image(self, path, top_k=24, status_callback=None, subset=None):
+        """Ranks the library by how much each photo looks like the one at
+        `path`.
+
+        CLIP puts images and text in the same space, so this is the same
+        ranking as a text search with the query coming from a picture
+        instead of words - useful when the thing you want is easier to show
+        than to describe ("more like this shot from last year's campaign").
+        """
+        self.load_model(status_callback)
+        query_emb = self.embed_image_file(path)
+        return self._rank(query_emb, top_k, subset=subset)
+
     def search_text(self, text, top_k=24, status_callback=None, bonus=None, subset=None):
         self.load_model(status_callback)
         query_emb, exclude_emb = self.embed_query(text)
