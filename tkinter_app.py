@@ -1185,6 +1185,16 @@ class ImageSearchApp:
             self.status_var.set("No searches yet - your search history will appear here.")
             return
         self.status_var.set(f"{len(history)} previous search(es). Click one to run it again.")
+        top = ctk.CTkFrame(self.results_frame, fg_color="transparent")
+        top.pack(fill=tk.X, padx=4, pady=(2, 8))
+        ctk.CTkButton(
+            top, text="Clear search history", width=170, height=30, corner_radius=8,
+            # A muted red on hover: the one destructive action on this screen
+            # should look different from the searches beside it.
+            fg_color=CARD_COLOR, hover_color="#7a2330", text_color=TEXT_COLOR,
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            command=self._clear_history,
+        ).pack(side=tk.RIGHT)
         for entry in history:
             term = entry.get("term", "")
             when = (entry.get("at") or "").replace("T", " ")
@@ -1199,6 +1209,36 @@ class ImageSearchApp:
             ctk.CTkLabel(
                 row, text=when, text_color=MUTED_TEXT_COLOR, font=ctk.CTkFont(size=11),
             ).pack(side=tk.RIGHT, padx=12)
+
+    def _clear_history(self):
+        """Empties this machine's search history, after asking.
+
+        Only the list of past searches goes. The click feedback that helps
+        rank results for everyone is a separate file and is left alone.
+        """
+        count = len(self._load_history())
+        if not count:
+            return
+        if not messagebox.askyesno(
+            "Clear search history",
+            f"Clear all {count} searches from your history?\n\n"
+            "This also clears the Recent shortcuts under the search box. "
+            "It can't be undone.",
+            icon="warning",
+        ):
+            return
+        try:
+            with open(self._history_path(), "w", encoding="utf-8") as f:
+                json.dump({"searches": []}, f)
+        except OSError as exc:
+            _log_reuse(f"HISTORY CLEAR FAILED: {exc!r}")
+            self.status_var.set("Could not clear the search history.")
+            return
+        self._history = []
+        self._refresh_suggestions()
+        self._update_history_button()
+        self._show_history()
+        self.status_var.set("Search history cleared.")
 
     # ---------- fast local index ----------
 
