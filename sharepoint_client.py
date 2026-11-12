@@ -3,6 +3,7 @@ document library, using interactive user sign-in (no client secret)."""
 
 import json
 import os
+import sys
 import threading
 import urllib.parse
 
@@ -30,7 +31,10 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024
 UPLOAD_CHUNK_SIZE = 16 * 320 * 1024  # 5 MiB
 TOKEN_CACHE_PATH = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "msal_cache.bin"
+    (os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Topshot")
+     if sys.platform == "darwin"
+     else os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch")),
+    "msal_cache.bin"
 )
 
 

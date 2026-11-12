@@ -25,7 +25,10 @@ if not getattr(sys, "frozen", False) and "HF_HOME" not in os.environ:
 import app_version as _bundled  # noqa: E402  the version inside the .exe
 
 UPDATES_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "app"
+    (os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Topshot")
+     if sys.platform == "darwin"
+     else os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch")),
+    "app"
 )
 STATE_FILE = os.path.join(UPDATES_DIR, "current.json")
 

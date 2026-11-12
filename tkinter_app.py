@@ -80,14 +80,27 @@ def _sharepoint():
         _SHAREPOINT = sharepoint_client
     return _SHAREPOINT
 
+IS_MAC = sys.platform == "darwin"
+
+
+def _data_dir():
+    """Settings, caches, logs and downloaded updates: %LOCALAPPDATA%\\ImageSearch
+    on Windows, ~/Library/Application Support/Topshot on a Mac."""
+    if IS_MAC:
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Topshot")
+    return os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch")
+
+
+DATA_DIR = _data_dir()
+
 CRASH_LOG_PATH = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "crash.log"
+    DATA_DIR, "crash.log"
 )
 BOOT_LOG_PATH = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "startup.log"
+    DATA_DIR, "startup.log"
 )
 REUSE_LOG_PATH = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "reuse_debug.log"
+    DATA_DIR, "reuse_debug.log"
 )
 
 
@@ -306,12 +319,16 @@ CARD_RADIUS = 14
 UI_FONT = "Segoe UI"
 UI_FONT_MEDIUM = "Segoe UI Semibold"
 UI_FONT_SEMIBOLD = "Segoe UI Semibold"
+if sys.platform == "darwin":
+    UI_FONT = UI_FONT_MEDIUM = UI_FONT_SEMIBOLD = "Helvetica Neue"
 _INTER_FILES = ("Inter-Regular.ttf", "Inter-Medium.ttf", "Inter-SemiBold.ttf", "Inter-Bold.ttf")
 
 
 def _register_bundled_fonts():
     """Makes the bundled Inter files usable by this process (FR_PRIVATE):
     nothing is installed, and they vanish when the app closes."""
+    if IS_MAC:
+        return _register_fonts_mac()
     try:
         import ctypes
 
@@ -326,6 +343,41 @@ def _register_bundled_fonts():
                 added += add(path, 0x10, 0)
             except Exception:
                 pass
+    return added
+
+
+def _register_fonts_mac():
+    """The Mac version of the above: Core Text, for this process only."""
+    try:
+        import ctypes
+
+        cf = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        ct = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreText.framework/CoreText")
+        cf.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+        cf.CFURLCreateFromFileSystemRepresentation.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        ct.CTFontManagerRegisterFontsForURL.restype = ctypes.c_bool
+        ct.CTFontManagerRegisterFontsForURL.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+    except Exception:
+        return 0
+    added = 0
+    for name in _INTER_FILES:
+        path = _resource_path("assets", "fonts", name)
+        if not os.path.exists(path):
+            continue
+        raw = os.fsencode(path)
+        url = cf.CFURLCreateFromFileSystemRepresentation(None, raw, len(raw), False)
+        if not url:
+            continue
+        try:
+            added += bool(ct.CTFontManagerRegisterFontsForURL(url, 1, None))  # process scope
+        except Exception:
+            pass
+        finally:
+            cf.CFRelease(url)
     return added
 
 
@@ -602,6 +654,41 @@ def open_in_system_viewer(path):
         subprocess.Popen(["open", path])
     else:
         subprocess.Popen(["xdg-open", path])
+
+
+def _open_external(target):
+    """Opens a link, a mailto: or a file with whatever the system uses for it.
+    Raises if nothing could be opened, so callers can offer another way."""
+    if sys.platform.startswith("win"):
+        os.startfile(target)  # noqa: S606
+    elif sys.platform == "darwin":
+        subprocess.run(["open", target], check=True, timeout=20)
+    else:
+        subprocess.run(["xdg-open", target], check=True, timeout=20)
+
+
+def _apply_icon(win):
+    """The app icon on a window. A Mac shows the app bundle's icon instead."""
+    if sys.platform == "darwin":
+        return
+    try:
+        win.iconbitmap(_resource_path("assets", "app_icon.ico"))
+    except Exception:
+        pass
+
+
+def _bind_context_menu(widget, handler):
+    """Right-click. On a Mac a two-finger click or the right button arrives as
+    Button-2 under Tk 8.6 (Button-3 from Tk 8.7 on), so both are bound."""
+    widget.bind("<Button-3>", handler)
+    if sys.platform == "darwin":
+        widget.bind("<Button-2>", handler)
+
+
+def _system_description():
+    if sys.platform == "darwin":
+        return f"macOS {platform.mac_ver()[0]} ({platform.machine()})"
+    return f"Windows {platform.release()} ({platform.version()})"
 
 
 def _make_ghost_button(parent, text, command, width=0, icon=None):
@@ -1145,7 +1232,7 @@ class ImageSearchApp:
                 self.sidebar, f"  {shown} ({len(idxs)})", lambda n=name: self._set_view(n),
                 icon="shared" if name in shared_names else "folder",
             )
-            card.bind("<Button-3>", lambda e, n=name: self._show_collection_menu(e, n))
+            _bind_context_menu(card, lambda e, n=name: self._show_collection_menu(e, n))
             card.configure(
                 fg_color=self._card_rest_colour(name),
                 text_color=TEXT_COLOR if self._view == name else TEXT_SOFT,
@@ -2302,8 +2389,7 @@ class ImageSearchApp:
 
     def _sp_cache_dirs(self):
         local_folder = os.path.join(
-            os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-            "ImageSearch",
+            DATA_DIR,
             "sharepoint_cache",
             "FotosVideos",
         )
@@ -3213,7 +3299,7 @@ class ImageSearchApp:
         y = max(0, (win.winfo_screenheight() - height) // 2 - 20)
         win.geometry(f"{width}x{height}+{x}+{y}")
         try:
-            win.after(200, lambda: win.iconbitmap(_resource_path("assets", "app_icon.ico")))
+            win.after(200, lambda: _apply_icon(win))
         except Exception:
             pass
 
@@ -3374,6 +3460,8 @@ class ImageSearchApp:
         from io import BytesIO
 
         img = self._open_upright(source).convert("RGB")
+        if IS_MAC:
+            return self._put_image_on_mac_clipboard(img)
         buf = BytesIO()
         img.save(buf, "BMP")
         data = buf.getvalue()[14:]  # a DIB is a BMP minus its file header
@@ -3401,6 +3489,18 @@ class ImageSearchApp:
             user32.SetClipboardData(8, handle)  # CF_DIB
         finally:
             user32.CloseClipboard()
+        return img.width, img.height
+
+    def _put_image_on_mac_clipboard(self, img):
+        """The Mac clipboard takes the picture itself, so Keynote, PowerPoint
+        and Mail paste it as an image."""
+        import tempfile
+
+        tmp = os.path.join(tempfile.gettempdir(), "topshot-clipboard.jpg")
+        img.save(tmp, "JPEG", quality=95)
+        script = f'set the clipboard to (read (POSIX file "{tmp}") as JPEG picture)'
+        subprocess.run(["osascript", "-e", script], check=True, timeout=30,
+                       capture_output=True)
         return img.width, img.height
 
     def _copy_to_clipboard(self, path, meta, token=None):
@@ -3515,7 +3615,7 @@ class ImageSearchApp:
         after saying why when it is the latter."""
         dialog = ctk.CTkInputDialog(title=title, text=prompt)
         # CustomTkinter puts its own icon on new windows after ~200ms.
-        dialog.after(250, lambda: dialog.iconbitmap(_resource_path("assets", "app_icon.ico")))
+        dialog.after(250, lambda: _apply_icon(dialog))
         raw = dialog.get_input()
         if raw is None:
             return None
@@ -3958,7 +4058,7 @@ class ImageSearchApp:
         win.configure(fg_color=BG_COLOR)
         win.resizable(False, False)
         win.transient(self.root)
-        win.after(250, lambda: win.iconbitmap(_resource_path("assets", "app_icon.ico")))
+        win.after(250, lambda: _apply_icon(win))
         result = {}
 
         body = ctk.CTkFrame(win, fg_color="transparent")
@@ -4086,7 +4186,7 @@ class ImageSearchApp:
         if not messagebox.askyesno(
             "Invite people",
             f"Write an invitation email to {who} about “{name}”?\n\n"
-            "It opens in Outlook so you can read it and send it yourself.",
+            "It opens in your email app so you can read it and send it yourself.",
         ):
             return
         import config
@@ -4108,7 +4208,7 @@ class ImageSearchApp:
             {"subject": subject, "body": body}, quote_via=urllib.parse.quote
         )
         try:
-            os.startfile(url)
+            _open_external(url)
         except Exception as exc:
             _log_reuse(f"INVITE EMAIL FAILED: {exc!r}")
             messagebox.showinfo(APP_NAME, "Couldn't open your email app - please send the invitation yourself.")
@@ -4177,7 +4277,7 @@ class ImageSearchApp:
         lines = [
             f"{APP_NAME} {APP_VERSION} (runtime {RUNTIME_VERSION}, "
             f"{'installed app' if getattr(sys, 'frozen', False) else 'from source'})",
-            f"Windows {platform.release()} ({platform.version()})",
+            _system_description(),
             f"Signed in as: {self._shared_state().get('me') or 'unknown'}",
             f"Photos in library: {len(getattr(self.engine, 'paths', []) or []):,}",
         ]
@@ -4201,7 +4301,7 @@ class ImageSearchApp:
         win.configure(fg_color=BG_COLOR)
         win.resizable(False, False)
         win.transient(self.root)
-        win.after(250, lambda: win.iconbitmap(_resource_path("assets", "app_icon.ico")))
+        win.after(250, lambda: _apply_icon(win))
         body = ctk.CTkFrame(win, fg_color="transparent")
         body.pack(fill=tk.BOTH, expand=True, padx=24, pady=(20, 18))
         ctk.CTkLabel(body, text="How can we help?", font=_font(17, "semibold"),
@@ -4227,7 +4327,7 @@ class ImageSearchApp:
         message.pack(fill=tk.X, pady=(4, 8))
         details = tk.BooleanVar(value=True)
         ctk.CTkCheckBox(
-            body, text="Include app details (version, Windows, recent error log)",
+            body, text="Include app details (version, system, recent error log)",
             variable=details, font=_font(12), text_color=TEXT_SOFT, fg_color=PRIMARY,
             hover_color=PRIMARY_HOVER, checkmark_color="#ffffff", border_color="#3f4a44",
             checkbox_width=18, checkbox_height=18,
@@ -4283,7 +4383,7 @@ class ImageSearchApp:
             {"subject": subject, "body": content[:1500]}, quote_via=urllib.parse.quote
         )
         try:
-            os.startfile(url)
+            _open_external(url)
         except Exception:
             messagebox.showinfo("Support", f"Please email {to} - your message couldn't be sent.")
 
@@ -4291,7 +4391,7 @@ class ImageSearchApp:
 
     def _tour_path(self):
         return os.path.join(
-            os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "tour.json"
+            DATA_DIR, "tour.json"
         )
 
     def _tour_seen(self):
@@ -4361,7 +4461,7 @@ class ImageSearchApp:
         win.configure(fg_color=BG_COLOR)
         win.resizable(False, False)
         win.transient(self.root)
-        win.after(250, lambda: win.iconbitmap(_resource_path("assets", "app_icon.ico")))
+        win.after(250, lambda: _apply_icon(win))
         body = ctk.CTkFrame(win, fg_color="transparent")
         body.pack(fill=tk.BOTH, expand=True, padx=28, pady=(24, 20))
 
@@ -4422,7 +4522,7 @@ class ImageSearchApp:
 
     def _updates_dir(self):
         return os.path.join(
-            os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "app"
+            DATA_DIR, "app"
         )
 
     def _staged_update(self):
@@ -4579,7 +4679,7 @@ class ImageSearchApp:
         url = getattr(config, "DOWNLOAD_URL", "")
         if url:
             try:
-                os.startfile(url)
+                _open_external(url)
             except Exception:
                 pass
 
@@ -4590,7 +4690,7 @@ class ImageSearchApp:
         win.configure(fg_color=BG_COLOR)
         win.resizable(False, False)
         win.transient(self.root)
-        win.after(250, lambda: win.iconbitmap(_resource_path("assets", "app_icon.ico")))
+        win.after(250, lambda: _apply_icon(win))
         body = ctk.CTkFrame(win, fg_color="transparent")
         body.pack(fill=tk.BOTH, expand=True, padx=26, pady=(22, 18))
         upcoming = info["version"] != APP_VERSION
@@ -5171,7 +5271,7 @@ class ImageSearchApp:
             # Double-click previews in-app; the original is one click away
             # from inside the preview. A click on the star toggles it.
             label.bind("<Double-Button-1>", lambda e, p=path, m=meta: self._on_thumb_double(e, p, m))
-            label.bind("<Button-3>", lambda e, p=path, m=meta: self._show_result_menu(e, p, m))
+            _bind_context_menu(label, lambda e, p=path, m=meta: self._show_result_menu(e, p, m))
             label.bind("<ButtonPress-1>", lambda e, p=path, m=meta: self._drag_start(e, p, m))
             label.bind("<B1-Motion>", self._drag_motion)
             label.bind(
@@ -5347,8 +5447,7 @@ def _start_freeze_watchdog(root):
     watched; this records where it happened."""
     import faulthandler
 
-    path = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                        "ImageSearch", "freeze.log")
+    path = os.path.join(DATA_DIR, "freeze.log")
     beat = [time.monotonic()]
 
     def pulse():
@@ -5452,7 +5551,7 @@ def _set_window_icons(root):
 
 def _handover_path():
     return os.path.join(
-        os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "app", "handover"
+        DATA_DIR, "app", "handover"
     )
 
 
@@ -5593,6 +5692,64 @@ class PopMenu:
         _animate(self.root, self.CLOSE_MS, fold, done=gone, ease=EASE_OUT)
 
 
+class _OutlineBars:
+    """macOS stand-in for the tour's dimmed layer. Tk on a Mac can't make
+    part of a window see-through, so the highlight is drawn as four thin
+    green windows around the part being explained; nothing is dimmed and
+    nothing covers the card."""
+
+    WIDTH = 2
+
+    def __init__(self, root, colour):
+        self.root = root
+        self.bars = []
+        for _ in range(4):
+            bar = tk.Toplevel(root)
+            bar.overrideredirect(True)
+            bar.configure(bg=colour)
+            try:
+                bar.transient(root)
+                bar.attributes("-alpha", 0.0)
+            except tk.TclError:
+                pass
+            bar.geometry("1x1+0+0")
+            self.bars.append(bar)
+
+    def place(self, rect):
+        ox, oy = self.root.winfo_rootx(), self.root.winfo_rooty()
+        x0, y0, x1, y1 = (round(v) for v in rect)
+        x0, y0, x1, y1 = x0 - 3, y0 - 3, x1 + 3, y1 + 3
+        w, h, t = max(1, x1 - x0), max(1, y1 - y0), self.WIDTH
+        for bar, (x, y, bw, bh) in zip(self.bars, (
+                (x0, y0, w, t), (x0, y1 - t, w, t), (x0, y0, t, h), (x1 - t, y0, t, h))):
+            try:
+                bar.geometry(f"{bw}x{bh}+{ox + x}+{oy + y}")
+                bar.lift()
+            except tk.TclError:
+                pass
+
+    def alpha(self, value):
+        for bar in self.bars:
+            try:
+                bar.attributes("-alpha", max(0.0, min(1.0, value)))
+            except tk.TclError:
+                pass
+
+    def lift(self):
+        for bar in self.bars:
+            try:
+                bar.lift()
+            except tk.TclError:
+                pass
+
+    def destroy(self):
+        for bar in self.bars:
+            try:
+                bar.destroy()
+            except tk.TclError:
+                pass
+
+
 class Tour:
     """A five-step guided tour. The window dims, the part being explained
     stays lit with a ring around it, and a card beside it says what it is.
@@ -5621,7 +5778,10 @@ class Tour:
         self.bubble_box = None
         self._moving = False
         self._still = 0
+        self.outline = _OutlineBars(self.root, "#34d399") if IS_MAC else None
         self.overlay = tk.Toplevel(self.root)
+        if self.outline is not None:
+            self.overlay.withdraw()  # kept only so the code below has a window
         self.overlay.overrideredirect(True)
         self.overlay.transient(self.root)
         self.overlay.configure(bg="#000000")
@@ -5659,12 +5819,17 @@ class Tour:
         return (r.winfo_rootx(), r.winfo_rooty(), r.winfo_width(), r.winfo_height())
 
     def _place_overlay(self):
+        if self.outline is not None:
+            return
         x, y, w, h = self._window_geometry()
         self.overlay.geometry(f"{w}x{h}+{x}+{y}")
         self.canvas.configure(width=w, height=h)
         self.overlay.lift()
 
     def _overlay_alpha(self, value):
+        if self.outline is not None:
+            self.outline.alpha(value / self.DIM)
+            return
         try:
             self.overlay.attributes("-alpha", value)
         except tk.TclError:
@@ -5699,6 +5864,9 @@ class Tour:
 
     def _draw(self, rect):
         self.rect = rect
+        if self.outline is not None:
+            self.outline.place(rect)
+            return
         self.canvas.coords(self.hole, *self._rounded(*rect))
         x0, y0, x1, y1 = rect
         self.canvas.coords(self.ring, *self._rounded(x0 - 2, y0 - 2, x1 + 2, y1 + 2, 14))
@@ -5741,6 +5909,13 @@ class Tour:
         above the dimmed layer, which hid the highlight. While the app is the
         active window the layer is put back on top; when another app is in
         front it is left alone, so it never covers other programs."""
+        if self.outline is not None:
+            try:
+                if self.root.focus_displayof() is not None:
+                    self.outline.lift()
+            except (tk.TclError, KeyError):
+                pass
+            return
         try:
             import ctypes
 
@@ -5930,6 +6105,8 @@ class Tour:
                 self.overlay.destroy()
             except tk.TclError:
                 pass
+            if self.outline is not None:
+                self.outline.destroy()
             _fine_timer(False)
             self.on_done()
 
@@ -6376,7 +6553,7 @@ class BootSequence:
         messagebox.showerror(
             APP_NAME,
             f"{APP_NAME} could not start. The details were written to "
-            "crash.log in %LOCALAPPDATA%\\ImageSearch.",
+            f"crash.log in {DATA_DIR}.",
         )
         self.root.destroy()
 
@@ -6458,7 +6635,7 @@ def main():
         root.iconbitmap(default=_resource_path("assets", "app_icon.ico"))
     except Exception:
         try:
-            root.iconbitmap(_resource_path("assets", "app_icon.ico"))
+            _apply_icon(root)
         except Exception:
             pass
     BootSequence(root).start()

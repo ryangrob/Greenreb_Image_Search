@@ -1,0 +1,72 @@
+# Builds the Mac version of Topshot on one of GitHub's Macs (Apple Silicon).
+# Start it from GitHub: Actions > "Build Mac app" > Run workflow.
+# When it is done (about 20-30 minutes) the .dmg is under "Artifacts" on
+# the run's page. A second artifact, mac-smoke-test, has a screenshot and
+# the logs of the app being started once on that Mac.
+name: Build Mac app
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mac:
+    runs-on: macos-14
+    timeout-minutes: 75
+    env:
+      PYTHON: /Library/Frameworks/Python.framework/Versions/3.13/bin/python3
+    steps:
+      - uses: actions/checkout@v4
+
+      # python.org's Python: it ships the Tk the window is drawn with, which
+      # is what PyInstaller expects on a Mac.
+      - name: Install Python 3.13 from python.org
+        run: |
+          curl -sSLo python.pkg https://www.python.org/ftp/python/3.13.1/python-3.13.1-macos11.pkg
+          sudo installer -pkg python.pkg -target /
+          "$PYTHON" --version
+          "$PYTHON" -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      - name: Cache the CLIP model
+        uses: actions/cache@v4
+        with:
+          path: model_cache
+          key: clip-model-${{ hashFiles('search_engine.py') }}
+
+      - name: Install requirements
+        run: |
+          "$PYTHON" -m pip install --upgrade pip
+          "$PYTHON" -m pip install -r requirements.txt
+
+      - name: Build Topshot.app and the .dmg
+        run: bash build_mac.sh
+
+      - name: Start the app once (smoke test)
+        continue-on-error: true
+        run: |
+          mkdir -p smoke
+          ./dist/Topshot.app/Contents/MacOS/Topshot > smoke/stdout.log 2>&1 &
+          PID=$!
+          sleep 50
+          screencapture -x smoke/screen-50s.png || true
+          sleep 20
+          screencapture -x smoke/screen-70s.png || true
+          kill $PID 2>/dev/null || true
+          sleep 2
+          cp "$HOME/Library/Application Support/Topshot/"*.log smoke/ 2>/dev/null || true
+          ls -la smoke
+          tail -50 smoke/*.log || true
+
+      - name: Upload the .dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: Topshot-mac
+          path: dist/Topshot-*-mac.dmg
+          retention-days: 30
+
+      - name: Upload the smoke test
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-smoke-test
+          path: smoke/
+          retention-days: 14
