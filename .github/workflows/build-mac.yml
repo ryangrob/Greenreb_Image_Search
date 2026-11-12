@@ -10,7 +10,7 @@ on:
 
 jobs:
   mac:
-    runs-on: macos-14
+    runs-on: macos-latest   # always the current Apple Silicon image
     timeout-minutes: 75
     env:
       PYTHON: /Library/Frameworks/Python.framework/Versions/3.13/bin/python3
