@@ -1,7 +1,7 @@
 # Greenreb Image Search v3.0.0
 
 Search the marketing photo library on SharePoint by describing what you
-need, or by showing it a picture. 32,000 photos, no tagging required.
+need, or by showing it a picture. 33,000 photos, no tagging required.
 
 ## Install
 
@@ -24,35 +24,36 @@ Run anyway**. The app is not code-signed yet.
 
 **Better search results.** The top results now keep their true relevance
 order. Previously the list was reordered twice after ranking, pushing
-genuinely better matches down the grid — a specific search gave you a few
-good results followed by loose ones.
+genuinely better matches down the grid.
 
 **Searches understand what you're asking for.** A search for a thing
 ("burger", "cocktail") leads with photos of that thing. A search for a
-scene ("birthday party") leads with photos of guests. Previously every
-search assumed you wanted people in shot.
+scene ("birthday party") leads with photos of guests.
 
 **Find similar.** Pick any photo on your computer and find the ones in the
 library that look like it. No words needed.
 
 **Collections you curate.** Start with Golf, Food, Drinks, Family & Kids
 and Groups, or make your own with the **+** in the sidebar. Fill them by
-dragging a photo onto one, or right-click a photo. Right-click a collection
-to rename or remove it - removing never deletes photos. Automatic categories were close but never right; a shortlist someone
-chose is worth more.
+dragging a photo onto one, or by right-clicking a photo. Right-click a
+collection to rename or remove it — removing never deletes photos.
 
-**Preview and copy.** Double-click any photo for a large view inside the
-app. **Copy** puts the full-resolution original on your clipboard, ready
-to paste into PowerPoint or an email.
+**Full-resolution preview.** Double-click any photo for a large view
+inside the app that sharpens to the original as it loads. **Copy** puts
+the full-resolution photo on your clipboard, ready to paste into
+PowerPoint or an email.
 
-**Starts properly.** A short intro card while the app loads, then the
-window appears complete - no blank pause, no window jumping to full screen,
+**Starts properly.** A short intro while the app loads, then the window
+appears complete — no blank pause, no window jumping to full screen,
 nothing filling in piece by piece.
 
 **Faster.** Search results and collections draw many times faster, and the
 window no longer stutters when moved between monitors.
 
-**Fixed:** un-starring a favourite now actually removes it.
+**Clear search history** with one button in the Search history view.
+
+**Fixed:** un-starring a favourite now removes it; Copy and Open original
+work straight after starting the app.
 
 ## Known limitations
 

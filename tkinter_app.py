@@ -51,7 +51,7 @@ import customtkinter as ctk
 _T_CTK = time.perf_counter()
 import numpy as np
 _T_NUMPY = time.perf_counter()
-from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageTk
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageTk
 _T_PIL = time.perf_counter()
 
 from search_engine import ImageSearchEngine, MODEL_TAG
@@ -234,6 +234,18 @@ LEGACY_COLLECTIONS = {"Family": "Family & Kids", "Kids": "Family & Kids"}
 # How far the pointer has to move with the button held before it counts as a
 # drag rather than a click, so double-clicking a photo still opens it.
 DRAG_THRESHOLD_PX = 8
+# Drag and drop motion. The carried photo eases towards where it should be
+# every frame (an exponential approach: reads as ease-out, and retargets
+# smoothly when the pointer changes its mind) instead of jumping.
+DRAG_SCALE = 0.62        # carried size, as a share of the tile
+DRAG_SCALE_OVER = 0.5    # a little smaller over a collection: "it goes in here"
+DRAG_ALPHA = 0.92
+DRAG_FOLLOW_TAU_MS = 26  # how closely it trails the pointer
+DRAG_SETTLE_TAU_MS = 60  # how quickly it shrinks / grows
+DRAG_HOVER_MS = 140      # collection card lighting up or dimming
+DROP_FLY_MS = 280        # flying into the collection
+DROP_BACK_MS = 240       # gliding home when dropped elsewhere
+CARD_PULSE_MS = 560      # the collection's confirmation glow
 # Largest the in-app preview will draw an image, in px.
 PREVIEW_MAX = (1120, 740)
 # Results built per pass before handing control back to the event loop.
@@ -259,15 +271,151 @@ OBJECT_PROMPTS = [
 ]
 DEFAULT_TOP_K = 150
 
-BG_COLOR = "#0d1b2a"
-CARD_COLOR = "#0a141f"
-ACCENT_COLOR = "#0b4c8c"
-ACCENT_ACTIVE = "#004fff"
-FIELD_BG = "#0a141f"
-TEXT_COLOR = "#eef3fa"
-MUTED_TEXT_COLOR = "#8fa3b8"
+BG_COLOR = "#0a0a0a"
+CARD_COLOR = "#171717"
+ACCENT_COLOR = "#262626"
+ACCENT_ACTIVE = "#333333"
+FIELD_BG = "#171717"
+TEXT_COLOR = "#fafafa"
+MUTED_TEXT_COLOR = "#a3a3a3"
 
 CARD_RADIUS = 14
+
+# The look follows the Topgolf Sales Cockpit: near-black page, a slightly
+# lighter full-height sidebar, #171717 cards with #262626 hairlines, white
+# text, and no brand blue - the colour on screen comes from the photos.
+# Inter (bundled in assets/fonts, loaded for this process only - nothing is
+# installed on the machine). Falls back to Segoe UI if the files are missing.
+UI_FONT = "Segoe UI"
+UI_FONT_MEDIUM = "Segoe UI Semibold"
+UI_FONT_SEMIBOLD = "Segoe UI Semibold"
+_INTER_FILES = ("Inter-Regular.ttf", "Inter-Medium.ttf", "Inter-SemiBold.ttf", "Inter-Bold.ttf")
+
+
+def _register_bundled_fonts():
+    """Makes the bundled Inter files usable by this process (FR_PRIVATE):
+    nothing is installed, and they vanish when the app closes."""
+    try:
+        import ctypes
+
+        add = ctypes.windll.gdi32.AddFontResourceExW
+    except Exception:
+        return 0
+    added = 0
+    for name in _INTER_FILES:
+        path = _resource_path("assets", "fonts", name)
+        if os.path.exists(path):
+            try:
+                added += add(path, 0x10, 0)
+            except Exception:
+                pass
+    return added
+
+
+def _choose_ui_fonts(root):
+    """Uses Inter where Windows can see it, Segoe UI otherwise."""
+    global UI_FONT, UI_FONT_MEDIUM, UI_FONT_SEMIBOLD
+    try:
+        import tkinter.font as tkfont
+
+        families = set(tkfont.families(root))
+    except Exception:
+        return
+    if "Inter" in families:
+        UI_FONT = "Inter"
+        UI_FONT_MEDIUM = "Inter Medium" if "Inter Medium" in families else "Inter"
+        UI_FONT_SEMIBOLD = "Inter SemiBold" if "Inter SemiBold" in families else "Inter"
+
+
+def _font(size, weight="regular"):
+    """The app's type scale in one place: Inter Regular / Medium / SemiBold,
+    falling back to Segoe UI and Segoe UI Semibold."""
+    family = {
+        "regular": UI_FONT, "medium": UI_FONT_MEDIUM,
+        "semibold": UI_FONT_SEMIBOLD, "bold": UI_FONT,
+    }[weight]
+    bold = weight == "bold" or (weight != "regular" and family == UI_FONT)
+    return ctk.CTkFont(family=family, size=size, weight="bold" if bold else "normal")
+SURFACE = "#171717"
+SURFACE_HOVER = "#222222"
+BORDER = "#262626"
+TEXT_SOFT = "#e5e5e5"
+FAINT_TEXT = "#737373"
+SIDEBAR_BG = "#141414"
+NAV_BG = SIDEBAR_BG
+PRIMARY_TEXT = "#0a0a0a"
+FOCUS_BORDER = "#525252"
+PULSE_COLOUR = "#404040"
+SOURCE_DOT = "#22c55e"
+NAV_HOVER = "#1f1f1f"
+NAV_SELECTED = "#262626"
+PRIMARY = "#fafafa"
+PRIMARY_HOVER = "#d4d4d4"
+
+# Segoe MDL2 Assets ships with Windows 10 and 11; the glyphs are drawn into
+# images so they sit beside Segoe UI text at any size. Without the font the
+# buttons simply have no icon.
+_ICON_GLYPHS = {
+    "photos": "\uE91B", "star": "\uE734", "history": "\uE81C", "folder": "\uE8B7",
+    "search": "\uE721", "refresh": "\uE72C", "settings": "\uE713", "add": "\uE710",
+    "similar": "\uE8B9", "open": "\uE838",
+}
+_icon_cache = {}
+# The same outline icon set as the Sales Cockpit (Lucide), from the bundled
+# icon font; its codepoints are read from the stylesheet that ships with it.
+_LUCIDE_NAMES = {
+    "photos": "images", "star": "star", "history": "history", "folder": "folder",
+    "search": "search", "refresh": "refresh-cw", "settings": "settings", "add": "plus",
+    "similar": "scan-search", "open": "folder-open", "index": "database",
+}
+_lucide_codes = None
+
+
+def _lucide_glyph(name):
+    global _lucide_codes
+    if _lucide_codes is None:
+        _lucide_codes = {}
+        try:
+            with open(_resource_path("assets", "fonts", "lucide.css"), encoding="utf-8") as f:
+                css = f.read()
+            for icon, code in re.findall(
+                r'\.icon-([a-z0-9-]+):+before\s*\{\s*content:\s*"\\([0-9a-fA-F]+)"', css
+            ):
+                _lucide_codes[icon] = chr(int(code, 16))
+        except Exception:
+            pass
+    return _lucide_codes.get(_LUCIDE_NAMES.get(name, name))
+
+
+def _icon(name, size=16, colour=None):
+    key = (name, size, colour)
+    if key in _icon_cache:
+        return _icon_cache[key]
+    image = None
+    try:
+        k = 4
+        glyph = _lucide_glyph(name)
+        lucide_path = _resource_path("assets", "fonts", "lucide.ttf")
+        if glyph and os.path.exists(lucide_path):
+            font = ImageFont.truetype(lucide_path, size * k)
+        else:
+            glyph = _ICON_GLYPHS[name]
+            font = ImageFont.truetype(
+                os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "segmdl2.ttf"), size * k
+            )
+        canvas = Image.new("RGBA", (size * k, size * k), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(canvas)
+        left, top, right, bottom = draw.textbbox((0, 0), glyph, font=font)
+        draw.text(
+            ((size * k - (right - left)) / 2 - left, (size * k - (bottom - top)) / 2 - top),
+            glyph, font=font, fill=_hex_rgb(colour or TEXT_SOFT) + (255,),
+        )
+        small = canvas.resize((size, size), Image.LANCZOS)
+        image = ctk.CTkImage(light_image=small, dark_image=small, size=(size, size))
+    except Exception:
+        image = None
+    _icon_cache[key] = image
+    return image
 BUTTON_RADIUS = 17
 
 LOGO_HEIGHT = 36
@@ -398,6 +546,27 @@ def open_in_system_viewer(path):
         subprocess.Popen(["xdg-open", path])
 
 
+def _make_ghost_button(parent, text, command, width=0, icon=None):
+    """A quiet, borderless button for occasional actions."""
+    return ctk.CTkButton(
+        parent, text=text, command=command, width=width, height=32, corner_radius=8,
+        fg_color="transparent", hover_color=SURFACE_HOVER, text_color=TEXT_SOFT,
+        text_color_disabled=FAINT_TEXT, image=_icon(icon, 15) if icon else None,
+        compound="left", font=_font(13, "medium"),
+    )
+
+
+def _make_secondary_button(parent, text, command, width=120, icon=None):
+    """An outlined button: clearly clickable, but quieter than the primary."""
+    return ctk.CTkButton(
+        parent, text=text, command=command, width=width, height=38, corner_radius=10,
+        fg_color="transparent", hover_color=SURFACE_HOVER, border_width=1,
+        border_color=BORDER, text_color=TEXT_COLOR, text_color_disabled=FAINT_TEXT,
+        image=_icon(icon, 15) if icon else None, compound="left",
+        font=_font(13, "semibold"),
+    )
+
+
 def _make_button(parent, text, command, width=140):
     return ctk.CTkButton(
         parent,
@@ -405,16 +574,35 @@ def _make_button(parent, text, command, width=140):
         command=command,
         width=width,
         height=34,
-        corner_radius=BUTTON_RADIUS,
-        fg_color=ACCENT_COLOR,
-        hover_color=ACCENT_ACTIVE,
+        corner_radius=8,
+        fg_color="#262626",
+        hover_color="#333333",
+        text_color_disabled=FAINT_TEXT,
         text_color=TEXT_COLOR,
-        font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+        font=_font(13, "medium"),
+    )
+
+
+def _make_primary_button(parent, text, command, width=96):
+    """The one emphasised action: white on near-black, as in the Cockpit."""
+    return ctk.CTkButton(
+        parent, text=text, command=command, width=width, height=36, corner_radius=8,
+        fg_color=PRIMARY, hover_color=PRIMARY_HOVER, text_color=PRIMARY_TEXT,
+        text_color_disabled="#737373", font=_font(13, "semibold"),
     )
 
 
 STAR_BADGE_SIZE = (26, 24)
-STAR_BADGE_INSET = 3
+STAR_BADGE_INSET = 6  # clear of the tile's rounded corner
+# The results grid is a justified layout (as in Google Photos): every
+# photo in a row shares one height and keeps its own shape, and each full
+# row is sized to end exactly at the right edge. No captions - the folder
+# name is shown in the preview, where it is actually readable.
+ROW_HEIGHT = 140  # target height; full rows shrink a little to fit the width
+TILE_GAP = 6
+TILE_RADIUS = 8
+GRID_SIDE_PAD = 0  # tiles line up with the search field's left edge
+ROWS_PER_CHUNK = 3  # rows built per event-loop turn, so the grid fills in smoothly
 CAPTION_FONT = ("Roboto", -12)  # what CustomTkinter used for captions on Windows
 
 
@@ -477,6 +665,7 @@ class ImageSearchApp:
         self.thumbnail_refs = []  # keep CTkImage refs alive
         self._thumb_cache = {}  # path -> decoded PIL thumbnail, see _thumb_image
         self._badges = None
+        self._tile_corners = None
         self._render_favs = set()
         self._last_query = ""
         self._feedback = None
@@ -515,135 +704,195 @@ class ImageSearchApp:
     # ---------- UI construction ----------
 
     def _build_widgets(self):
-        header = ctk.CTkFrame(self.root, fg_color="transparent")
-        header.pack(fill=tk.X, padx=12, pady=(12, 0))
+        # Laid out like the Sales Cockpit: a full-height sidebar for where you
+        # are (library, collections) and the occasional system actions at
+        # its foot, and a main column with the page title, the search field
+        # and the photos.
+        shell = ctk.CTkFrame(self.root, fg_color=SIDEBAR_BG, corner_radius=0, width=240)
+        shell.pack(side=tk.LEFT, fill=tk.Y)
+        shell.pack_propagate(False)
+        ctk.CTkFrame(self.root, fg_color=BORDER, width=1, corner_radius=0).pack(
+            side=tk.LEFT, fill=tk.Y
+        )
+        nav = ctk.CTkFrame(shell, fg_color="transparent")
+        nav.pack(fill=tk.BOTH, expand=True, padx=10, pady=(16, 12))
+
+        brand = ctk.CTkFrame(nav, fg_color="transparent")
+        brand.pack(fill=tk.X, padx=6, pady=(0, 20))
         self._logo_image = _load_logo_image()
         if self._logo_image:
-            ctk.CTkLabel(header, image=self._logo_image, text="").pack(side=tk.LEFT)
-        # The header was a small logo adrift in an otherwise empty band; naming
-        # the app there makes the window read as a product rather than a tool.
+            ctk.CTkLabel(brand, image=self._logo_image, text="").pack(side=tk.LEFT)
+        names = ctk.CTkFrame(brand, fg_color="transparent")
+        names.pack(side=tk.LEFT, padx=(10, 0))
         ctk.CTkLabel(
-            header, text="Image Search",
-            font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
-            text_color=TEXT_COLOR,
-        ).pack(side=tk.LEFT, padx=(12, 0))
-        stamp = _build_stamp()
-        subtitle = "Marketing photo library"
-        if stamp:
-            subtitle = f"{subtitle}   \u00b7   version {stamp}"
+            names, text="Image Search", font=_font(14, "semibold"), text_color=TEXT_COLOR,
+            height=18, anchor="w",
+        ).pack(anchor="w")
         ctk.CTkLabel(
-            header, text=subtitle,
-            font=ctk.CTkFont(family="Segoe UI", size=13),
-            text_color=MUTED_TEXT_COLOR,
-        ).pack(side=tk.LEFT, padx=(12, 0), pady=(4, 0))
+            names, text="Marketing photo library", font=_font(11), text_color=MUTED_TEXT_COLOR,
+            height=16, anchor="w",
+        ).pack(anchor="w")
 
-        top = ctk.CTkFrame(self.root, fg_color=CARD_COLOR, corner_radius=CARD_RADIUS)
-        top.pack(fill=tk.X, padx=12, pady=12)
+        def section(parent, text, pady=(0, 4)):
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill=tk.X, pady=pady)
+            ctk.CTkLabel(
+                row, text=text, text_color=FAINT_TEXT, font=_font(11, "medium"), height=22,
+            ).pack(side=tk.LEFT, padx=(10, 0))
+            return row
 
+        # Footer first (packed from the bottom up), so the lists above can
+        # grow without pushing it off the window.
+        footer = ctk.CTkFrame(nav, fg_color="transparent")
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        ctk.CTkFrame(footer, fg_color=BORDER, height=1, corner_radius=0).pack(
+            fill=tk.X, pady=(0, 10)
+        )
+        source = ctk.CTkFrame(footer, fg_color="transparent")
+        source.pack(fill=tk.X, padx=10)
+        ctk.CTkLabel(
+            source, text="\u25cf", text_color=SOURCE_DOT, font=_font(10), width=12, height=18,
+        ).pack(side=tk.LEFT, anchor="n")
         self.folder_var = tk.StringVar(value="No folder selected")
-        _make_button(top, "Choose Folder...", self._choose_folder, width=150).pack(
-            side=tk.LEFT, padx=(14, 8), pady=14
-        )
-        # Sized so the buttons to its right still fit at the minimum window
-        # width rather than being clipped off the edge.
         ctk.CTkLabel(
-            top, textvariable=self.folder_var, width=150, anchor="w",
-            text_color=MUTED_TEXT_COLOR,
-        ).pack(side=tk.LEFT, padx=8, pady=14, fill=tk.X, expand=True)
-        self.index_button = _make_button(top, "Index Folder", self._start_indexing, width=130)
-        self.index_button.pack(side=tk.LEFT, padx=4, pady=14)
+            source, textvariable=self.folder_var, text_color=MUTED_TEXT_COLOR, font=_font(12),
+            justify="left", anchor="w", wraplength=180,
+        ).pack(side=tk.LEFT, padx=(6, 0), fill=tk.X)
+        stamp = _build_stamp()
+        if stamp:
+            ctk.CTkLabel(
+                footer, text=f"Version {stamp}", text_color=FAINT_TEXT, font=_font(11),
+                anchor="w", height=18,
+            ).pack(fill=tk.X, padx=(28, 10), pady=(2, 0))
+
+        system = ctk.CTkFrame(nav, fg_color="transparent")
+        system.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 12))
+        section(system, "SYSTEM")
+        self.sharepoint_button = self._make_collection_card(
+            system, "  Check for new photos", self._browse_sharepoint, icon="refresh"
+        )
+        self._make_collection_card(system, "  Choose folder…", self._choose_folder, icon="open")
+        self.index_button = self._make_collection_card(
+            system, "  Index folder", self._start_indexing, icon="index"
+        )
         self.index_button.configure(state=tk.DISABLED)
-        self.sharepoint_button = _make_button(
-            top, "Check for new photos", self._browse_sharepoint, width=190
+        self._make_collection_card(system, "  Settings", self._open_settings, icon="settings")
+
+        section(nav, "LIBRARY")
+        self.all_card = self._make_collection_card(
+            nav, "  All photos", lambda: self._set_view("all"), icon="photos"
         )
-        self.sharepoint_button.pack(side=tk.LEFT, padx=4, pady=14)
-        _make_button(top, "Settings", self._open_settings, width=100).pack(
-            side=tk.LEFT, padx=(4, 14), pady=14
-        )
-
-        # Sidebar (collection cards) beside the search area and results, so
-        # switching collection keeps the same search box rather than moving it.
-        body = ctk.CTkFrame(self.root, fg_color="transparent")
-        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
-
-        sidebar = ctk.CTkFrame(body, fg_color="transparent", width=176)
-        sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
-        sidebar.pack_propagate(False)
-
-        self.sidebar = sidebar
-        self.all_card = self._make_collection_card(sidebar, "All photos", lambda: self._set_view("all"))
         self.fav_card = self._make_collection_card(
-            sidebar, "Favourites", lambda: self._set_view("favourites")
+            nav, "  Favourites", lambda: self._set_view("favourites"), icon="star"
         )
         self.history_card = self._make_collection_card(
-            sidebar, "Search history", lambda: self._set_view("history")
+            nav, "  Search history", lambda: self._set_view("history"), icon="history"
         )
-        # Separates the three ways of looking at the whole library from the
-        # automatic collections below.
-        ctk.CTkFrame(sidebar, fg_color=ACCENT_ACTIVE, height=3, corner_radius=2).pack(
-            fill=tk.X, pady=(6, 10)
-        )
-        heading = ctk.CTkFrame(sidebar, fg_color="transparent")
-        heading.pack(fill=tk.X, pady=(0, 6))
-        ctk.CTkLabel(
-            heading, text="COLLECTIONS", text_color=MUTED_TEXT_COLOR,
-            font=ctk.CTkFont(size=11, weight="bold"),
-        ).pack(side=tk.LEFT, padx=(4, 0))
+        heading = section(nav, "COLLECTIONS", pady=(20, 4))
         ctk.CTkButton(
-            heading, text="+", width=28, height=24, corner_radius=8,
-            fg_color=CARD_COLOR, hover_color=ACCENT_COLOR, text_color=TEXT_COLOR,
-            font=ctk.CTkFont(size=16, weight="bold"), command=self._new_collection,
-        ).pack(side=tk.RIGHT)
+            heading, text="" if _icon("add", 14) else "+", image=_icon("add", 14),
+            width=26, height=24, corner_radius=6,
+            fg_color="transparent", hover_color=NAV_HOVER, text_color=TEXT_SOFT,
+            font=_font(15, "semibold"), command=self._new_collection,
+        ).pack(side=tk.RIGHT, padx=(0, 4))
+        # Collection items are rebuilt into this frame (see
+        # _rebuild_collection_cards), between the heading and the footer.
+        self.sidebar = ctk.CTkFrame(nav, fg_color="transparent")
+        self.sidebar.pack(fill=tk.X)
         self._collections_hint = None
         self.collection_cards = {}
 
-        main = ctk.CTkFrame(body, fg_color="transparent")
-        main.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        main = ctk.CTkFrame(self.root, fg_color="transparent")
+        main.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(32, 24), pady=(24, 0))
 
-        search_frame = ctk.CTkFrame(main, fg_color=CARD_COLOR, corner_radius=CARD_RADIUS)
+        # Page title and a one-line status beneath it, like the Cockpit's
+        # "Guten Tag, Ryan" header.
+        head = ctk.CTkFrame(main, fg_color="transparent")
+        head.pack(fill=tk.X, pady=(0, 18))
+        titles = ctk.CTkFrame(head, fg_color="transparent")
+        titles.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.title_var = tk.StringVar(value="All photos")
+        ctk.CTkLabel(
+            titles, textvariable=self.title_var, font=_font(22, "semibold"),
+            text_color=TEXT_COLOR, anchor="w", height=30,
+        ).pack(anchor="w")
+        self.status_var = tk.StringVar(value="Loading your photo library...")
+        ctk.CTkLabel(
+            titles, textvariable=self.status_var, font=_font(13), text_color=MUTED_TEXT_COLOR,
+            anchor="w", height=20,
+        ).pack(anchor="w", pady=(2, 0))
+        # A hairline that only shows while something is running: its track is
+        # the background colour, so at rest there is nothing to see.
+        self.progress = ctk.CTkProgressBar(
+            head, width=140, height=3, corner_radius=2,
+            fg_color=BG_COLOR, progress_color=TEXT_SOFT,
+        )
+        # CustomTkinter still draws a round dot at 0%, so the bar takes the
+        # background colour whenever it is empty and idle.
+        _set, _start = self.progress.set, self.progress.start
+
+        def progress_set(value, *args, **kwargs):
+            try:
+                idle = value <= 0 and self.progress.cget("mode") == "determinate"
+                self.progress.configure(progress_color=BG_COLOR if idle else TEXT_SOFT)
+            except Exception:
+                pass
+            return _set(value, *args, **kwargs)
+
+        def progress_start(*args, **kwargs):
+            try:
+                self.progress.configure(progress_color=TEXT_SOFT)
+            except Exception:
+                pass
+            return _start(*args, **kwargs)
+
+        self.progress.set, self.progress.start = progress_set, progress_start
+        self.progress.set(0)
+        self.progress.pack(side=tk.RIGHT, anchor="s", pady=(0, 8))
+
+        search_frame = ctk.CTkFrame(
+            main, fg_color=SURFACE, corner_radius=12, border_width=1, border_color=BORDER,
+        )
         search_frame.pack(fill=tk.X, pady=(0, 12))
+        search_icon = _icon("search", 16, MUTED_TEXT_COLOR)
+        if search_icon is not None:
+            ctk.CTkLabel(search_frame, image=search_icon, text="").pack(side=tk.LEFT, padx=(16, 0))
 
         self.query_var = tk.StringVar()
         self.query_entry = ctk.CTkEntry(
-            search_frame, textvariable=self.query_var, fg_color=FIELD_BG,
-            text_color=TEXT_COLOR, border_width=0, corner_radius=10,
+            search_frame, textvariable=self.query_var, fg_color=SURFACE,
+            text_color=TEXT_COLOR, border_width=0, corner_radius=8, height=38,
+            font=_font(14),
             placeholder_text="Describe an image in English...",
+            placeholder_text_color=FAINT_TEXT,
         )
-        self.query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(14, 8), pady=14)
+        self.query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8), pady=8)
         self.query_entry.bind("<Return>", lambda _e: self._start_text_search())
-
-        self.image_search_button = _make_button(
-            search_frame, "Find similar...", self._start_image_search, width=130
+        self.query_entry.bind(
+            "<FocusIn>", lambda _e: search_frame.configure(border_color=FOCUS_BORDER)
         )
-        self.image_search_button.pack(side=tk.LEFT, padx=(0, 8), pady=14)
+        self.query_entry.bind("<FocusOut>", lambda _e: search_frame.configure(border_color=BORDER))
+
+        self.image_search_button = _make_secondary_button(
+            search_frame, "Find similar…", self._start_image_search, width=136, icon="similar"
+        )
+        self.image_search_button.configure(height=36, corner_radius=8)
+        self.image_search_button.pack(side=tk.LEFT, padx=(0, 8), pady=8)
         self.image_search_button.configure(state=tk.DISABLED)
 
-        self.search_button = _make_button(
-            search_frame, "Search", self._start_text_search, width=100
-        )
-        self.search_button.pack(side=tk.LEFT, padx=(0, 14), pady=14)
+        self.search_button = _make_primary_button(search_frame, "Search", self._start_text_search)
+        self.search_button.pack(side=tk.LEFT, padx=(0, 8), pady=8)
         self.search_button.configure(state=tk.DISABLED)
 
         self.suggestion_bar = ctk.CTkFrame(main, fg_color="transparent")
-        self.suggestion_bar.pack(fill=tk.X, pady=(0, 8))
-
-        status_frame = ctk.CTkFrame(main, fg_color="transparent")
-        status_frame.pack(fill=tk.X, pady=(0, 8))
-        self.status_var = tk.StringVar(
-            value="Loading your photo library..."
-        )
-        ctk.CTkLabel(
-            status_frame, textvariable=self.status_var, text_color=TEXT_COLOR, anchor="w",
-        ).pack(side=tk.LEFT)
-        self.progress = ctk.CTkProgressBar(
-            status_frame, width=200, fg_color=FIELD_BG, progress_color=ACCENT_COLOR,
-        )
-        self.progress.set(0)
-        self.progress.pack(side=tk.RIGHT)
+        self.suggestion_bar.pack(fill=tk.X, pady=(0, 14))
 
         # Scrollable results grid - CTkScrollableFrame already handles its
         # own internal canvas, scrollbar, and mousewheel binding.
-        self.results_frame = ctk.CTkScrollableFrame(main, fg_color=BG_COLOR)
+        self.results_frame = ctk.CTkScrollableFrame(
+            main, fg_color=BG_COLOR, corner_radius=0, scrollbar_button_color=BORDER,
+            scrollbar_button_hover_color="#404040",
+        )
         self.results_frame.pack(fill=tk.BOTH, expand=True)
         # CustomTkinter moves 1 pixel per scroll "unit" on Windows, which
         # feels sluggish over a tall grid of 150 results - scaling the
@@ -668,20 +917,25 @@ class ImageSearchApp:
         self._update_favourites_button()
         self._set_view("all")
 
-    def _make_collection_card(self, parent, text, command):
+    def _make_collection_card(self, parent, text, command, icon="folder"):
+        """A flat sidebar item: no panel of its own, a soft highlight on
+        hover and a filled one when selected."""
         card = ctk.CTkButton(
             parent,
             text=text,
             command=command,
-            height=48,
-            corner_radius=CARD_RADIUS,
-            fg_color=CARD_COLOR,
-            hover_color=ACCENT_COLOR,
-            text_color=TEXT_COLOR,
+            height=34,
+            corner_radius=8,
+            fg_color=NAV_BG,
+            hover_color=NAV_HOVER,
+            text_color=TEXT_SOFT,
+            text_color_disabled=FAINT_TEXT,
             anchor="w",
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            image=_icon(icon, 16),
+            compound="left",
+            font=_font(14, "medium"),
         )
-        card.pack(fill=tk.X, pady=(0, 8))
+        card.pack(fill=tk.X, pady=(0, 1))
         return card
 
     def _update_favourites_button(self):
@@ -757,26 +1011,39 @@ class ImageSearchApp:
                 self.sidebar, f"  {shown} ({len(idxs)})", lambda n=name: self._set_view(n)
             )
             card.bind("<Button-3>", lambda e, n=name: self._show_collection_menu(e, n))
+            card.configure(
+                fg_color=self._card_rest_colour(name),
+                text_color=TEXT_COLOR if self._view == name else TEXT_SOFT,
+            )
             self.collection_cards[name] = card
         if not self.collection_cards:
             self._collections_hint = ctk.CTkLabel(
                 self.sidebar, text="No collections.\nClick + to make one.",
-                text_color=MUTED_TEXT_COLOR, font=ctk.CTkFont(size=12), justify="left",
+                text_color=MUTED_TEXT_COLOR, font=_font(12), justify="left",
             )
             self._collections_hint.pack(anchor="w", padx=6, pady=(2, 0))
 
     def _set_view(self, view):
         """Switches which collection the search box searches."""
         self._view = view
-        self.all_card.configure(
-            text="  All photos", fg_color=ACCENT_COLOR if view == "all" else CARD_COLOR
-        )
-        self.fav_card.configure(fg_color=ACCENT_COLOR if view == "favourites" else CARD_COLOR)
-        self.history_card.configure(fg_color=ACCENT_COLOR if view == "history" else CARD_COLOR)
+        if getattr(self, "title_var", None) is not None:
+            self.title_var.set(
+                {"all": "All photos", "favourites": "Favourites", "history": "Search history"}
+                .get(view, view)
+            )
+        def look(selected):
+            return {
+                "fg_color": NAV_SELECTED if selected else NAV_BG,
+                "text_color": TEXT_COLOR if selected else TEXT_SOFT,
+            }
+
+        self.all_card.configure(**look(view == "all"))
+        self.fav_card.configure(**look(view == "favourites"))
+        self.history_card.configure(**look(view == "history"))
         self._update_favourites_button()
         self._update_history_button()
         for name, card in self.collection_cards.items():
-            card.configure(fg_color=ACCENT_COLOR if view == name else CARD_COLOR)
+            card.configure(**look(view == name))
 
         if view == "history":
             self.query_entry.configure(placeholder_text="Describe an image in English...")
@@ -1154,14 +1421,15 @@ class ImageSearchApp:
         if not terms:
             return
         ctk.CTkLabel(
-            self.suggestion_bar, text="Recent:", text_color=MUTED_TEXT_COLOR,
-            font=ctk.CTkFont(size=11),
-        ).pack(side=tk.LEFT, padx=(2, 6))
+            self.suggestion_bar, text="Recent", text_color=FAINT_TEXT,
+            font=_font(12),
+        ).pack(side=tk.LEFT, padx=(4, 8))
         for term in terms:
             ctk.CTkButton(
-                self.suggestion_bar, text=term, height=26, corner_radius=13,
-                fg_color=CARD_COLOR, hover_color=ACCENT_COLOR, text_color=TEXT_COLOR,
-                font=ctk.CTkFont(size=11), width=0,
+                self.suggestion_bar, text=term, height=28, corner_radius=14,
+                fg_color="transparent", hover_color=SURFACE_HOVER, text_color=TEXT_SOFT,
+                border_width=1, border_color=BORDER,
+                font=_font(12), width=0,
                 command=lambda t=term: self._search_term(t),
             ).pack(side=tk.LEFT, padx=3)
 
@@ -1180,6 +1448,7 @@ class ImageSearchApp:
         history = self._load_history()
         for child in self.results_frame.winfo_children():
             child.destroy()
+        self._scroll_results_to_top()
         self.thumbnail_refs.clear()
         if not history:
             self.status_var.set("No searches yet - your search history will appear here.")
@@ -1192,7 +1461,7 @@ class ImageSearchApp:
             # A muted red on hover: the one destructive action on this screen
             # should look different from the searches beside it.
             fg_color=CARD_COLOR, hover_color="#7a2330", text_color=TEXT_COLOR,
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            font=_font(12, "semibold"),
             command=self._clear_history,
         ).pack(side=tk.RIGHT)
         for entry in history:
@@ -1203,11 +1472,11 @@ class ImageSearchApp:
             ctk.CTkButton(
                 row, text=term, anchor="w", height=34, corner_radius=8,
                 fg_color="transparent", hover_color=ACCENT_COLOR, text_color=TEXT_COLOR,
-                font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+                font=_font(13, "semibold"),
                 command=lambda t=term: self._search_term(t),
             ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 4), pady=4)
             ctk.CTkLabel(
-                row, text=when, text_color=MUTED_TEXT_COLOR, font=ctk.CTkFont(size=11),
+                row, text=when, text_color=MUTED_TEXT_COLOR, font=_font(11),
             ).pack(side=tk.RIGHT, padx=12)
 
     def _clear_history(self):
@@ -1378,7 +1647,7 @@ class ImageSearchApp:
 
         ctk.CTkLabel(
             win, text="Save opened images to", text_color=TEXT_COLOR,
-            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+            font=_font(14, "semibold"),
         ).pack(anchor="w", padx=20, pady=(20, 2))
         ctk.CTkLabel(
             win,
@@ -2449,11 +2718,13 @@ class ImageSearchApp:
                     self.status_var.set(event[1])
                 elif kind == "index_done":
                     self.progress.stop()
+                    self.progress.configure(mode="determinate")
                     self.progress.set(0)
                     self._set_busy(False)
                     self.status_var.set(f"Indexed {event[1]} images. Ready to search.")
                 elif kind == "search_done":
                     self.progress.stop()
+                    self.progress.configure(mode="determinate")
                     self.progress.set(0)
                     self._set_busy(False)
                     self._render_results(event[1])
@@ -2498,6 +2769,7 @@ class ImageSearchApp:
                 elif kind == "sp_index_done":
                     _, count, changed_folder_count, failed_count = event
                     self.progress.stop()
+                    self.progress.configure(mode="determinate")
                     self.progress.set(0)
                     self.folder_var.set("SharePoint: Fotos & Videos (all subfolders)")
                     self._set_busy(False)
@@ -2560,6 +2832,7 @@ class ImageSearchApp:
                     open_in_system_viewer(delivered)
                 elif kind == "error":
                     self.progress.stop()
+                    self.progress.configure(mode="determinate")
                     self.progress.set(0)
                     self._set_busy(False)
                     self.status_var.set("Error.")
@@ -2582,9 +2855,12 @@ class ImageSearchApp:
         except Exception:
             width = self.results_frame.winfo_width()
         if width <= 1:
-            return GRID_COLUMNS
-        cell_width = THUMB_SIZE[0] + GRID_CELL_PADDING
-        return max(1, (width - GRID_CELL_PADDING) // cell_width)
+            # Not laid out yet (the window is built hidden during the intro);
+            # the resize that follows the reveal re-lays it out at the real width.
+            return GRID_COLUMNS * (THUMB_SIZE[0] + GRID_CELL_PADDING)
+        # The justified grid depends on the exact width, so the "column
+        # count" is now simply the width: any real change re-lays it out.
+        return width
 
     def _on_results_area_resized(self):
         """Re-lays out the current results at the new column count, once
@@ -2628,17 +2904,63 @@ class ImageSearchApp:
             self._badges = {True: _draw_star_badge(True), False: _draw_star_badge(False)}
         return self._badges
 
-    def _thumb_photo(self, path, favourite):
-        """A thumbnail with its favourite star composited in, ready for Tk.
+    def _tile_mask(self, size):
+        """An alpha mask with rounded corners for one tile. The corner is
+        drawn once at 4x and reused, so a mask costs four pastes."""
+        r = TILE_RADIUS
+        if self._tile_corners is None:
+            s = 4
+            big = Image.new("L", (r * s, r * s), 0)
+            ImageDraw.Draw(big).pieslice((0, 0, 2 * r * s - 1, 2 * r * s - 1), 180, 270, fill=255)
+            c = big.resize((r, r), Image.LANCZOS)
+            self._tile_corners = (
+                c, c.transpose(Image.FLIP_LEFT_RIGHT),
+                c.transpose(Image.FLIP_TOP_BOTTOM), c.transpose(Image.ROTATE_180),
+            )
+        tl, tr, bl, br = self._tile_corners
+        w, h = size
+        mask = Image.new("L", size, 255)
+        mask.paste(tl, (0, 0))
+        mask.paste(tr, (w - r, 0))
+        mask.paste(bl, (0, h - r))
+        mask.paste(br, (w - r, h - r))
+        return mask
 
-        Composited rather than laid over the photo as a second widget: the
-        badge's rounded corners blend into the photo instead of showing
-        square patches of background, and each result is one widget lighter.
+    def _tile_photo(self, path, size, favourite, hover=False):
+        return ImageTk.PhotoImage(self._tile_pil(path, size, favourite, hover))
+
+    def _tile_pil(self, path, size, favourite, hover=False):
+        """One grid tile, ready for Tk: the photo filled to `size` (centre
+        crop of at most a few pixels, never stretched), rounded corners, and
+        the star - always when it is a favourite, otherwise only on hover,
+        so a screen of photos is not covered in empty stars.
         """
-        img = self._thumb_image(path).convert("RGBA")
-        badge = self._star_badges()[bool(favourite)]
-        img.alpha_composite(badge, (img.width - badge.width - STAR_BADGE_INSET, STAR_BADGE_INSET))
-        return ImageTk.PhotoImage(img)
+        img = ImageOps.fit(self._thumb_image(path), size, Image.LANCZOS)
+        tile = Image.new("RGBA", size, _hex_rgb(BG_COLOR) + (255,))
+        tile.paste(img, (0, 0), self._tile_mask(size))
+        if favourite or hover:
+            badge = self._star_badges()[bool(favourite)]
+            tile.alpha_composite(
+                badge, (size[0] - badge.width - STAR_BADGE_INSET, STAR_BADGE_INSET)
+            )
+        return tile
+
+    def _tile_hover(self, label, on):
+        tile = getattr(label, "tile", None)
+        if tile is None or getattr(label, "dragging", False):
+            return
+        path, size, key = tile
+        if key in self._render_favs:
+            return  # the gold star already shows
+        try:
+            if on:
+                if getattr(label, "hover_image", None) is None:
+                    label.hover_image = self._tile_photo(path, size, False, hover=True)
+                label.configure(image=label.hover_image)
+            else:
+                label.configure(image=label.image)
+        except Exception:
+            pass
 
     @staticmethod
     def _in_star(event):
@@ -3130,11 +3452,23 @@ class ImageSearchApp:
         """Right-click menu on a result: the keyboard-and-mouse route into a
         collection, for anyone who would rather not drag."""
         menu = tk.Menu(self.root, tearoff=0)
-        for name in self._collection_names():
-            menu.add_command(
-                label=f"Add to {name}",
-                command=lambda n=name: self._add_to_collection(n, path, meta),
-            )
+        names = self._collection_names()
+        in_collection = self._view in names
+        for name in names:
+            if name == self._view:
+                continue
+            if in_collection:
+                menu.add_command(
+                    label=f"Move to {name}",
+                    command=lambda n=name, v=self._view: (
+                        self._move_to_collection(v, n, path, meta), self._pulse_card(n)),
+                )
+            else:
+                menu.add_command(
+                    label=f"Add to {name}",
+                    command=lambda n=name: (
+                        self._add_to_collection(n, path, meta), self._pulse_card(n)),
+                )
         if self._view in self._collection_names():
             menu.add_separator()
             menu.add_command(
@@ -3158,15 +3492,37 @@ class ImageSearchApp:
 
     # ---------- drag a photo onto a collection ----------
 
+    # ---------- drag and drop into collections ----------
+    #
+    # The photo lifts off the grid into a small card that follows the
+    # pointer, and its place in the grid dims. The collection under the
+    # pointer lights up and the card shrinks a little more to say "it goes
+    # in here". Released there, it flies into the collection, which glows
+    # to confirm; when the photo came from another collection it is moved,
+    # and its place in the grid fades out. Released anywhere else, it
+    # glides back to where it came from.
+
     def _drag_start(self, event, path, meta):
         # Only records where the press happened. The drag does not begin
         # until the pointer actually moves, so a double-click still opens
         # the photo instead of being swallowed here.
+        try:
+            w, h = event.widget.winfo_width(), event.widget.winfo_height()
+        except tk.TclError:
+            w, h = 1, 1
         self._drag = {
-            "path": path, "meta": meta,
+            "path": path, "meta": meta, "label": event.widget,
             "x": event.x_root, "y": event.y_root,
-            "active": False, "win": None, "hover": None,
+            "px": event.x_root, "py": event.y_root,
+            "fx": min(1.0, max(0.0, event.x / max(1, w))),
+            "fy": min(1.0, max(0.0, event.y / max(1, h))),
+            "active": False, "ghost": None, "hover": None, "tick": None,
         }
+
+    def _motion_reduced(self):
+        if getattr(self, "_reduced_motion", None) is None:
+            self._reduced_motion = _prefers_reduced_motion()
+        return self._reduced_motion
 
     def _card_under_pointer(self, x_root, y_root):
         for name, card in (self.collection_cards or {}).items():
@@ -3179,83 +3535,316 @@ class ImageSearchApp:
                 continue
         return None
 
+    def _drop_target(self, x_root, y_root):
+        """The collection a drop would land in - never the one being viewed,
+        since dropping a photo where it already is does nothing."""
+        name = self._card_under_pointer(x_root, y_root)
+        return None if name == self._view else name
+
+    def _card_rest_colour(self, name):
+        return NAV_SELECTED if self._view == name else NAV_BG
+
+    def _fade_card(self, name, to_colour, ms, start=None, ease=None):
+        """Eases a collection card's colour. A newer fade on the same card
+        takes over from wherever this one has got to."""
+        card = (self.collection_cards or {}).get(name)
+        if card is None:
+            return
+        if start is None:
+            try:
+                start = card.cget("fg_color")
+            except Exception:
+                start = None
+            if not (isinstance(start, str) and start.startswith("#") and len(start) == 7):
+                start = self._card_rest_colour(name)
+        gens = self.__dict__.setdefault("_card_fade_gen", {})
+        gen = gens.get(name, 0) + 1
+        gens[name] = gen
+
+        def step(p):
+            if gens.get(name) != gen:
+                return
+            try:
+                card.configure(fg_color=_mix(start, to_colour, p))
+            except Exception:
+                pass
+
+        _animate(self.root, ms, step, ease=ease or EASE_OUT)
+
+    def _pulse_card(self, name):
+        """A collection glows and settles back, confirming what landed in it."""
+        self._fade_card(name, self._card_rest_colour(name), CARD_PULSE_MS, start=PULSE_COLOUR)
+
     def _set_drag_hover(self, name):
         drag = self._drag
         if drag is None or drag.get("hover") == name:
             return
         previous = drag.get("hover")
-        if previous and previous in (self.collection_cards or {}):
-            self.collection_cards[previous].configure(
-                fg_color=ACCENT_COLOR if self._view == previous else CARD_COLOR
-            )
-        if name and name in (self.collection_cards or {}):
-            self.collection_cards[name].configure(fg_color=ACCENT_ACTIVE)
+        if previous:
+            self._fade_card(previous, self._card_rest_colour(previous), DRAG_HOVER_MS)
+        if name:
+            self._fade_card(name, ACCENT_ACTIVE, DRAG_HOVER_MS)
         drag["hover"] = name
 
     def _drag_motion(self, event):
         drag = self._drag
         if drag is None:
             return
+        drag["px"], drag["py"] = event.x_root, event.y_root
         if not drag["active"]:
             moved = abs(event.x_root - drag["x"]) + abs(event.y_root - drag["y"])
             if moved < DRAG_THRESHOLD_PX:
                 return
             drag["active"] = True
-            drag["win"] = self._make_drag_preview(drag["path"])
-        win = drag.get("win")
-        if win is not None:
-            try:
-                win.geometry(f"+{event.x_root + 12}+{event.y_root + 12}")
-            except Exception:
-                pass
-        self._set_drag_hover(self._card_under_pointer(event.x_root, event.y_root))
+            self._dim_source(drag)
+            drag["ghost"] = self._make_ghost(drag)
+            if drag["ghost"] is not None:
+                _fine_timer(True)
+                drag["t"] = time.perf_counter()
+                self._drag_tick(drag)
+        self._set_drag_hover(self._drop_target(event.x_root, event.y_root))
 
-    def _make_drag_preview(self, path):
-        """A small translucent window that follows the pointer, so it is
-        obvious something is being carried."""
+    def _dim_source(self, drag):
+        """The photo's place in the grid dims while it is being carried, and
+        can fade out the rest of the way if it is moved away."""
+        label = drag["label"]
         try:
+            path, size, key = label.tile
+            tile = self._tile_pil(path, size, key in self._render_favs)
+            bg = Image.new("RGBA", size, _hex_rgb(BG_COLOR) + (255,))
+            drag["dim"] = [
+                ImageTk.PhotoImage(Image.blend(tile, bg, a)) for a in (0.62, 0.74, 0.85, 0.94, 1.0)
+            ]
+            label.dragging = True
+            label.configure(image=drag["dim"][0])
+        except Exception:
+            drag["dim"] = None
+
+    def _restore_source(self, drag):
+        label = drag["label"]
+        try:
+            label.dragging = False
+            label.configure(image=label.image)
+        except Exception:
+            pass
+
+    def _make_ghost(self, drag):
+        """The carried photo: a borderless window that starts exactly over
+        the tile, so lifting it reads as one object leaving the grid."""
+        label = drag["label"]
+        try:
+            tile_w, tile_h = label.winfo_width(), label.winfo_height()
+            x0, y0 = label.winfo_rootx(), label.winfo_rooty()
             win = tk.Toplevel(self.root)
             win.overrideredirect(True)
+            win.configure(bg=BG_COLOR)
             try:
-                win.attributes("-alpha", 0.85)
                 win.attributes("-topmost", True)
             except Exception:
                 pass
-            try:
-                photo = ImageTk.PhotoImage(self._thumb_image(path))
-                carried = tk.Label(win, image=photo, bd=0, highlightthickness=0)
-                carried.image = photo
-                carried.pack()
-            except Exception:
-                tk.Label(win, text="Moving photo...", padx=10, pady=6).pack()
-            return win
+            inner = tk.Label(win, bd=0, highlightthickness=0, bg=BG_COLOR)
+            inner.pack()
+            g = {
+                "win": win, "label": inner, "base": self._thumb_image(drag["path"]),
+                "w": max(8, tile_w), "h": max(8, tile_h), "size": None,
+                "cx": x0 + tile_w / 2, "cy": y0 + tile_h / 2, "scale": 1.0, "alpha": 1.0,
+            }
+            self._place_ghost(g)
+            win.update_idletasks()
+            _round_corners(win, border=SPLASH_ACCENT)
+            return g
         except Exception:
             return None
+
+    def _place_ghost(self, g):
+        w = max(8, round(g["w"] * g["scale"]))
+        h = max(8, round(g["h"] * g["scale"]))
+        if g["size"] != (w, h):
+            photo = ImageTk.PhotoImage(ImageOps.fit(g["base"], (w, h), Image.BILINEAR))
+            g["label"].configure(image=photo)
+            g["label"].image = photo
+            g["size"] = (w, h)
+        g["win"].geometry(f"{w}x{h}+{round(g['cx'] - w / 2)}+{round(g['cy'] - h / 2)}")
+        try:
+            g["win"].attributes("-alpha", max(0.0, min(1.0, g["alpha"])))
+        except Exception:
+            pass
+
+    def _drag_tick(self, drag):
+        """One frame of the carried photo easing after the pointer."""
+        drag["tick"] = None
+        g = drag.get("ghost")
+        if g is None or drag.get("released"):
+            return
+        now = time.perf_counter()
+        dt = max(1.0, (now - drag["t"]) * 1000.0)
+        drag["t"] = now
+        scale = DRAG_SCALE_OVER if drag.get("hover") else DRAG_SCALE
+        # The spot that was grabbed stays under the pointer as the card shrinks.
+        tx = drag["px"] + (0.5 - drag["fx"]) * g["w"] * scale
+        ty = drag["py"] + (0.5 - drag["fy"]) * g["h"] * scale
+        if self._motion_reduced():
+            kp = ks = 1.0
+        else:
+            kp = 1.0 - math.exp(-dt / DRAG_FOLLOW_TAU_MS)
+            ks = 1.0 - math.exp(-dt / DRAG_SETTLE_TAU_MS)
+        g["cx"] += (tx - g["cx"]) * kp
+        g["cy"] += (ty - g["cy"]) * kp
+        g["scale"] += (scale - g["scale"]) * ks
+        g["alpha"] += (DRAG_ALPHA - g["alpha"]) * ks
+        try:
+            self._place_ghost(g)
+        except tk.TclError:
+            return
+        drag["tick"] = self.root.after(FRAME_MS, lambda: self._drag_tick(drag))
 
     def _drag_release(self, event):
         drag = self._drag
         self._drag = None
         if drag is None:
             return
-        win = drag.get("win")
-        if win is not None:
+        drag["released"] = True
+        if drag.get("tick") is not None:
             try:
-                win.destroy()
+                self.root.after_cancel(drag["tick"])
             except Exception:
                 pass
-        hover = drag.get("hover")
-        if hover and hover in (self.collection_cards or {}):
-            self.collection_cards[hover].configure(
-                fg_color=ACCENT_COLOR if self._view == hover else CARD_COLOR
-            )
         if not drag["active"]:
             return  # a plain click, not a drag
-        target = self._card_under_pointer(event.x_root, event.y_root)
+        target = self._drop_target(event.x_root, event.y_root)
+        hover = drag.get("hover")
+        if hover and hover != target:
+            self._fade_card(hover, self._card_rest_colour(hover), DRAG_HOVER_MS)
         if target:
-            self._add_to_collection(target, drag["path"], drag["meta"])
+            self._fly_into(drag, target)
+        else:
+            self._fly_back(drag)
 
-    def _render_results(self, results):
+    def _end_ghost(self, drag):
+        g = drag.get("ghost")
+        drag["ghost"] = None
+        if g is not None:
+            try:
+                g["win"].destroy()
+            except Exception:
+                pass
+            _fine_timer(False)
+
+    def _fly_into(self, drag, target):
+        g = drag.get("ghost")
+        moving = self._view in self._collection_names() and self._view != target
+        source = self._view
+
+        def land():
+            self._end_ghost(drag)
+            if moving:
+                self._move_to_collection(source, target, drag["path"], drag["meta"])
+            else:
+                self._restore_source(drag)
+                self._add_to_collection(target, drag["path"], drag["meta"])
+            self._pulse_card(target)
+
+        card = (self.collection_cards or {}).get(target)
+        if g is None or card is None:
+            land()
+            return
+        try:
+            ex = card.winfo_rootx() + card.winfo_width() / 2
+            ey = card.winfo_rooty() + card.winfo_height() / 2
+        except tk.TclError:
+            land()
+            return
+        x0, y0, s0, a0 = g["cx"], g["cy"], g["scale"], g["alpha"]
+        dim = drag.get("dim") if moving else None
+
+        def step(p):
+            g["cx"] = x0 + (ex - x0) * p
+            g["cy"] = y0 + (ey - y0) * p
+            g["scale"] = s0 + (0.14 - s0) * p
+            g["alpha"] = a0 * (1.0 - p ** 3)  # stays visible most of the way in
+            self._place_ghost(g)
+            if dim:  # the photo's old place in the grid fades out alongside
+                try:
+                    drag["label"].configure(image=dim[min(len(dim) - 1, int(p * len(dim)))])
+                except Exception:
+                    pass
+
+        ms = 0 if self._motion_reduced() else DROP_FLY_MS
+        _animate(self.root, ms, step, land, ease=EASE_IN_OUT)
+
+    def _fly_back(self, drag):
+        g = drag.get("ghost")
+
+        def home():
+            self._end_ghost(drag)
+            self._restore_source(drag)
+
+        if g is None:
+            home()
+            return
+        label = drag["label"]
+        try:
+            hx = label.winfo_rootx() + label.winfo_width() / 2
+            hy = label.winfo_rooty() + label.winfo_height() / 2
+        except tk.TclError:
+            home()
+            return
+        x0, y0, s0, a0 = g["cx"], g["cy"], g["scale"], g["alpha"]
+
+        def step(p):
+            g["cx"] = x0 + (hx - x0) * p
+            g["cy"] = y0 + (hy - y0) * p
+            g["scale"] = s0 + (1.0 - s0) * p
+            g["alpha"] = a0 + (1.0 - a0) * p
+            self._place_ghost(g)
+
+        ms = 0 if self._motion_reduced() else DROP_BACK_MS
+        _animate(self.root, ms, step, home, ease=EASE_OUT)
+
+    def _move_to_collection(self, source, target, path, meta):
+        """Moves a photo out of one collection and into another."""
+        item_id = (meta or {}).get("item_id")
+        if not item_id:
+            self.status_var.set("Only photos from the shared drive can be collected.")
+            return
+        by_id = self._collection_ids()
+        source_ids = by_id.get(source) or []
+        target_ids = by_id.setdefault(target, [])
+        already = item_id in target_ids
+        if item_id in source_ids:
+            source_ids.remove(item_id)
+        if not already:
+            target_ids.append(item_id)
+        if not self._write_collection_ids(by_id):
+            return
+        self._collections = self._load_collections()
+        self._rebuild_collection_cards()
+        if self._view == source:
+            remaining = [r for r in self._last_results
+                         if ((r[2] or {}).get("item_id") if r[2] else None) != item_id]
+            self._render_results(remaining, keep_scroll=True)
+        note = f" (it was already in {target})" if already else ""
+        self.status_var.set(
+            f"Moved to {target}{note}. {len(source_ids)} photo(s) left in {source}."
+        )
+
+    def _scroll_results_to_top(self):
+        """A new set of results starts at the top. Without this, switching
+        from a long view (scrolled down) to a short one kept the old scroll
+        position - below the end of the new content, so it looked empty."""
+        try:
+            self.results_frame._parent_canvas.yview_moveto(0)
+        except Exception:
+            pass
+
+    def _render_results(self, results, keep_scroll=False):
         self._last_results = results
+        self._restore_scroll = None
+        if keep_scroll:
+            try:
+                self._restore_scroll = self.results_frame._parent_canvas.yview()[0]
+            except Exception:
+                pass
         # A fill from the previous render may still be in flight.
         if self._render_after_id is not None:
             try:
@@ -3265,45 +3854,97 @@ class ImageSearchApp:
             self._render_after_id = None
         for child in self.results_frame.winfo_children():
             child.destroy()
+        if self._restore_scroll is None:
+            self._scroll_results_to_top()
         self.thumbnail_refs.clear()
         # Read once per render, not once per photo: it is a file on disk.
         self._render_favs = set(self._own_favourites())
         # Measured now rather than trusting the last resize event, so the
         # first layout after startup already has the right column count.
         self._current_columns = self._desired_columns()
-        self._render_chunk(results, 0, max(1, self._current_columns))
+        avail = max(320, self._current_columns - 2 * GRID_SIDE_PAD - 4)
+        self._render_chunk(results, 0, avail)
 
-    def _render_chunk(self, results, start, columns):
-        """Builds one screenful of results, then yields to the event loop
-        before the next.
+    def _render_chunk(self, results, start, avail):
+        """Builds a few rows of results, then yields to the event loop
+        before the next, so the first rows appear at once.
 
-        Each result is three plain Tk widgets. They used to be five
-        CustomTkinter widgets, each drawing its own canvas and registering
-        with CustomTkinter's theme and scaling trackers - about 33ms per
-        photo, so 120 photos took four seconds to appear. Plain widgets in
-        the same colours take a fraction of a millisecond each, and the star
-        is drawn into the thumbnail rather than placed on top of it.
+        Rows are justified: photos are added at ROW_HEIGHT until the row
+        reaches the available width, then the row is scaled to end exactly
+        at the right edge. Each photo is one plain Tk label (CustomTkinter
+        widgets cost ~33ms each); the star and the rounded corners are
+        drawn into the image itself.
         """
         self._render_after_id = None
-        end = min(start + RENDER_CHUNK, len(results))
+        n = len(results)
+        idx = start
+        rows = 0
+        while idx < n and rows < ROWS_PER_CHUNK:
+            items = []
+            total_aspect = 0.0
+            full = False
+            while idx < n:
+                path, _score, meta = results[idx]
+                idx += 1
+                try:
+                    img = self._thumb_image(path)
+                except Exception:
+                    continue
+                aspect = min(3.0, max(0.4, img.width / max(1, img.height)))
+                items.append((path, meta, aspect))
+                total_aspect += aspect
+                if total_aspect * ROW_HEIGHT + TILE_GAP * (len(items) - 1) >= avail:
+                    full = True
+                    break
+            if not items:
+                break
+            gaps = TILE_GAP * (len(items) - 1)
+            if full:
+                height = max(40, round((avail - gaps) / total_aspect))
+                widths = [max(24, round(a * height)) for _p, _m, a in items]
+                widths[-1] += (avail - gaps) - sum(widths)  # land exactly on the edge
+                widths[-1] = max(24, widths[-1])
+            else:
+                height = ROW_HEIGHT
+                widths = [max(24, round(a * height)) for _p, _m, a in items]
+            self._build_row(items, widths, height)
+            rows += 1
 
-        for idx in range(start, end):
-            path, _score, meta = results[idx]
-            key = self._fav_key(path, meta)
+        if getattr(self, "_restore_scroll", None) is not None:
             try:
-                photo = self._thumb_photo(path, key in self._render_favs)
+                self.root.update_idletasks()
+                self.results_frame._parent_canvas.yview_moveto(self._restore_scroll)
+            except Exception:
+                pass
+            if idx >= n:
+                self._restore_scroll = None
+
+        if idx < n:
+            self._render_after_id = self.root.after(
+                1, lambda: self._render_chunk(results, idx, avail)
+            )
+        elif self._render_done_callback is not None:
+            callback, self._render_done_callback = self._render_done_callback, None
+            callback()
+
+    def _build_row(self, items, widths, height):
+        row = tk.Frame(self.results_frame, bg=BG_COLOR, bd=0, highlightthickness=0)
+        row.pack(anchor="w", padx=(GRID_SIDE_PAD, 0), pady=(0, TILE_GAP))
+        for i, ((path, meta, _a), w) in enumerate(zip(items, widths)):
+            key = self._fav_key(path, meta)
+            size = (w, height)
+            try:
+                photo = self._tile_photo(path, size, key in self._render_favs)
             except Exception:
                 continue
-            row, col = divmod(idx, columns)
-            cell = tk.Frame(self.results_frame, bg=BG_COLOR, bd=0, highlightthickness=0)
-            cell.grid(row=row, column=col, sticky="n", padx=4, pady=4)
-
             label = tk.Label(
-                cell, image=photo, bd=0, highlightthickness=0, padx=0, pady=0,
+                row, image=photo, bd=0, highlightthickness=0, padx=0, pady=0,
                 bg=BG_COLOR, cursor="hand2",
             )
             label.image = photo  # a PhotoImage only lives while something refers to it
-            label.pack()
+            label.hover_image = None
+            label.tile = (path, size, key)
+            label.pack(side=tk.LEFT, padx=(0 if i == 0 else TILE_GAP, 0))
             # Double-click previews in-app; the original is one click away
             # from inside the preview. A click on the star toggles it.
             label.bind("<Double-Button-1>", lambda e, p=path, m=meta: self._on_thumb_double(e, p, m))
@@ -3314,32 +3955,19 @@ class ImageSearchApp:
                 "<ButtonRelease-1>",
                 lambda e, k=key, p=path, m=meta: self._on_thumb_release(e, k, p, m),
             )
-
-            # The SharePoint filename is almost always a camera default
-            # (DSC05540.jpg), so the folder is the only human-meaningful
-            # label a result can carry - show it when we know it.
-            folder = (meta or {}).get("folder") if meta else None
-            caption = folder if folder else os.path.basename(path)
-            tk.Label(
-                cell, text=caption, justify=tk.CENTER, wraplength=THUMB_SIZE[0],
-                fg=MUTED_TEXT_COLOR, bg=BG_COLOR, font=CAPTION_FONT, bd=0,
-            ).pack(pady=(4, 4))
-
-        if end < len(results):
-            self._render_after_id = self.root.after(
-                1, lambda: self._render_chunk(results, end, columns)
-            )
-        elif self._render_done_callback is not None:
-            callback, self._render_done_callback = self._render_done_callback, None
-            callback()
+            label.bind("<Enter>", lambda e: self._tile_hover(e.widget, True))
+            label.bind("<Leave>", lambda e: self._tile_hover(e.widget, False))
 
     def _on_star_clicked(self, key, path, meta, widget):
         added = self._toggle_favourite(key, path, meta)
         (self._render_favs.add if added else self._render_favs.discard)(key)
         try:
-            photo = self._thumb_photo(path, added)
-            widget.configure(image=photo)
-            widget.image = photo
+            _p, size, _k = widget.tile
+            widget.image = self._tile_photo(path, size, added)
+            # The pointer is still on the photo, so an un-starred photo
+            # keeps showing the outline star until the pointer leaves.
+            widget.hover_image = None if added else self._tile_photo(path, size, False, hover=True)
+            widget.configure(image=widget.image if added else widget.hover_image)
         except Exception:
             pass
         # Un-starring while viewing favourites should drop it from the list.
@@ -3348,11 +3976,11 @@ class ImageSearchApp:
 
 # ---------- startup: splash and reveal ----------
 
-SPLASH_BG = "#0d1b2a"  # the window's own background, so the handover is seamless
-SPLASH_TRACK = "#1c2c3f"
-SPLASH_ACCENT = "#3d7bff"  # the icon's blue, lifted to read on the dark card
-SPLASH_FAINT = "#4f6377"
-SPLASH_BORDER = "#22344a"
+SPLASH_BG = "#0a0a0a"  # the window's own background, so the handover is seamless
+SPLASH_TRACK = "#262626"
+SPLASH_ACCENT = "#e5e5e5"  # a soft white, matching the neutral palette
+SPLASH_FAINT = "#737373"
+SPLASH_BORDER = "#262626"
 FRAME_MS = 8
 
 
@@ -3578,10 +4206,10 @@ class BootSplash:
             self._shield_frames = []
 
         title = c.create_text(w // 2, 160, text="Image Search", fill=SPLASH_BG,
-                              font=("Segoe UI Semibold", -26))
+                              font=(UI_FONT_SEMIBOLD, -26))
         self._entrance.append((90, lambda q: self._fade_text(title, TEXT_COLOR, w // 2, 160, q)))
         subtitle = c.create_text(w // 2, 190, text="Marketing photo library", fill=SPLASH_BG,
-                                 font=("Segoe UI", -14))
+                                 font=(UI_FONT, -14))
         self._entrance.append(
             (130, lambda q: self._fade_text(subtitle, MUTED_TEXT_COLOR, w // 2, 190, q))
         )
@@ -3610,14 +4238,14 @@ class BootSplash:
 
         self._status_xy = (w // 2, 252)
         self._status = c.create_text(*self._status_xy, text="Starting…", fill=SPLASH_BG,
-                                     font=("Segoe UI", -12))
+                                     font=(UI_FONT, -12))
         self._entrance.append(
             (200, lambda q: self._fade_text(self._status, MUTED_TEXT_COLOR, *self._status_xy, q))
         )
         stamp = _build_stamp()
         if stamp:
             version = c.create_text(w - 16, h - 12, text=f"version {stamp}", anchor="se",
-                                    fill=SPLASH_BG, font=("Segoe UI", -11))
+                                    fill=SPLASH_BG, font=(UI_FONT, -11))
             self._entrance.append(
                 (240, lambda q: c.itemconfigure(version, fill=_mix(SPLASH_BG, SPLASH_FAINT, q)))
             )
@@ -3939,6 +4567,17 @@ def main():
     except Exception:
         pass
     ctk.set_appearance_mode("dark")
+    # One typeface throughout. CustomTkinter defaults to Roboto, which mixed
+    # with the Segoe UI used for headings made the window look assembled.
+    try:
+        font_theme = ctk.ThemeManager.theme["CTkFont"]
+        if "family" in font_theme:
+            font_theme["family"] = UI_FONT
+        for platform_font in font_theme.values():
+            if isinstance(platform_font, dict) and "family" in platform_font:
+                platform_font["family"] = UI_FONT
+    except Exception:
+        pass
     # CustomTkinter re-scales every widget when the window moves to a monitor
     # with a different display scaling, which on a multi-monitor desk means
     # the whole grid is rebuilt mid-drag and the window judders. The app is
@@ -3947,7 +4586,18 @@ def main():
         ctk.deactivate_automatic_dpi_awareness()
     except Exception:
         pass
+    _register_bundled_fonts()
     root = ctk.CTk()
+    _choose_ui_fonts(root)
+    try:
+        font_theme = ctk.ThemeManager.theme["CTkFont"]
+        if "family" in font_theme:
+            font_theme["family"] = UI_FONT
+        for platform_font in font_theme.values():
+            if isinstance(platform_font, dict) and "family" in platform_font:
+                platform_font["family"] = UI_FONT
+    except Exception:
+        pass
     # Hidden and fully transparent until BootSequence reveals it: the window
     # is built and laid out out of sight, so it never appears half-made.
     try:
