@@ -13,11 +13,16 @@ import config
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SCOPES = ["Sites.Read.All", "Files.ReadWrite.All"]
+# Asked for separately, only when someone sends a support message, so the
+# normal sign-in never needs this permission.
+MAIL_SCOPES = ["Mail.Send"]
 INDEX_FILENAME = ".imagesearch_sp_index.json"
 # Each machine writes its own feedback file rather than all sharing one, so
 # concurrent users can never overwrite each other's contributions.
 FEEDBACK_PREFIX = ".imagesearch_feedback_"
 FAVOURITES_PREFIX = ".imagesearch_favourites_"
+# One file per shared collection: who owns it, who it is shared with, its photos.
+SHARED_COLLECTION_PREFIX = ".imagesearch_collection_"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 # Payloads at/above this go through a resumable upload session rather than a
 # simple PUT. Graph's chunked uploads require each chunk (except the last) to
@@ -76,6 +81,53 @@ class SharePointClient:
             raise RuntimeError(error)
         self._token = result["access_token"]
         self._save_cache()
+
+    def sign_in_silent(self):
+        """Signs in from the saved session only - never opens a browser.
+        For checks that run on their own in the background."""
+        accounts = self._app.get_accounts()
+        if not accounts:
+            return False
+        result = self._app.acquire_token_silent(SCOPES, account=accounts[0])
+        if not result or "access_token" not in result:
+            return False
+        self._token = result["access_token"]
+        self._save_cache()
+        return True
+
+    def send_mail(self, to, subject, body):
+        """Sends an email from the signed-in user's own mailbox (it appears
+        in their Sent Items). The first time, Microsoft may ask them to
+        allow the app to send mail on their behalf."""
+        accounts = self._app.get_accounts()
+        result = None
+        if accounts:
+            result = self._app.acquire_token_silent(MAIL_SCOPES, account=accounts[0])
+        if not result:
+            result = self._app.acquire_token_interactive(scopes=MAIL_SCOPES)
+        if not result or "access_token" not in result:
+            raise RuntimeError((result or {}).get("error_description", "Not allowed to send mail."))
+        self._save_cache()
+        resp = requests.post(
+            f"{GRAPH_BASE}/me/sendMail",
+            headers={"Authorization": f"Bearer {result['access_token']}",
+                     "Content-Type": "application/json"},
+            json={
+                "message": {
+                    "subject": subject,
+                    "body": {"contentType": "Text", "content": body},
+                    "toRecipients": [{"emailAddress": {"address": to}}],
+                },
+                "saveToSentItems": True,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+    def account_email(self):
+        """The signed-in user's address (their Microsoft sign-in name)."""
+        accounts = self._app.get_accounts()
+        return (accounts[0].get("username") or "").strip().lower() if accounts else ""
 
     def _headers(self):
         # Access tokens expire after ~60-90 minutes; a full indexing run (or
@@ -243,6 +295,121 @@ class SharePointClient:
         resp = requests.get(download_url, timeout=60)
         resp.raise_for_status()
         return resp.json()
+
+    def delete_file(self, folder_item_id, filename):
+        """Deletes a file from a folder (to the site's recycle bin). A file
+        that is already gone counts as deleted."""
+        self._resolve_site_and_drive()
+        url = f"{GRAPH_BASE}/drives/{self._drive_id}/items/{folder_item_id}:/{filename}"
+        resp = requests.delete(url, headers=self._headers(), timeout=30)
+        if resp.status_code not in (204, 404):
+            resp.raise_for_status()
+
+    # ----- files on another site, by path (the releases folder) -----
+
+    def _drive_for_site(self, site_path):
+        cache = self.__dict__.setdefault("_site_drives", {})
+        if site_path not in cache:
+            site = self._get(f"{GRAPH_BASE}/sites/{config.SHAREPOINT_HOSTNAME}:{site_path}")
+            cache[site_path] = self._get(f"{GRAPH_BASE}/sites/{site['id']}/drive")["id"]
+        return cache[site_path]
+
+    def download_bytes_by_path(self, site_path, file_path):
+        """A file's contents by its path on a site, or None if it isn't there."""
+        drive = self._drive_for_site(site_path)
+        url = f"{GRAPH_BASE}/drives/{drive}/root:/{urllib.parse.quote(file_path)}"
+        try:
+            entry = self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
+        download_url = entry.get("@microsoft.graph.downloadUrl")
+        if not download_url:
+            detail = self._get(f"{GRAPH_BASE}/drives/{drive}/items/{entry['id']}")
+            download_url = detail["@microsoft.graph.downloadUrl"]
+        resp = requests.get(download_url, timeout=120)
+        resp.raise_for_status()
+        return resp.content
+
+    def ensure_folder(self, site_path, folder_path):
+        """Creates a folder path on a site, one level at a time, if missing."""
+        drive = self._drive_for_site(site_path)
+        built = ""
+        for part in [p for p in folder_path.split("/") if p]:
+            parent = built
+            built = f"{built}/{part}" if built else part
+            try:
+                self._get(f"{GRAPH_BASE}/drives/{drive}/root:/{urllib.parse.quote(built)}")
+                continue
+            except requests.exceptions.HTTPError as exc:
+                if exc.response is None or exc.response.status_code != 404:
+                    raise
+            parent_url = (
+                f"{GRAPH_BASE}/drives/{drive}/root:/{urllib.parse.quote(parent)}:/children"
+                if parent else f"{GRAPH_BASE}/drives/{drive}/root/children"
+            )
+            resp = requests.post(
+                parent_url,
+                headers={**self._headers(), "Content-Type": "application/json"},
+                json={"name": part, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"},
+                timeout=30,
+            )
+            if resp.status_code != 409:  # created by someone else meanwhile is fine
+                resp.raise_for_status()
+
+    def list_names_by_path(self, site_path, folder_path, prefix=""):
+        """Names of the .json files in a folder on a site that start with
+        `prefix` - an empty list if the folder doesn't exist yet."""
+        drive = self._drive_for_site(site_path)
+        url = f"{GRAPH_BASE}/drives/{drive}/root:/{urllib.parse.quote(folder_path)}:/children"
+        names = []
+        while url:
+            try:
+                data = self._get(url)
+            except requests.exceptions.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    return []
+                raise
+            for child in data.get("value", []):
+                name = child.get("name", "")
+                if name.startswith(prefix) and name.endswith(".json"):
+                    names.append(name)
+            url = data.get("@odata.nextLink")
+        return names
+
+    def delete_by_path(self, site_path, file_path):
+        """Deletes a file on a site (to its recycle bin); already gone is fine."""
+        drive = self._drive_for_site(site_path)
+        url = f"{GRAPH_BASE}/drives/{drive}/root:/{urllib.parse.quote(file_path)}"
+        resp = requests.delete(url, headers=self._headers(), timeout=30)
+        if resp.status_code not in (204, 404):
+            resp.raise_for_status()
+
+    def upload_bytes_by_path(self, site_path, folder_path, filename, payload):
+        """Uploads (creates/overwrites) a file of any size into a folder on a site."""
+        drive = self._drive_for_site(site_path)
+        target = urllib.parse.quote(f"{folder_path}/{filename}")
+        resp = requests.post(
+            f"{GRAPH_BASE}/drives/{drive}/root:/{target}:/createUploadSession",
+            headers={**self._headers(), "Content-Type": "application/json"},
+            json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        upload_url = resp.json()["uploadUrl"]
+        total = len(payload)
+        start = 0
+        while start < total:
+            end = min(start + UPLOAD_CHUNK_SIZE, total) - 1
+            chunk_resp = requests.put(
+                upload_url,
+                headers={"Content-Range": f"bytes {start}-{end}/{total}"},
+                data=payload[start:end + 1],
+                timeout=120,
+            )
+            chunk_resp.raise_for_status()
+            start = end + 1
 
     def download_index_file(self, folder_item_id):
         """Returns the parsed shared index dict for a folder, or None."""

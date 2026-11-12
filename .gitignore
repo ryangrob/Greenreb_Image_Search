@@ -20,3 +20,6 @@ __pycache__/
 
 # Packaged builds staged for GitHub Releases (uploaded via gh release, not committed)
 /release_upload/
+
+# Update packages built by make_update.py (published to SharePoint, not committed)
+/dist_update/

@@ -1,5 +1,5 @@
 @echo off
-REM Run this ONCE. It puts an "Image Search" icon on your Desktop that
+REM Run this ONCE. It puts a "Topshot" icon on your Desktop that
 REM launches the app directly - no console window, no typing.
 setlocal
 cd /d "%~dp0"
@@ -19,17 +19,17 @@ if not defined PYW (
 echo Using %PYW%
 powershell -NoProfile -Command ^
   "$d=[Environment]::GetFolderPath('Desktop');" ^
-  "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($d+'\Image Search.lnk');" ^
+  "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($d+'\Topshot.lnk');" ^
   "$s.TargetPath='%PYW%';" ^
   "$s.Arguments='\"%~dp0tkinter_app.py\"';" ^
   "$s.WorkingDirectory='%~dp0.';" ^
   "$s.IconLocation='%~dp0assets\app_icon.ico';" ^
-  "$s.Description='Greenreb Image Search';" ^
+  "$s.Description='Topshot';" ^
   "$s.Save();" ^
-  "Write-Host ('Created: ' + $d + '\Image Search.lnk')"
+  "Write-Host ('Created: ' + $d + '\Topshot.lnk')"
 
 echo.
-echo Done. "Image Search" is on your Desktop.
+echo Done. "Topshot" is on your Desktop.
 echo Right-click it and choose "Pin to taskbar" if you want it there too.
 echo.
 pause

@@ -11,6 +11,7 @@ import concurrent.futures
 import datetime
 import glob
 import hashlib
+import io
 import json
 import math
 import os
@@ -24,6 +25,9 @@ import threading
 import time
 import traceback
 import unicodedata
+import urllib.parse
+import uuid
+import zipfile
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
@@ -55,6 +59,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageTk
 _T_PIL = time.perf_counter()
 
 from search_engine import ImageSearchEngine, MODEL_TAG
+from app_version import APP_AUTHOR, APP_MODULES, APP_NAME, APP_VERSION, RUNTIME_VERSION, version_tuple
 _T_ENGINE = time.perf_counter()
 _SHAREPOINT = None
 
@@ -234,6 +239,15 @@ LEGACY_COLLECTIONS = {"Family": "Family & Kids", "Kids": "Family & Kids"}
 # How far the pointer has to move with the button held before it counts as a
 # drag rather than a click, so double-clicking a photo still opens it.
 DRAG_THRESHOLD_PX = 8
+# Shared collections are re-read from SharePoint this often while the app
+# is open (and on start, and when Sync is clicked).
+SHARED_SYNC_MS = 10 * 60 * 1000
+# How often an open app looks for a newer version (also on every start).
+UPDATE_CHECK_MS = 4 * 60 * 60 * 1000
+# What an update package may contain. Anything else means the package is
+# not one of ours, and it is refused.
+UPDATE_FILE_TYPES = {".py", ".ttf", ".css", ".txt", ".json", ".png", ".ico"}
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # Drag and drop motion. The carried photo eases towards where it should be
 # every frame (an exponential approach: reads as ease-out, and retargets
 # smoothly when the pointer changes its mind) instead of jumping.
@@ -271,19 +285,20 @@ OBJECT_PROMPTS = [
 ]
 DEFAULT_TOP_K = 150
 
-BG_COLOR = "#0a0a0a"
-CARD_COLOR = "#171717"
-ACCENT_COLOR = "#262626"
-ACCENT_ACTIVE = "#333333"
-FIELD_BG = "#171717"
+BG_COLOR = "#090b0a"
+CARD_COLOR = "#141917"
+ACCENT_COLOR = "#1d2621"
+ACCENT_ACTIVE = "#1b4a37"
+FIELD_BG = "#141917"
 TEXT_COLOR = "#fafafa"
-MUTED_TEXT_COLOR = "#a3a3a3"
+MUTED_TEXT_COLOR = "#9ca8a2"
 
 CARD_RADIUS = 14
 
-# The look follows the Topgolf Sales Cockpit: near-black page, a slightly
-# lighter full-height sidebar, #171717 cards with #262626 hairlines, white
-# text, and no brand blue - the colour on screen comes from the photos.
+# Topshot's look: the layout of the Topgolf Sales Cockpit (near-black page,
+# a slightly lighter full-height sidebar, cards with hairline borders, white
+# text) tinted with the greens of the app icon. One green does the
+# emphasis: the Search button, the selected item, focus and progress.
 # Inter (bundled in assets/fonts, loaded for this process only - nothing is
 # installed on the machine). Falls back to Segoe UI if the files are missing.
 UI_FONT = "Segoe UI"
@@ -336,21 +351,22 @@ def _font(size, weight="regular"):
     }[weight]
     bold = weight == "bold" or (weight != "regular" and family == UI_FONT)
     return ctk.CTkFont(family=family, size=size, weight="bold" if bold else "normal")
-SURFACE = "#171717"
-SURFACE_HOVER = "#222222"
-BORDER = "#262626"
+SURFACE = "#141917"
+SURFACE_HOVER = "#1c2420"
+BORDER = "#24302a"
 TEXT_SOFT = "#e5e5e5"
-FAINT_TEXT = "#737373"
-SIDEBAR_BG = "#141414"
+FAINT_TEXT = "#6b7a72"
+SIDEBAR_BG = "#0f1311"
 NAV_BG = SIDEBAR_BG
-PRIMARY_TEXT = "#0a0a0a"
-FOCUS_BORDER = "#525252"
-PULSE_COLOUR = "#404040"
-SOURCE_DOT = "#22c55e"
-NAV_HOVER = "#1f1f1f"
-NAV_SELECTED = "#262626"
-PRIMARY = "#fafafa"
-PRIMARY_HOVER = "#d4d4d4"
+PRIMARY_TEXT = "#ffffff"
+FOCUS_BORDER = "#10a573"
+PULSE_COLOUR = "#1f6b4c"
+SOURCE_DOT = "#34d399"
+NAV_HOVER = "#17201b"
+NAV_SELECTED = "#123628"
+SYSTEM_TEXT = "#84928b"  # System items sit back from the rest of the sidebar
+PRIMARY = "#10a573"
+PRIMARY_HOVER = "#14c088"
 
 # Segoe MDL2 Assets ships with Windows 10 and 11; the glyphs are drawn into
 # images so they sit beside Segoe UI text at any size. Without the font the
@@ -359,6 +375,9 @@ _ICON_GLYPHS = {
     "photos": "\uE91B", "star": "\uE734", "history": "\uE81C", "folder": "\uE8B7",
     "search": "\uE721", "refresh": "\uE72C", "settings": "\uE713", "add": "\uE710",
     "similar": "\uE8B9", "open": "\uE838",
+    "shared": "\uE716", "update": "\uE896", "sync": "\uE72C", "info": "\uE946",
+    "support": "\uE897", "local": "\uEDA2",
+    "back": "\uE72B", "next": "\uE72A", "done": "\uE73E",
 }
 _icon_cache = {}
 # The same outline icon set as the Sales Cockpit (Lucide), from the bundled
@@ -367,6 +386,9 @@ _LUCIDE_NAMES = {
     "photos": "images", "star": "star", "history": "history", "folder": "folder",
     "search": "search", "refresh": "refresh-cw", "settings": "settings", "add": "plus",
     "similar": "scan-search", "open": "folder-open", "index": "database",
+    "shared": "users", "update": "download", "sync": "refresh-cw", "info": "info",
+    "support": "life-buoy", "local": "hard-drive",
+    "back": "arrow-left", "next": "arrow-right", "done": "check",
 }
 _lucide_codes = None
 
@@ -385,6 +407,17 @@ def _lucide_glyph(name):
         except Exception:
             pass
     return _lucide_codes.get(_LUCIDE_NAMES.get(name, name))
+
+
+_icon_pil_cache = {}
+
+
+def _icon_tk(name, size=16, colour=None):
+    """The same icon as a plain Tk image, or None."""
+    if _icon(name, size, colour) is None:
+        return None
+    small = _icon_pil_cache.get((name, size, colour))
+    return ImageTk.PhotoImage(small) if small is not None else None
 
 
 def _icon(name, size=16, colour=None):
@@ -411,6 +444,7 @@ def _icon(name, size=16, colour=None):
             glyph, font=font, fill=_hex_rgb(colour or TEXT_SOFT) + (255,),
         )
         small = canvas.resize((size, size), Image.LANCZOS)
+        _icon_pil_cache[key] = small
         image = ctk.CTkImage(light_image=small, dark_image=small, size=(size, size))
     except Exception:
         image = None
@@ -439,11 +473,25 @@ def _build_stamp():
 def _resource_path(*parts):
     # PyInstaller (--onedir) unpacks bundled data next to the exe under
     # sys._MEIPASS; running from source, it's just this file's folder.
-    base = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, *parts)
+    # A downloaded update runs from its own folder and brings its own
+    # assets, so this file's folder comes first in every case.
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), *parts)
+    if os.path.exists(here) or not getattr(sys, "frozen", False):
+        return here
+    return os.path.join(sys._MEIPASS, *parts)
 
 
 def _load_mark(height):
+    """The app's mark, `height` px tall: the Topshot icon when it is there,
+    otherwise the shield cut from the old logo."""
+    mark = _resource_path("assets", "topshot_mark.png")
+    if os.path.exists(mark):
+        with Image.open(mark) as img:
+            return img.convert("RGBA").resize((height, height), Image.LANCZOS)
+    return _load_shield(height)
+
+
+def _load_shield(height):
     """The Topgolf shield on its own, as an RGBA image `height` px tall.
 
     logo.png is the full lockup - the shield above the TOPGOLF wordmark -
@@ -575,8 +623,8 @@ def _make_button(parent, text, command, width=140):
         width=width,
         height=34,
         corner_radius=8,
-        fg_color="#262626",
-        hover_color="#333333",
+        fg_color="#1d2621",
+        hover_color="#2a3830",
         text_color_disabled=FAINT_TEXT,
         text_color=TEXT_COLOR,
         font=_font(13, "medium"),
@@ -588,7 +636,7 @@ def _make_primary_button(parent, text, command, width=96):
     return ctk.CTkButton(
         parent, text=text, command=command, width=width, height=36, corner_radius=8,
         fg_color=PRIMARY, hover_color=PRIMARY_HOVER, text_color=PRIMARY_TEXT,
-        text_color_disabled="#737373", font=_font(13, "semibold"),
+        text_color_disabled="#a7d8c4", font=_font(13, "semibold"),
     )
 
 
@@ -643,7 +691,7 @@ def _draw_star_badge(filled):
 class ImageSearchApp:
     def __init__(self, root, boot=None):
         self.root = root
-        self.root.title("Greenreb Image Search")
+        self.root.title(APP_NAME)
         self.root.geometry("1180x760")
         self.root.minsize(1000, 560)
         # Opens filling the screen: more of the grid is visible at once, and
@@ -665,6 +713,12 @@ class ImageSearchApp:
         self.thumbnail_refs = []  # keep CTkImage refs alive
         self._thumb_cache = {}  # path -> decoded PIL thumbnail, see _thumb_image
         self._badges = None
+        self._shared = None            # shared collections, see _shared_state
+        self._shared_syncing = False
+        self._shared_lock = threading.Lock()  # one SharePoint write at a time
+        self._sp_root_id = None
+        self._update_checking = False
+        self._update_ready = None      # version downloaded and waiting for a restart
         self._tile_corners = None
         self._render_favs = set()
         self._last_query = ""
@@ -725,7 +779,7 @@ class ImageSearchApp:
         names = ctk.CTkFrame(brand, fg_color="transparent")
         names.pack(side=tk.LEFT, padx=(10, 0))
         ctk.CTkLabel(
-            names, text="Image Search", font=_font(14, "semibold"), text_color=TEXT_COLOR,
+            names, text=APP_NAME, font=_font(14, "semibold"), text_color=TEXT_COLOR,
             height=18, anchor="w",
         ).pack(anchor="w")
         ctk.CTkLabel(
@@ -745,9 +799,19 @@ class ImageSearchApp:
         # grow without pushing it off the window.
         footer = ctk.CTkFrame(nav, fg_color="transparent")
         footer.pack(side=tk.BOTTOM, fill=tk.X)
-        ctk.CTkFrame(footer, fg_color=BORDER, height=1, corner_radius=0).pack(
-            fill=tk.X, pady=(0, 10)
+        # Shown only when a newer version is ready (see _show_update_notice).
+        self.update_row = ctk.CTkFrame(footer, fg_color="transparent")
+        self.update_label = ctk.CTkLabel(
+            self.update_row, text="", font=_font(12, "medium"), text_color=TEXT_COLOR,
+            anchor="w", justify="left", wraplength=200,
         )
+        self.update_label.pack(fill=tk.X, padx=10)
+        self.update_button = _make_primary_button(
+            self.update_row, "Restart to update", self._restart_app, width=200
+        )
+        self.update_button.configure(height=32)
+        self._footer_divider = ctk.CTkFrame(footer, fg_color=BORDER, height=1, corner_radius=0)
+        self._footer_divider.pack(fill=tk.X, pady=(0, 10))
         source = ctk.CTkFrame(footer, fg_color="transparent")
         source.pack(fill=tk.X, padx=10)
         ctk.CTkLabel(
@@ -758,25 +822,34 @@ class ImageSearchApp:
             source, textvariable=self.folder_var, text_color=MUTED_TEXT_COLOR, font=_font(12),
             justify="left", anchor="w", wraplength=180,
         ).pack(side=tk.LEFT, padx=(6, 0), fill=tk.X)
+        version = f"Version {APP_VERSION}"
         stamp = _build_stamp()
-        if stamp:
-            ctk.CTkLabel(
-                footer, text=f"Version {stamp}", text_color=FAINT_TEXT, font=_font(11),
-                anchor="w", height=18,
-            ).pack(fill=tk.X, padx=(28, 10), pady=(2, 0))
+        if stamp and not getattr(sys, "frozen", False):
+            version += f"  \u00b7  {stamp}"  # running from source: when it last changed
+        ctk.CTkLabel(
+            footer, text=version, text_color=FAINT_TEXT, font=_font(11), anchor="w", height=18,
+        ).pack(fill=tk.X, padx=(28, 10), pady=(2, 0))
 
-        system = ctk.CTkFrame(nav, fg_color="transparent")
+        system = self.system_section = ctk.CTkFrame(nav, fg_color="transparent")
         system.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 12))
         section(system, "SYSTEM")
-        self.sharepoint_button = self._make_collection_card(
+        self.sharepoint_button = self._make_system_item(
             system, "  Check for new photos", self._browse_sharepoint, icon="refresh"
         )
-        self._make_collection_card(system, "  Choose folder…", self._choose_folder, icon="open")
-        self.index_button = self._make_collection_card(
-            system, "  Index folder", self._start_indexing, icon="index"
+        self._make_system_item(
+            system, "  Check for updates", lambda: self._check_for_updates(interactive=True),
+            icon="update",
         )
+        # Searching a folder on this computer instead of SharePoint is rare,
+        # so both of its actions sit behind one item.
+        local = self._make_system_item(system, "  Local folder", None, icon="local")
+        local.configure(command=lambda: self._show_local_folder_menu(local))
+        # Not shown: only its enabled state is used, by the menu above.
+        self.index_button = ctk.CTkButton(system, text="", command=self._start_indexing)
         self.index_button.configure(state=tk.DISABLED)
-        self._make_collection_card(system, "  Settings", self._open_settings, icon="settings")
+        self._make_system_item(system, "  Settings", self._open_settings, icon="settings")
+        self._make_system_item(system, "  Support", self._show_support_form, icon="support")
+        self._make_system_item(system, "  About", self._show_about, icon="info")
 
         section(nav, "LIBRARY")
         self.all_card = self._make_collection_card(
@@ -788,17 +861,33 @@ class ImageSearchApp:
         self.history_card = self._make_collection_card(
             nav, "  Search history", lambda: self._set_view("history"), icon="history"
         )
-        heading = section(nav, "COLLECTIONS", pady=(20, 4))
-        ctk.CTkButton(
+        heading = self.collections_heading = section(nav, "COLLECTIONS", pady=(20, 4))
+        add_button = ctk.CTkButton(
             heading, text="" if _icon("add", 14) else "+", image=_icon("add", 14),
             width=26, height=24, corner_radius=6,
             fg_color="transparent", hover_color=NAV_HOVER, text_color=TEXT_SOFT,
-            font=_font(15, "semibold"), command=self._new_collection,
-        ).pack(side=tk.RIGHT, padx=(0, 4))
+            font=_font(15, "semibold"),
+        )
+        add_button.configure(command=lambda: self._show_add_collection_menu(add_button))
+        add_button.pack(side=tk.RIGHT, padx=(0, 4))
+        # Fetches shared collections now - after someone has been added to
+        # one, or to pick up photos others just put in.
+        self.shared_sync_button = ctk.CTkButton(
+            heading, text="" if _icon("sync", 13) else "\u21bb", image=_icon("sync", 13),
+            width=26, height=24, corner_radius=6,
+            fg_color="transparent", hover_color=NAV_HOVER, text_color=TEXT_SOFT,
+            font=_font(13), command=lambda: self._sync_shared(interactive=True, announce=True),
+        )
+        self.shared_sync_button.pack(side=tk.RIGHT)
         # Collection items are rebuilt into this frame (see
         # _rebuild_collection_cards), between the heading and the footer.
-        self.sidebar = ctk.CTkFrame(nav, fg_color="transparent")
-        self.sidebar.pack(fill=tk.X)
+        # Scrolls on its own when there are more collections than fit, so
+        # the System section below never covers the last ones.
+        self.sidebar = ctk.CTkScrollableFrame(
+            nav, fg_color=SIDEBAR_BG, corner_radius=0,
+            scrollbar_button_color="#1d2621", scrollbar_button_hover_color="#33443b",
+        )
+        self.sidebar.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         self._collections_hint = None
         self.collection_cards = {}
 
@@ -825,7 +914,7 @@ class ImageSearchApp:
         # the background colour, so at rest there is nothing to see.
         self.progress = ctk.CTkProgressBar(
             head, width=140, height=3, corner_radius=2,
-            fg_color=BG_COLOR, progress_color=TEXT_SOFT,
+            fg_color=BG_COLOR, progress_color=PRIMARY_HOVER,
         )
         # CustomTkinter still draws a round dot at 0%, so the bar takes the
         # background colour whenever it is empty and idle.
@@ -834,14 +923,14 @@ class ImageSearchApp:
         def progress_set(value, *args, **kwargs):
             try:
                 idle = value <= 0 and self.progress.cget("mode") == "determinate"
-                self.progress.configure(progress_color=BG_COLOR if idle else TEXT_SOFT)
+                self.progress.configure(progress_color=BG_COLOR if idle else PRIMARY_HOVER)
             except Exception:
                 pass
             return _set(value, *args, **kwargs)
 
         def progress_start(*args, **kwargs):
             try:
-                self.progress.configure(progress_color=TEXT_SOFT)
+                self.progress.configure(progress_color=PRIMARY_HOVER)
             except Exception:
                 pass
             return _start(*args, **kwargs)
@@ -850,7 +939,7 @@ class ImageSearchApp:
         self.progress.set(0)
         self.progress.pack(side=tk.RIGHT, anchor="s", pady=(0, 8))
 
-        search_frame = ctk.CTkFrame(
+        search_frame = self.search_frame = ctk.CTkFrame(
             main, fg_color=SURFACE, corner_radius=12, border_width=1, border_color=BORDER,
         )
         search_frame.pack(fill=tk.X, pady=(0, 12))
@@ -891,7 +980,7 @@ class ImageSearchApp:
         # own internal canvas, scrollbar, and mousewheel binding.
         self.results_frame = ctk.CTkScrollableFrame(
             main, fg_color=BG_COLOR, corner_radius=0, scrollbar_button_color=BORDER,
-            scrollbar_button_hover_color="#404040",
+            scrollbar_button_hover_color="#3a4c42",
         )
         self.results_frame.pack(fill=tk.BOTH, expand=True)
         # CustomTkinter moves 1 pixel per scroll "unit" on Windows, which
@@ -916,6 +1005,19 @@ class ImageSearchApp:
 
         self._update_favourites_button()
         self._set_view("all")
+
+    def _make_system_item(self, parent, text, command, icon):
+        """A System entry: smaller and quieter than the library and
+        collections above it - used now and then, so it steps back and
+        leaves room for more collections."""
+        item = ctk.CTkButton(
+            parent, text=text, command=command, height=28, corner_radius=7,
+            fg_color=NAV_BG, hover_color=NAV_HOVER, text_color=SYSTEM_TEXT,
+            text_color_disabled=FAINT_TEXT, anchor="w", image=_icon(icon, 14, SYSTEM_TEXT),
+            compound="left", font=_font(12, "medium"),
+        )
+        item.pack(fill=tk.X, pady=0)
+        return item
 
     def _make_collection_card(self, parent, text, command, icon="folder"):
         """A flat sidebar item: no panel of its own, a soft highlight on
@@ -1004,11 +1106,13 @@ class ImageSearchApp:
         if getattr(self, "_collections_hint", None) is not None:
             self._collections_hint.destroy()
             self._collections_hint = None
+        shared_names = set(self._shared_by_name())
         for name, idxs in (self._collections or {}).items():
             # Long names are shortened on the card only; the sidebar is narrow.
             shown = name if len(name) <= 17 else name[:16].rstrip() + "…"
             card = self._make_collection_card(
-                self.sidebar, f"  {shown} ({len(idxs)})", lambda n=name: self._set_view(n)
+                self.sidebar, f"  {shown} ({len(idxs)})", lambda n=name: self._set_view(n),
+                icon="shared" if name in shared_names else "folder",
             )
             card.bind("<Button-3>", lambda e, n=name: self._show_collection_menu(e, n))
             card.configure(
@@ -1083,7 +1187,7 @@ class ImageSearchApp:
             "or pick a collection on the left."
         )
 
-    def _show_collection(self, name):
+    def _show_collection(self, name, keep_scroll=False):
         idxs = (self._collections or {}).get(name, [])
         if not idxs:
             self._render_results([])
@@ -1093,7 +1197,7 @@ class ImageSearchApp:
             )
             return
         results = [(self.engine.paths[i], 1.0, self.engine.meta[i]) for i in idxs[:DEFAULT_TOP_K]]
-        self._render_results(results)
+        self._render_results(results, keep_scroll=keep_scroll)
         extra = f" (showing first {DEFAULT_TOP_K})" if len(idxs) > DEFAULT_TOP_K else ""
         self.status_var.set(f"{len(idxs)} photo(s) in {name}{extra}. Search to narrow it down.")
 
@@ -1232,7 +1336,7 @@ class ImageSearchApp:
             )
             return
         if self.engine.embeddings is None or len(self.engine.paths) == 0:
-            messagebox.showinfo("Image Search", "Index the folder first before searching.")
+            messagebox.showinfo(APP_NAME, "Index the folder first before searching.")
             return
         subset = self._active_subset()
         if self._view == "favourites" and not subset:
@@ -1289,7 +1393,7 @@ class ImageSearchApp:
             self.status_var.set("Still loading photos - one moment, then try again.")
             return
         if self.engine.embeddings is None or len(self.engine.paths) == 0:
-            messagebox.showinfo("Image Search", "Load the photo library first.")
+            messagebox.showinfo(APP_NAME, "Load the photo library first.")
             return
         path = filedialog.askopenfilename(
             title="Pick a photo to find similar ones",
@@ -2830,13 +2934,29 @@ class ImageSearchApp:
                     else:
                         self.status_var.set("Ready to search.")
                     open_in_system_viewer(delivered)
+                elif kind == "shared_records":
+                    self._apply_shared_records(event[1], event[2], event[3])
+                elif kind == "shared_upsert":
+                    self._apply_shared_upsert(event[1], event[2], event[3])
+                elif kind == "shared_removed":
+                    self._apply_shared_removed(event[1], event[2])
+                elif kind == "support_fallback":
+                    self._support_fallback(event[1], event[2], event[3])
+                elif kind == "shared_invite":
+                    self._offer_invite(event[1], event[2])
+                elif kind in ("shared_status", "update_status"):
+                    self.status_var.set(event[1])
+                elif kind == "update_ready":
+                    self._show_update_notice(event[1], restart=True)
+                elif kind == "update_full":
+                    self._show_update_notice(event[1], restart=False, note=event[2])
                 elif kind == "error":
                     self.progress.stop()
                     self.progress.configure(mode="determinate")
                     self.progress.set(0)
                     self._set_busy(False)
                     self.status_var.set("Error.")
-                    messagebox.showerror("Image Search", event[1])
+                    messagebox.showerror(APP_NAME, event[1])
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
@@ -3277,7 +3397,7 @@ class ImageSearchApp:
 
     # ---------- manual collections ----------
 
-    def _collection_ids(self):
+    def _local_collection_ids(self):
         """{name: [item_id, ...]} in sidebar order, exactly as curated.
 
         Item ids rather than positions, so a collection survives the index
@@ -3305,7 +3425,32 @@ class ImageSearchApp:
                     bucket.append(item_id)
         return out
 
+    def _collection_ids(self):
+        """Every collection in the sidebar, {name: [item_id, ...]}: this
+        computer's own, then the shared ones this user is in."""
+        out = self._local_collection_ids()
+        for name, record in self._shared_by_name().items():
+            out[name] = [i for i in (record.get("items") or []) if i]
+        return out
+
     def _write_collection_ids(self, by_id):
+        """Saves collections. Local ones go to this computer's file; a
+        change to a shared one is saved here at once and sent to SharePoint
+        in the background, as the photos added and removed - so two people
+        filling the same collection at once do not undo each other."""
+        shared = self._shared_by_name()
+        for name, record in shared.items():
+            if name not in by_id:
+                continue
+            new = [i for i in by_id[name] if i]
+            old = [i for i in (record.get("items") or []) if i]
+            if new != old:
+                added = [i for i in new if i not in old]
+                removed = [i for i in old if i not in new]
+                record["items"] = new
+                self._save_shared_state()
+                self._push_shared(dict(record), add=added, remove=removed)
+        by_id = {name: ids for name, ids in by_id.items() if name not in shared}
         payload = {
             "version": 2,
             "collections": [{"name": name, "items": ids} for name, ids in by_id.items()],
@@ -3341,17 +3486,21 @@ class ImageSearchApp:
             return None
         if len(name) > COLLECTION_NAME_MAX:
             messagebox.showinfo(
-                "Image Search", f"Please keep collection names to {COLLECTION_NAME_MAX} characters."
+                APP_NAME, f"Please keep collection names to {COLLECTION_NAME_MAX} characters."
             )
             return None
         if name.lower() in RESERVED_COLLECTION_NAMES:
             messagebox.showinfo(
-                "Image Search", f"“{name}” is already used by the app - please choose another name."
+                APP_NAME, f"“{name}” is already used by the app - please choose another name."
             )
             return None
         taken = {n.lower() for n in self._collection_ids() if n != current}
+        if current is None:
+            # Shared collections show under their own names; a new local one
+            # may not borrow one of those either.
+            taken |= {(r.get("name") or "").lower() for r in self._shared_state()["collections"]}
         if name.lower() in taken:
-            messagebox.showinfo("Image Search", f"There is already a collection called “{name}”.")
+            messagebox.showinfo(APP_NAME, f"There is already a collection called “{name}”.")
             return None
         return name
 
@@ -3368,6 +3517,9 @@ class ImageSearchApp:
             )
 
     def _rename_collection(self, name):
+        if self._is_shared(name):
+            self._manage_shared(name)
+            return
         new = self._ask_collection_name(
             "Rename collection", f"New name for “{name}”:", current=name
         )
@@ -3385,6 +3537,9 @@ class ImageSearchApp:
             self.status_var.set(f"Renamed {name} to {new}.")
 
     def _remove_collection(self, name):
+        if self._is_shared(name):
+            self._leave_or_delete_shared(name)
+            return
         by_id = self._collection_ids()
         if name not in by_id:
             return
@@ -3406,6 +3561,9 @@ class ImageSearchApp:
             self.status_var.set(f"Removed {name}.")
 
     def _show_collection_menu(self, event, name):
+        if self._is_shared(name):
+            self._show_shared_menu(event, name)
+            return
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="Rename…", command=lambda: self._rename_collection(name))
         menu.add_command(label="Remove…", command=lambda: self._remove_collection(name))
@@ -3447,6 +3605,957 @@ class ImageSearchApp:
         self.status_var.set(f"Removed from {name} - {len(ids)} photo(s) left.")
         if self._view == name:
             self._show_collection(name)
+
+    # ---------- shared collections ----------
+    #
+    # A shared collection is one small file on SharePoint, next to the
+    # favourites: its name, who owns it, the email addresses it is shared
+    # with, and its photos. Everyone listed sees it in their sidebar and can
+    # add and remove photos; only the owner changes the name and the people.
+    # Note that this decides what the app shows - anyone who can open the
+    # photo library on SharePoint could also open these files.
+
+    def _shared_cache_path(self):
+        return os.path.join(self._sp_cache_dirs()[0], "shared_collections.json")
+
+    def _shared_state(self):
+        """{"me": email, "collections": [record, ...]} - the last synced
+        copy, kept on disk so shared collections show at once on start."""
+        if self._shared is None:
+            data = self._read_json(self._shared_cache_path())
+            records = [
+                r for r in (data.get("collections") or [])
+                if isinstance(r, dict) and isinstance(r.get("id"), str)
+            ]
+            self._shared = {"me": (data.get("me") or "").lower(), "collections": records}
+        return self._shared
+
+    def _save_shared_state(self):
+        try:
+            os.makedirs(os.path.dirname(self._shared_cache_path()), exist_ok=True)
+            with open(self._shared_cache_path(), "w", encoding="utf-8") as f:
+                json.dump(self._shared_state(), f, ensure_ascii=False)
+        except OSError as exc:
+            _log_reuse(f"SHARED COLLECTIONS SAVE FAILED: {exc!r}")
+
+    def _shared_by_name(self):
+        """{sidebar name: record}. A shared collection whose name is already
+        used by one of this computer's own collections is shown as
+        "Name (shared)" so the two never get mixed up."""
+        local = {n.lower() for n in self._local_collection_ids()}
+        out = {}
+        for record in sorted(
+            self._shared_state()["collections"], key=lambda r: (r.get("name") or "").lower()
+        ):
+            base = (record.get("name") or "Shared").strip() or "Shared"
+            shown, n = base, 1
+            while shown.lower() in local or shown in out:
+                n += 1
+                shown = f"{base} (shared)" if n == 2 else f"{base} (shared {n - 1})"
+            out[shown] = record
+        return out
+
+    def _is_shared(self, name):
+        return name in self._shared_by_name()
+
+    def _shared_name_for(self, collection_id):
+        for name, record in self._shared_by_name().items():
+            if record.get("id") == collection_id:
+                return name
+        return None
+
+    @staticmethod
+    def _visible_to(record, me):
+        if not me:
+            return False
+        members = [str(m).lower() for m in (record.get("members") or [])]
+        return me == str(record.get("owner") or "").lower() or me in members
+
+    def _sp_client(self, interactive):
+        """The SharePoint connection. Background checks pass
+        interactive=False: they use the saved sign-in or give up quietly,
+        and never open a sign-in window on their own."""
+        if interactive:
+            return self._ensure_sp_client()
+        with self._sp_lock:
+            if self.sp_client is None:
+                client = _sharepoint().SharePointClient()
+                if not client.sign_in_silent():
+                    return None
+                self.sp_client = client
+        return self.sp_client
+
+    @staticmethod
+    def _shared_location():
+        import config
+
+        return (
+            getattr(config, "SHARED_SITE_PATH", config.SHAREPOINT_SITE_PATH),
+            getattr(config, "SHARED_FOLDER_PATH", config.SHAREPOINT_SEARCH_ROOT_PATH),
+        )
+
+    def _shared_read(self, client, filename):
+        site, folder = self._shared_location()
+        raw = client.download_bytes_by_path(site, f"{folder}/{filename}")
+        return json.loads(raw.decode("utf-8")) if raw else None
+
+    def _shared_write(self, client, filename, record):
+        site, folder = self._shared_location()
+        client.ensure_folder(site, folder)
+        client.upload_bytes_by_path(
+            site, folder, filename, json.dumps(record, ensure_ascii=False).encode("utf-8")
+        )
+
+    def _sp_root(self, client):
+        if self._sp_root_id is None:
+            self._sp_root_id = client.get_search_root_item()["id"]
+        return self._sp_root_id
+
+    @staticmethod
+    def _now_iso():
+        return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+    def _start_background_checks(self):
+        self._sync_shared()
+        self.root.after(3000, self._check_for_updates)
+        self.root.after(SHARED_SYNC_MS, self._periodic_shared_sync)
+        self.root.after(UPDATE_CHECK_MS, self._periodic_update_check)
+
+    def _periodic_shared_sync(self):
+        self._sync_shared()
+        self.root.after(SHARED_SYNC_MS, self._periodic_shared_sync)
+
+    def _periodic_update_check(self):
+        self._check_for_updates()
+        self.root.after(UPDATE_CHECK_MS, self._periodic_update_check)
+
+    def _sync_shared(self, interactive=False, announce=False):
+        """Reads every shared collection on SharePoint and keeps the ones
+        this user owns or is listed in."""
+        if self._shared_syncing:
+            return
+        self._shared_syncing = True
+        if announce:
+            self.status_var.set("Syncing shared collections…")
+
+        def work():
+            try:
+                client = self._sp_client(interactive)
+                if client is None:
+                    return
+                me = client.account_email()
+                site, folder = self._shared_location()
+                prefix = _sharepoint().SHARED_COLLECTION_PREFIX
+                records = []
+                for filename in client.list_names_by_path(site, folder, prefix):
+                    record = self._shared_read(client, filename)
+                    if isinstance(record, dict) and isinstance(record.get("id"), str) \
+                            and self._visible_to(record, me):
+                        records.append(record)
+                self.event_queue.put(("shared_records", me, records, announce))
+            except Exception as exc:
+                _log_reuse(f"SHARED COLLECTIONS SYNC FAILED: {exc!r}")
+                if announce:
+                    self.event_queue.put((
+                        "shared_status",
+                        "Couldn't reach SharePoint to sync shared collections - try again in a moment.",
+                    ))
+            finally:
+                self._shared_syncing = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _viewing_shared(self):
+        record = self._shared_by_name().get(self._view)
+        return (record.get("id"), list(record.get("items") or [])) if record else (None, None)
+
+    def _after_shared_change(self, viewing_id, old_items):
+        """Redraws the sidebar, and the open collection if it changed."""
+        self._collections = self._load_collections()
+        self._rebuild_collection_cards()
+        if not viewing_id:
+            return
+        name = self._shared_name_for(viewing_id)
+        if name is None:
+            self._set_view("all")
+            self.status_var.set("That shared collection was removed, or you are no longer in it.")
+        elif name != self._view:
+            self._set_view(name)
+        else:
+            record = self._shared_by_name()[name]
+            if list(record.get("items") or []) != list(old_items or []):
+                self._show_collection(name, keep_scroll=True)
+
+    def _apply_shared_records(self, me, records, announce):
+        viewing_id, old_items = self._viewing_shared()
+        self._shared = {"me": (me or "").lower(), "collections": records}
+        self._save_shared_state()
+        self._after_shared_change(viewing_id, old_items)
+        if announce:
+            n = len(records)
+            self.status_var.set(
+                f"Shared collections are up to date - {n} shared with you." if n
+                else "No shared collections yet - use + to create one."
+            )
+
+    def _apply_shared_upsert(self, record, me, message):
+        viewing_id, old_items = self._viewing_shared()
+        state = self._shared_state()
+        if me:
+            state["me"] = me.lower()
+        state["collections"] = [r for r in state["collections"] if r.get("id") != record["id"]]
+        if self._visible_to(record, state["me"]):
+            state["collections"].append(record)
+        self._save_shared_state()
+        self._after_shared_change(viewing_id, old_items)
+        if message:
+            self.status_var.set(message)
+
+    def _apply_shared_removed(self, collection_id, message):
+        viewing_id, old_items = self._viewing_shared()
+        state = self._shared_state()
+        state["collections"] = [r for r in state["collections"] if r.get("id") != collection_id]
+        self._save_shared_state()
+        self._after_shared_change(viewing_id, old_items)
+        if message:
+            self.status_var.set(message)
+
+    def _push_shared(self, snapshot, add=(), remove=(), name=None, members=None,
+                     leave=False, delete=False, message=None):
+        """Applies one change to a shared collection's file on SharePoint.
+
+        Reads the current file first and applies only this change to it, so
+        photos someone else added a moment ago are kept."""
+        collection_id = snapshot["id"]
+
+        def work():
+            with self._shared_lock:
+                try:
+                    client = self._sp_client(True)
+                    me = client.account_email()
+                    filename = f"{_sharepoint().SHARED_COLLECTION_PREFIX}{collection_id}.json"
+                    if delete:
+                        site, folder = self._shared_location()
+                        client.delete_by_path(site, f"{folder}/{filename}")
+                        self.event_queue.put(("shared_removed", collection_id, message))
+                        return
+                    remote = self._shared_read(client, filename)
+                    if not (isinstance(remote, dict) and remote.get("id") == collection_id):
+                        self.event_queue.put((
+                            "shared_removed", collection_id,
+                            "That shared collection no longer exists on SharePoint.",
+                        ))
+                        return
+                    items = [i for i in (remote.get("items") or []) if i and i not in remove]
+                    for item_id in add:
+                        if item_id not in items:
+                            items.append(item_id)
+                    remote["items"] = items
+                    if name:
+                        remote["name"] = name
+                    if members is not None:
+                        remote["members"] = members
+                    if leave:
+                        remote["members"] = [
+                            m for m in (remote.get("members") or []) if str(m).lower() != me
+                        ]
+                    remote["updated"] = self._now_iso()
+                    remote["updated_by"] = me
+                    self._shared_write(client, filename, remote)
+                    if leave:
+                        self.event_queue.put(("shared_removed", collection_id, message))
+                    else:
+                        self.event_queue.put(("shared_upsert", remote, me, message))
+                except Exception as exc:
+                    _log_reuse(f"SHARED COLLECTION SAVE FAILED: {exc!r}")
+                    self.event_queue.put((
+                        "shared_status",
+                        "Couldn't save that change to SharePoint, so others won't see it yet. "
+                        "Check your connection and try again.",
+                    ))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_add_collection_menu(self, button):
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="New collection…", command=self._new_collection)
+        menu.add_command(label="New shared collection…", command=self._new_shared_collection)
+        try:
+            menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height() + 2)
+        finally:
+            menu.grab_release()
+
+    def _show_shared_menu(self, event, name):
+        record = self._shared_by_name().get(name) or {}
+        me = self._shared_state()["me"]
+        owner = str(record.get("owner") or "")
+        is_owner = bool(me) and owner.lower() == me
+        people = len(record.get("members") or [])
+        menu = tk.Menu(self.root, tearoff=0)
+        if is_owner:
+            menu.add_command(label="Name and people…", command=lambda: self._manage_shared(name))
+        else:
+            menu.add_command(label=f"Shared by {owner or 'someone else'}", state=tk.DISABLED)
+        menu.add_command(label=f"Shared with {people} {'person' if people == 1 else 'people'}",
+                         state=tk.DISABLED)
+        menu.add_command(label="Sync now",
+                         command=lambda: self._sync_shared(interactive=True, announce=True))
+        menu.add_separator()
+        menu.add_command(
+            label="Delete shared collection…" if is_owner else "Leave this collection…",
+            command=lambda: self._leave_or_delete_shared(name),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    @staticmethod
+    def _parse_emails(text):
+        found, bad = [], []
+        for piece in re.split(r"[\s,;]+", text or ""):
+            piece = piece.strip().strip("<>").lower()
+            if not piece:
+                continue
+            if EMAIL_PATTERN.match(piece):
+                if piece not in found:
+                    found.append(piece)
+            else:
+                bad.append(piece)
+        return found, bad
+
+    def _shared_dialog(self, title, action, name="", members=(), current=None):
+        """Asks for a name and the people to share with.
+        Returns (name, [emails]) or None if cancelled."""
+        win = ctk.CTkToplevel(self.root)
+        win.title(title)
+        win.configure(fg_color=BG_COLOR)
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.after(250, lambda: win.iconbitmap(_resource_path("assets", "app_icon.ico")))
+        result = {}
+
+        body = ctk.CTkFrame(win, fg_color="transparent")
+        body.pack(fill=tk.BOTH, expand=True, padx=24, pady=(20, 18))
+        ctk.CTkLabel(body, text=title, font=_font(17, "semibold"), text_color=TEXT_COLOR,
+                     anchor="w").pack(fill=tk.X)
+        ctk.CTkLabel(
+            body, font=_font(12), text_color=MUTED_TEXT_COLOR, anchor="w", justify="left",
+            wraplength=400,
+            text=(f"Everyone you list sees this collection in their {APP_NAME} and can add "
+                  "or remove photos. They need access to the photo library on SharePoint."),
+        ).pack(fill=tk.X, pady=(4, 16))
+
+        ctk.CTkLabel(body, text="Name", font=_font(12, "medium"), text_color=TEXT_SOFT,
+                     anchor="w").pack(fill=tk.X)
+        name_entry = ctk.CTkEntry(
+            body, width=400, height=36, fg_color=SURFACE, border_color=BORDER, border_width=1,
+            corner_radius=8, text_color=TEXT_COLOR, font=_font(13),
+        )
+        name_entry.insert(0, name)
+        name_entry.pack(fill=tk.X, pady=(4, 14))
+
+        ctk.CTkLabel(body, text="People - work email addresses, one per line",
+                     font=_font(12, "medium"), text_color=TEXT_SOFT, anchor="w").pack(fill=tk.X)
+        people = ctk.CTkTextbox(
+            body, width=400, height=130, fg_color=SURFACE, border_color=BORDER, border_width=1,
+            corner_radius=8, text_color=TEXT_COLOR, font=_font(13),
+        )
+        if members:
+            people.insert("1.0", "\n".join(members))
+        people.pack(fill=tk.X, pady=(4, 6))
+        error = ctk.CTkLabel(body, text="", font=_font(12), text_color="#f87171", anchor="w",
+                             justify="left", wraplength=400)
+        error.pack(fill=tk.X)
+
+        def submit():
+            chosen = " ".join(name_entry.get().split())
+            if not chosen:
+                error.configure(text="Please give the collection a name.")
+                return
+            if len(chosen) > COLLECTION_NAME_MAX:
+                error.configure(text=f"Please keep the name to {COLLECTION_NAME_MAX} characters.")
+                return
+            if chosen.lower() in RESERVED_COLLECTION_NAMES:
+                error.configure(text=f"“{chosen}” is used by the app - please choose another name.")
+                return
+            taken = {n.lower() for n in self._local_collection_ids()}
+            taken |= {
+                (r.get("name") or "").lower() for r in self._shared_state()["collections"]
+                if (r.get("name") or "") != current
+            }
+            if chosen.lower() in taken:
+                error.configure(text=f"There is already a collection called “{chosen}”.")
+                return
+            emails, bad = self._parse_emails(people.get("1.0", "end"))
+            if bad:
+                error.configure(text="These don't look like email addresses: " + ", ".join(bad[:4]))
+                return
+            result["value"] = (chosen, emails)
+            win.destroy()
+
+        buttons = ctk.CTkFrame(body, fg_color="transparent")
+        buttons.pack(fill=tk.X, pady=(12, 0))
+        _make_primary_button(buttons, action, submit, width=110).pack(side=tk.RIGHT)
+        _make_secondary_button(buttons, "Cancel", win.destroy, width=100).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+        win.bind("<Escape>", lambda _e: win.destroy())
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        name_entry.focus_set()
+        self.root.wait_window(win)
+        return result.get("value")
+
+    def _new_shared_collection(self):
+        value = self._shared_dialog("New shared collection", "Create")
+        if not value:
+            return
+        name, members = value
+        self.status_var.set(f"Creating {name} on SharePoint…")
+
+        def work():
+            try:
+                client = self._sp_client(True)
+                me = client.account_email()
+                now = self._now_iso()
+                record = {
+                    "version": 1,
+                    "id": uuid.uuid4().hex[:16],
+                    "name": name,
+                    "owner": me,
+                    "members": [m for m in members if m != me],
+                    "items": [],
+                    "created": now,
+                    "updated": now,
+                    "updated_by": me,
+                }
+                filename = f"{_sharepoint().SHARED_COLLECTION_PREFIX}{record['id']}.json"
+                self._shared_write(client, filename, record)
+                people = len(record["members"])
+                if record["members"]:
+                    self.event_queue.put(("shared_invite", name, list(record["members"])))
+                self.event_queue.put((
+                    "shared_upsert", record, me,
+                    f"Created {name}, shared with {people} {'person' if people == 1 else 'people'}. "
+                    "They see it after their next sync - or straight away if they click Sync.",
+                ))
+            except Exception as exc:
+                _log_reuse(f"SHARED COLLECTION CREATE FAILED: {exc!r}")
+                self.event_queue.put((
+                    "shared_status",
+                    "Couldn't create the shared collection on SharePoint - check your connection and try again.",
+                ))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _offer_invite(self, name, emails):
+        """Offers to open a ready-written invitation in the user's email app
+        (Outlook) - they read it and press Send themselves."""
+        if not emails:
+            return
+        who = emails[0] if len(emails) == 1 else f"{len(emails)} people"
+        if not messagebox.askyesno(
+            "Invite people",
+            f"Write an invitation email to {who} about “{name}”?\n\n"
+            "It opens in Outlook so you can read it and send it yourself.",
+        ):
+            return
+        subject = f"I've shared the photo collection “{name}” with you"
+        body = (
+            "Hi,\n\n"
+            f"I've shared the photo collection “{name}” with you in {APP_NAME}, our app for "
+            "searching the marketing photo library on SharePoint.\n\n"
+            "To see it: open the app and click the sync button (↻) next to Collections - or just "
+            f"restart it. “{name}” then appears under Collections, and you can add or remove "
+            "photos by dragging them onto it.\n\n"
+            "Don't have the app yet? Just reply and I'll send it to you.\n\n"
+            "Best"
+        )
+        url = "mailto:" + ",".join(emails) + "?" + urllib.parse.urlencode(
+            {"subject": subject, "body": body}, quote_via=urllib.parse.quote
+        )
+        try:
+            os.startfile(url)
+        except Exception as exc:
+            _log_reuse(f"INVITE EMAIL FAILED: {exc!r}")
+            messagebox.showinfo(APP_NAME, "Couldn't open your email app - please send the invitation yourself.")
+
+    def _manage_shared(self, shown_name):
+        record = self._shared_by_name().get(shown_name)
+        if not record:
+            return
+        me = self._shared_state()["me"]
+        if str(record.get("owner") or "").lower() != me:
+            messagebox.showinfo(
+                APP_NAME,
+                f"Only {record.get('owner') or 'the owner'} can change the name and people of this collection.",
+            )
+            return
+        value = self._shared_dialog(
+            "Shared collection", "Save", name=record.get("name") or "",
+            members=record.get("members") or [], current=record.get("name"),
+        )
+        if not value:
+            return
+        name, members = value
+        members = [m for m in members if m != me]
+        added = [m for m in members if m not in [str(x).lower() for x in (record.get("members") or [])]]
+        if added:
+            self.root.after(300, lambda: self._offer_invite(name, added))
+        self.status_var.set(f"Saving {name}…")
+        self._push_shared(dict(record), name=name, members=members,
+                          message=f"Saved {name} - shared with {len(members)} people.")
+
+    def _leave_or_delete_shared(self, shown_name):
+        record = self._shared_by_name().get(shown_name)
+        if not record:
+            return
+        me = self._shared_state()["me"]
+        if str(record.get("owner") or "").lower() == me:
+            if not messagebox.askyesno(
+                "Delete shared collection",
+                f"Delete “{shown_name}” for everyone it is shared with?\n\n"
+                "The photos stay in the library - only the collection goes.",
+                icon="warning",
+            ):
+                return
+            self._push_shared(dict(record), delete=True, message=f"Deleted {shown_name}.")
+        else:
+            if not messagebox.askyesno(
+                "Leave collection",
+                f"Leave “{shown_name}”? It disappears from your sidebar; the others keep it.",
+            ):
+                return
+            self._push_shared(dict(record), leave=True, message=f"You left {shown_name}.")
+
+    # ---------- local folder, support ----------
+
+    def _show_local_folder_menu(self, anchor):
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Choose folder…", command=self._choose_folder)
+        try:
+            enabled = str(self.index_button.cget("state")) == "normal"
+        except Exception:
+            enabled = False
+        menu.add_command(label="Index folder", command=self._start_indexing,
+                         state=tk.NORMAL if enabled else tk.DISABLED)
+        try:
+            menu.tk_popup(anchor.winfo_rootx() + 12, anchor.winfo_rooty() + anchor.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _app_details(self):
+        lines = [
+            f"{APP_NAME} {APP_VERSION} (runtime {RUNTIME_VERSION}, "
+            f"{'installed app' if getattr(sys, 'frozen', False) else 'from source'})",
+            f"Windows {platform.release()} ({platform.version()})",
+            f"Signed in as: {self._shared_state().get('me') or 'unknown'}",
+            f"Photos in library: {len(getattr(self.engine, 'paths', []) or []):,}",
+        ]
+        try:
+            with open(CRASH_LOG_PATH, "r", encoding="utf-8") as f:
+                tail = f.read()[-3000:]
+            if tail.strip():
+                lines += ["", "Last error log entries:", tail]
+        except Exception:
+            pass
+        return "\n".join(lines)
+
+    def _show_support_form(self):
+        """A short form that emails the app's owner from the user's own
+        Microsoft account - no email app needed."""
+        import config
+
+        to = getattr(config, "SUPPORT_EMAIL", "")
+        win = ctk.CTkToplevel(self.root)
+        win.title("Support")
+        win.configure(fg_color=BG_COLOR)
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.after(250, lambda: win.iconbitmap(_resource_path("assets", "app_icon.ico")))
+        body = ctk.CTkFrame(win, fg_color="transparent")
+        body.pack(fill=tk.BOTH, expand=True, padx=24, pady=(20, 18))
+        ctk.CTkLabel(body, text="How can we help?", font=_font(17, "semibold"),
+                     text_color=TEXT_COLOR, anchor="w").pack(fill=tk.X)
+        ctk.CTkLabel(body, text=f"Your message goes straight to {APP_AUTHOR}, sent from your "
+                     "Greenreb email so a reply comes back to you.", font=_font(12),
+                     text_color=MUTED_TEXT_COLOR, anchor="w", justify="left",
+                     wraplength=420).pack(fill=tk.X, pady=(4, 14))
+
+        topic = tk.StringVar(value="Problem")
+        ctk.CTkSegmentedButton(
+            body, values=["Problem", "Idea", "Question"], variable=topic, height=32,
+            font=_font(13, "medium"), fg_color=SURFACE, selected_color="#2a3830",
+            selected_hover_color="#33443b", unselected_color=SURFACE,
+            unselected_hover_color=SURFACE_HOVER, text_color=TEXT_COLOR,
+        ).pack(anchor="w")
+        ctk.CTkLabel(body, text="What's on your mind?", font=_font(12, "medium"),
+                     text_color=TEXT_SOFT, anchor="w").pack(fill=tk.X, pady=(14, 0))
+        message = ctk.CTkTextbox(
+            body, width=420, height=150, fg_color=SURFACE, border_color=BORDER, border_width=1,
+            corner_radius=8, text_color=TEXT_COLOR, font=_font(13), wrap="word",
+        )
+        message.pack(fill=tk.X, pady=(4, 8))
+        details = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            body, text="Include app details (version, Windows, recent error log)",
+            variable=details, font=_font(12), text_color=TEXT_SOFT, fg_color=PRIMARY,
+            hover_color=PRIMARY_HOVER, checkmark_color="#ffffff", border_color="#3f4a44",
+            checkbox_width=18, checkbox_height=18,
+        ).pack(anchor="w")
+        error = ctk.CTkLabel(body, text="", font=_font(12), text_color="#f87171", anchor="w")
+        error.pack(fill=tk.X, pady=(6, 0))
+
+        def send():
+            text = message.get("1.0", "end").strip()
+            if not text:
+                error.configure(text="Please write a few words first.")
+                return
+            first = text.splitlines()[0][:60]
+            subject = f"[{APP_NAME} {topic.get()}] {first}"
+            content = text
+            if details.get():
+                content += "\n\n---\n" + self._app_details()
+            win.destroy()
+            self.status_var.set("Sending your message…")
+
+            def work():
+                try:
+                    client = self._sp_client(True)
+                    client.send_mail(to, subject, content)
+                    self.event_queue.put(("shared_status", f"Thanks - your message was sent to {APP_AUTHOR}."))
+                except Exception as exc:
+                    _log_reuse(f"SUPPORT MAIL FAILED: {exc!r}")
+                    self.event_queue.put(("support_fallback", to, subject, content))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        buttons = ctk.CTkFrame(body, fg_color="transparent")
+        buttons.pack(fill=tk.X, pady=(10, 0))
+        _make_primary_button(buttons, "Send", send, width=100).pack(side=tk.RIGHT)
+        _make_secondary_button(buttons, "Cancel", win.destroy, width=100).pack(side=tk.RIGHT, padx=(0, 8))
+        ctk.CTkButton(
+            buttons, text="Take the tour", width=0, height=32, corner_radius=8,
+            fg_color="transparent", hover_color=SURFACE_HOVER, text_color=MUTED_TEXT_COLOR,
+            font=_font(12, "medium"), command=lambda: (win.destroy(), self._start_tour()),
+        ).pack(side=tk.LEFT)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        message.focus_set()
+
+    def _support_fallback(self, to, subject, content):
+        """If sending from the app isn't allowed (some organisations need IT
+        to approve it once), the same message opens in Outlook instead."""
+        self.status_var.set("Couldn't send from the app - opening it in your email app instead.")
+        url = f"mailto:{to}?" + urllib.parse.urlencode(
+            {"subject": subject, "body": content[:1500]}, quote_via=urllib.parse.quote
+        )
+        try:
+            os.startfile(url)
+        except Exception:
+            messagebox.showinfo("Support", f"Please email {to} - your message couldn't be sent.")
+
+    # ---------- tour ----------
+
+    def _tour_path(self):
+        return os.path.join(
+            os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "tour.json"
+        )
+
+    def _tour_seen(self):
+        return bool(self._read_json(self._tour_path()).get("seen"))
+
+    def _start_tour(self):
+        if getattr(self, "_tour", None) is not None:
+            return
+        steps = [
+            (lambda: self.search_frame, "Just describe it",
+             "Type what you need in plain English - “burger on a tray”, “friends cheering at "
+             "night” - and press Enter. Got a photo that's close? Use Find similar."),
+            (lambda: [self.collections_heading,
+                      getattr(self.sidebar, "_parent_frame", self.sidebar)], "Collections",
+             "Drag any photo onto a collection to file it. + creates a new one - or a shared "
+             "one for your team - and ↻ fetches what others added."),
+            (lambda: getattr(self.results_frame, "_parent_frame", self.results_frame), "Your photos",
+             "Double-click for a big preview, right-click to copy it in full resolution, and "
+             "hover to star a favourite."),
+            (lambda: [self.fav_card, self.history_card], "Favourites and history",
+             "Every photo you starred and every search you ran - one click to get back to them."),
+            (lambda: self.system_section, "Updates and help",
+             "The app keeps itself up to date. Settings, support and the story behind it live "
+             "down here. Enjoy!"),
+        ]
+        self._tour = Tour(self, steps, on_done=self._end_tour)
+
+    def _end_tour(self):
+        self._tour = None
+        try:
+            os.makedirs(os.path.dirname(self._tour_path()), exist_ok=True)
+            with open(self._tour_path(), "w", encoding="utf-8") as f:
+                json.dump({"seen": True, "version": APP_VERSION}, f)
+        except OSError:
+            pass
+
+    # ---------- about ----------
+
+    @staticmethod
+    def _code_stats():
+        """How many Python files and lines the running app is made of -
+        counted from the source when it is there (running from source, or
+        from a downloaded update), otherwise the figures for this release."""
+        folder = os.path.dirname(os.path.abspath(__file__))
+        files = lines = 0
+        for name in os.listdir(folder):
+            if name.endswith(".py"):
+                try:
+                    with open(os.path.join(folder, name), "r", encoding="utf-8") as f:
+                        lines += sum(1 for _ in f)
+                    files += 1
+                except OSError:
+                    pass
+        if files:
+            return files, lines
+        return 9, 6700  # the .exe holds compiled code only
+
+    def _show_about(self):
+        win = ctk.CTkToplevel(self.root)
+        win.title(f"About {APP_NAME}")
+        win.configure(fg_color=BG_COLOR)
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.after(250, lambda: win.iconbitmap(_resource_path("assets", "app_icon.ico")))
+        body = ctk.CTkFrame(win, fg_color="transparent")
+        body.pack(fill=tk.BOTH, expand=True, padx=28, pady=(24, 20))
+
+        top = ctk.CTkFrame(body, fg_color="transparent")
+        top.pack(fill=tk.X)
+        if getattr(self, "_logo_image", None):
+            ctk.CTkLabel(top, image=self._logo_image, text="").pack(side=tk.LEFT)
+        names = ctk.CTkFrame(top, fg_color="transparent")
+        names.pack(side=tk.LEFT, padx=(12, 0))
+        ctk.CTkLabel(names, text=APP_NAME, font=_font(20, "semibold"), text_color=TEXT_COLOR,
+                     anchor="w", height=26).pack(anchor="w")
+        ctk.CTkLabel(names, text=f"Version {APP_VERSION}  ·  Marketing photo library",
+                     font=_font(12), text_color=MUTED_TEXT_COLOR, anchor="w").pack(anchor="w")
+
+        files, lines = self._code_stats()
+
+        def block(heading, text, pady=(18, 0)):
+            ctk.CTkLabel(body, text=heading.upper(), font=_font(11, "medium"),
+                         text_color=FAINT_TEXT, anchor="w").pack(fill=tk.X, pady=pady)
+            ctk.CTkLabel(body, text=text, font=_font(13), text_color=TEXT_SOFT, anchor="w",
+                         justify="left", wraplength=420).pack(fill=tk.X, pady=(4, 0))
+
+        block("Created by", f"{APP_AUTHOR}")
+        block(
+            "How it was built",
+            f"Designed and developed by {APP_AUTHOR} with Claude, Anthropic's AI assistant, "
+            f"as a coding partner: {files} Python files with about {lines:,} lines of code. "
+            "It reads the marketing photo library on Microsoft SharePoint through Microsoft "
+            "Graph, signing in with your Greenreb Microsoft account.",
+        )
+        block(
+            "Built on",
+            "OpenAI CLIP (open_clip) to understand what is in each photo · PyTorch · "
+            "CustomTkinter · Pillow · Microsoft MSAL · the Inter typeface (SIL Open "
+            "Font License) · Lucide icons (ISC License).",
+        )
+        ctk.CTkLabel(body, text=f"© {datetime.date.today().year} {APP_AUTHOR}",
+                     font=_font(11), text_color=FAINT_TEXT, anchor="w").pack(fill=tk.X, pady=(18, 0))
+        row = ctk.CTkFrame(body, fg_color="transparent")
+        row.pack(fill=tk.X, pady=(14, 0))
+        _make_secondary_button(row, "Close", win.destroy, width=100).pack(side=tk.RIGHT)
+        _make_secondary_button(
+            row, "Take the tour", lambda: (win.destroy(), self._start_tour()), width=130
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+        win.bind("<Escape>", lambda _e: win.destroy())
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+    # ---------- updates ----------
+    #
+    # The app's own code (about 4 MB) is updated separately from the .exe's
+    # Python, libraries and model (about 600 MB). make_update.py publishes a
+    # package and a latest.json to the releases folder on SharePoint; the
+    # app downloads the package, checks it against the SHA-256 in
+    # latest.json, unpacks it, and launcher.py runs it from the next start.
+
+    def _updates_dir(self):
+        return os.path.join(
+            os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "app"
+        )
+
+    def _staged_update(self):
+        try:
+            with open(os.path.join(self._updates_dir(), "current.json"), "r", encoding="utf-8") as f:
+                return str(json.load(f).get("version") or "")
+        except Exception:
+            return ""
+
+    def _check_for_updates(self, interactive=False):
+        if self._update_checking:
+            return
+        if self._update_ready:
+            if interactive:
+                self.status_var.set(f"Version {self._update_ready} is ready - restart to update.")
+            return
+        self._update_checking = True
+        if interactive:
+            self.status_var.set("Checking for updates…")
+
+        def work():
+            try:
+                import config
+
+                client = self._sp_client(interactive)
+                if client is None:
+                    return
+                raw = client.download_bytes_by_path(
+                    config.UPDATE_SITE_PATH, f"{config.UPDATE_FOLDER_PATH}/latest.json"
+                )
+                if raw is None:
+                    if interactive:
+                        self.event_queue.put(("update_status", f"You're up to date (version {APP_VERSION})."))
+                    return
+                manifest = json.loads(raw.decode("utf-8"))
+                version = str(manifest["version"])
+                if version_tuple(version) <= version_tuple(APP_VERSION):
+                    if interactive:
+                        self.event_queue.put(("update_status", f"You're up to date (version {APP_VERSION})."))
+                    return
+                if int(manifest.get("runtime", -1)) != RUNTIME_VERSION:
+                    self.event_queue.put(("update_full", version, manifest.get("notes") or ""))
+                    return
+                if self._staged_update() != version:
+                    package = client.download_bytes_by_path(
+                        config.UPDATE_SITE_PATH, f"{config.UPDATE_FOLDER_PATH}/{manifest['package']}"
+                    )
+                    if package is None:
+                        raise ValueError("the update package is missing")
+                    if hashlib.sha256(package).hexdigest() != str(manifest["sha256"]).lower():
+                        raise ValueError("the update package does not match its checksum")
+                    self._stage_update(version, package)
+                self.event_queue.put(("update_ready", version))
+            except Exception as exc:
+                _log_reuse(f"UPDATE CHECK FAILED: {exc!r}")
+                if interactive:
+                    self.event_queue.put(("update_status", "Couldn't check for updates - try again later."))
+            finally:
+                self._update_checking = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _stage_update(self, version, package):
+        """Unpacks an update next to the others and points the launcher at
+        it. Refuses anything that isn't plainly one of our packages."""
+        root = self._updates_dir()
+        partial = os.path.join(root, f"{version}.partial")
+        shutil.rmtree(partial, ignore_errors=True)
+        os.makedirs(partial)
+        try:
+            self._unpack_update(package, partial)
+        except Exception:
+            shutil.rmtree(partial, ignore_errors=True)
+            raise
+        final = os.path.join(root, version)
+        shutil.rmtree(final, ignore_errors=True)
+        os.replace(partial, final)
+        with open(os.path.join(root, "current.json"), "w", encoding="utf-8") as f:
+            json.dump({"version": version, "runtime": RUNTIME_VERSION}, f)
+        # Older downloaded versions are no longer needed.
+        for entry in os.listdir(root):
+            path = os.path.join(root, entry)
+            if os.path.isdir(path) and entry not in (version, APP_VERSION):
+                shutil.rmtree(path, ignore_errors=True)
+
+    @staticmethod
+    def _unpack_update(package, partial):
+        with zipfile.ZipFile(io.BytesIO(package)) as z:
+            for info in z.infolist():
+                name = info.filename.replace("\\", "/")
+                if name.endswith("/"):
+                    continue
+                parts = name.split("/")
+                if name.startswith("/") or ".." in parts or ":" in name:
+                    raise ValueError(f"unsafe path in update: {name}")
+                if os.path.splitext(name)[1].lower() not in UPDATE_FILE_TYPES:
+                    raise ValueError(f"unexpected file in update: {name}")
+                dest = os.path.join(partial, *parts)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with z.open(info) as source, open(dest, "wb") as out:
+                    shutil.copyfileobj(source, out)
+        for module in APP_MODULES:
+            if not os.path.isfile(os.path.join(partial, f"{module}.py")):
+                raise ValueError(f"update is missing {module}.py")
+
+    def _show_update_notice(self, version, restart, note=""):
+        if restart:
+            self._update_ready = version
+            self.update_label.configure(text=f"Version {version} is ready")
+            self.update_button.pack(anchor="w", padx=10, pady=(6, 0))
+        else:
+            self.update_label.configure(
+                text=f"Version {version} is available as a new download. "
+                + (note or "Ask the app owner for the link.")
+            )
+            self.update_button.pack_forget()
+        if not self.update_row.winfo_ismapped():
+            self.update_row.pack(fill=tk.X, pady=(0, 12), before=self._footer_divider)
+
+    def _restart_app(self):
+        """Starts the app again through the launcher, which picks up the
+        downloaded version, then closes this window."""
+        if getattr(sys, "frozen", False):
+            command = [sys.executable]
+        else:
+            first = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+            if os.path.basename(first).lower() != "launcher.py":
+                first = os.path.join(os.path.dirname(os.path.abspath(__file__)), "launcher.py")
+            command = [sys.executable, first]
+        command.append("--after-update")
+        try:
+            os.remove(_handover_path())
+        except OSError:
+            pass
+        try:
+            subprocess.Popen(command, close_fds=True)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"Couldn't restart: {exc}")
+            return
+        # The same intro as at start-up, filling the screen, while the new
+        # version loads behind it. The new version opens its own identical
+        # screen on top and says so; then this window goes.
+        version = self._update_ready or "the new version"
+        try:
+            _fine_timer(True)
+            overlay = BootSplash(self.root, full=True)
+            overlay.show(on_shown=lambda: overlay.set_progress(0.35))
+            overlay.set_status(f"Updating to version {version}…")
+        except Exception:
+            overlay = None
+        started = time.perf_counter()
+
+        def wait_for_handover():
+            elapsed = time.perf_counter() - started
+            if os.path.exists(_handover_path()) or elapsed > 60:
+                if overlay is not None:
+                    overlay.set_progress(1.0)
+                self.root.after(300, self.root.destroy)
+                return
+            if overlay is not None and elapsed > 1.5:
+                # Creeps on while waiting, so it never looks stuck.
+                overlay.set_progress(min(0.9, 0.35 + elapsed / 20))
+            self.root.after(150, wait_for_handover)
+
+        self.root.after(400, wait_for_handover)
 
     def _show_result_menu(self, event, path, meta):
         """Right-click menu on a result: the keyboard-and-mouse route into a
@@ -3525,6 +4634,16 @@ class ImageSearchApp:
         return self._reduced_motion
 
     def _card_under_pointer(self, x_root, y_root):
+        # Cards scrolled out of view in the sidebar still have screen
+        # positions - over the System section - so only the visible part of
+        # the list counts.
+        try:
+            area = self.sidebar._parent_canvas
+            top = area.winfo_rooty()
+            if not (top <= y_root <= top + area.winfo_height()):
+                return None
+        except Exception:
+            pass
         for name, card in (self.collection_cards or {}).items():
             try:
                 cx, cy = card.winfo_rootx(), card.winfo_rooty()
@@ -3976,11 +5095,11 @@ class ImageSearchApp:
 
 # ---------- startup: splash and reveal ----------
 
-SPLASH_BG = "#0a0a0a"  # the window's own background, so the handover is seamless
-SPLASH_TRACK = "#262626"
-SPLASH_ACCENT = "#e5e5e5"  # a soft white, matching the neutral palette
-SPLASH_FAINT = "#737373"
-SPLASH_BORDER = "#262626"
+SPLASH_BG = "#090b0a"  # the window's own background, so the handover is seamless
+SPLASH_TRACK = "#1d2621"
+SPLASH_ACCENT = "#34d399"  # a soft white, matching the neutral palette
+SPLASH_FAINT = "#6b7a72"
+SPLASH_BORDER = "#24302a"
 FRAME_MS = 8
 
 
@@ -4147,6 +5266,367 @@ def _round_corners(win, border=SPLASH_BORDER):
         pass
 
 
+# Started with this flag by "Restart to update": the intro then fills the
+# screen and appears without its entrance, continuing the screen the old
+# version is showing, so the update reads as one window reloading.
+AFTER_UPDATE = "--after-update" in sys.argv
+
+
+def _handover_path():
+    return os.path.join(
+        os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "app", "handover"
+    )
+
+
+def _work_area(win):
+    """The primary screen minus the taskbar - where a maximised window sits."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        rect = ctypes.wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+            return rect.left, rect.top, rect.right, rect.bottom
+    except Exception:
+        pass
+    return 0, 0, win.winfo_screenwidth(), win.winfo_screenheight()
+
+
+class Tour:
+    """A five-step guided tour. The window dims, the part being explained
+    stays lit with a ring around it, and a bubble beside it says what it is.
+    Moving on, the lit area glides and resizes to the next part in one eased
+    motion. Clicking anywhere in the app (outside the bubble) ends the tour.
+
+    The dimmed layer is a translucent window over the app with a hole in it
+    (a colour Windows treats as see-through), so what is lit is the real,
+    live control - not a picture of it.
+    """
+
+    KEY = "#ff00fe"      # drawn in this colour = see-through
+    DIM = 0.62           # how dark the rest of the window goes
+    PAD = 8              # space between a control and its ring
+    MOVE_MS = 420        # the lit area gliding to the next part
+    FADE_MS = 200
+
+    def __init__(self, app, steps, on_done):
+        self.app, self.root, self.steps, self.on_done = app, app.root, steps, on_done
+        self.reduced = _prefers_reduced_motion()
+        self.index = 0
+        self.rect = None
+        self.closed = False
+        self.bubble = None
+        self.overlay = tk.Toplevel(self.root)
+        self.overlay.overrideredirect(True)
+        self.overlay.transient(self.root)  # stays above the app
+        self.overlay.configure(bg="#000000")
+        try:
+            self.overlay.attributes("-transparentcolor", self.KEY)
+            self.overlay.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+        self.canvas = tk.Canvas(self.overlay, bg="#000000", highlightthickness=0, bd=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.hole = self.canvas.create_polygon(0, 0, 0, 0, fill=self.KEY, outline="", smooth=True)
+        self.ring = self.canvas.create_polygon(0, 0, 0, 0, fill="", outline="#34d399", width=2,
+                                               smooth=True)
+        self._place_overlay()
+        # A click anywhere but the bubble ends the tour: on the dimmed area,
+        # or through the hole on the lit control itself. (Never unbound -
+        # tkinter's unbind would drop other handlers - it is inert once closed.)
+        self.canvas.bind("<Button-1>", lambda _e: self.close())
+        self.root.bind("<Button-1>", lambda _e: self.close(), add="+")
+        self.root.bind("<Configure>", self._on_root_moved, add="+")
+        self._bind_keys(self.overlay)
+        self._last_geometry = None
+        self._follow_window()
+        _fine_timer(True)
+        _animate(self.root, 0 if self.reduced else 240,
+                 lambda p: self._overlay_alpha(self.DIM * p))
+        self._go(0, first=True)
+
+    def _bind_keys(self, widget):
+        for key, action in (("<Escape>", self.close), ("<Right>", self.next),
+                            ("<Return>", self.next), ("<Left>", self.back)):
+            widget.bind(key, lambda _e, a=action: a())
+
+    # --- geometry ---
+
+    def _place_overlay(self):
+        x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        self.origin = (x, y)
+        self.overlay.geometry(f"{w}x{h}+{x}+{y}")
+        self.canvas.configure(width=w, height=h)
+        self.overlay.lift()
+
+    def _overlay_alpha(self, value):
+        try:
+            self.overlay.attributes("-alpha", value)
+        except tk.TclError:
+            pass
+
+    def _target_rect(self, step):
+        """The area to light: one widget, or the span of several."""
+        widgets = self.steps[step][0]()
+        if not isinstance(widgets, (list, tuple)):
+            widgets = [widgets]
+        self.root.update_idletasks()
+        boxes = [(w.winfo_rootx(), w.winfo_rooty(),
+                  w.winfo_rootx() + w.winfo_width(), w.winfo_rooty() + w.winfo_height())
+                 for w in widgets]
+        x0 = min(b[0] for b in boxes) - self.origin[0] - self.PAD
+        y0 = min(b[1] for b in boxes) - self.origin[1] - self.PAD
+        x1 = max(b[2] for b in boxes) - self.origin[0] + self.PAD
+        y1 = max(b[3] for b in boxes) - self.origin[1] + self.PAD
+        y1 = min(y1, y0 + 380)  # the photo grid runs off the screen: light its top
+        return [x0, y0, x1, y1]
+
+    @staticmethod
+    def _rounded(x0, y0, x1, y1, r=12):
+        r = max(2, min(r, (x1 - x0) / 2, (y1 - y0) / 2))
+        return [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+                x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+
+    def _draw(self, rect):
+        self.rect = rect
+        self.canvas.coords(self.hole, *self._rounded(*rect))
+        x0, y0, x1, y1 = rect
+        self.canvas.coords(self.ring, *self._rounded(x0 - 2, y0 - 2, x1 + 2, y1 + 2, 14))
+
+    def _window_geometry(self):
+        r = self.root
+        return (r.winfo_rootx(), r.winfo_rooty(), r.winfo_width(), r.winfo_height())
+
+    def _follow_window(self):
+        """Keeps the dimming and the lit area on the window when it is moved,
+        resized, maximised or dragged to another monitor: checked ten times a
+        second, and everything is re-measured as soon as it changes."""
+        if self.closed:
+            return
+        try:
+            geometry = self._window_geometry()
+            if self._last_geometry is not None and geometry != self._last_geometry:
+                self._realign()
+            self._last_geometry = geometry
+        except tk.TclError:
+            return
+        self.root.after(100, self._follow_window)
+
+    def _realign(self):
+        try:
+            self._place_overlay()
+            self.overlay.update_idletasks()
+            self._draw(self._target_rect(self.index))
+            self._place_bubble()
+        except Exception:
+            pass
+
+    def _on_root_moved(self, event=None):
+        if self.closed or (event is not None and event.widget is not self.root):
+            return
+        try:
+            self._place_overlay()
+            self._draw(self._target_rect(self.index))
+            self._place_bubble()
+        except Exception:
+            pass
+
+    # --- steps ---
+
+    def next(self):
+        if self.index + 1 >= len(self.steps):
+            self.close()
+        else:
+            self._go(self.index + 1)
+
+    def back(self):
+        if self.index > 0:
+            self._go(self.index - 1)
+
+    def _go(self, index, first=False):
+        if self.closed:
+            return
+        try:
+            target = self._target_rect(index)
+        except Exception:
+            _log_crash("tour step", sys.exc_info())
+            self.close()
+            return
+        self.index = index
+        start = self.rect or target
+        self._fade_bubble_out()
+        token = self._move_token = object()
+
+        def step(p):
+            # Position and size travel together on one curve, so the light
+            # reads as one shape gliding and reshaping, not jumping.
+            if self._move_token is token and not self.closed:
+                self._draw([a + (b - a) * p for a, b in zip(start, target)])
+
+        def arrived():
+            if self._move_token is token:
+                self._show_bubble()
+
+        _animate(self.root, 0 if (self.reduced or first) else self.MOVE_MS, step,
+                 done=arrived, ease=EASE_IN_OUT)
+
+    # --- the bubble ---
+
+    def _fade_bubble_out(self):
+        bubble, self.bubble = self.bubble, None
+        if bubble is None:
+            return
+
+        def fade(p):
+            try:
+                bubble.attributes("-alpha", 1 - p)
+            except tk.TclError:
+                pass
+
+        def gone():
+            try:
+                bubble.destroy()
+            except tk.TclError:
+                pass
+
+        _animate(self.root, 0 if self.reduced else 120, fade, done=gone)
+
+    def _show_bubble(self):
+        if self.closed:
+            return
+        try:
+            self._build_bubble()
+        except Exception:
+            _log_crash("tour bubble", sys.exc_info())
+
+    def _build_bubble(self):
+        _getter, title, text = self.steps[self.index]
+        total = len(self.steps)
+        last = self.index + 1 == total
+        bg = "#141917"
+        # Plain Tk only: a CustomTkinter widget in a window CustomTkinter
+        # didn't create can fail to draw, which left the first version of
+        # this bubble invisible.
+        b = self.bubble = tk.Toplevel(self.root)
+        b.withdraw()
+        b.overrideredirect(True)
+        b.transient(self.overlay)
+        b.configure(bg=bg)
+        try:
+            b.attributes("-topmost", True)
+            b.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+        frame = tk.Frame(b, bg=bg, padx=18, pady=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+        tk.Label(frame, text=title, bg=bg, fg=TEXT_COLOR, font=(UI_FONT_SEMIBOLD, -16),
+                 anchor="w", justify="left").pack(fill=tk.X)
+        tk.Label(frame, text=text, bg=bg, fg=TEXT_SOFT, font=(UI_FONT, -13), anchor="w",
+                 justify="left", wraplength=300).pack(fill=tk.X, pady=(6, 14))
+        row = tk.Frame(frame, bg=bg)
+        row.pack(fill=tk.X)
+
+        def button(icon, fallback, command, primary=False, enabled=True):
+            fill = PRIMARY if primary else bg
+            hover = PRIMARY_HOVER if primary else SURFACE_HOVER
+            ink = PRIMARY_TEXT if primary else (TEXT_COLOR if enabled else "#3f4a44")
+            c = tk.Canvas(row, width=36, height=32, bg=bg, highlightthickness=0, bd=0,
+                          cursor="hand2" if enabled else "")
+            shape = c.create_polygon(*Tour._rounded(1, 1, 35, 31, 8), fill=fill,
+                                     outline="" if primary else ("#2a3830" if enabled else "#1d2621"),
+                                     smooth=True)
+            image = _icon_tk(icon, 16, ink)
+            if image is not None:
+                c.create_image(18, 16, image=image)
+                c.image = image
+            else:
+                c.create_text(18, 16, text=fallback, fill=ink, font=(UI_FONT_SEMIBOLD, -14))
+            if enabled:
+                c.bind("<Enter>", lambda _e: c.itemconfigure(shape, fill=hover))
+                c.bind("<Leave>", lambda _e: c.itemconfigure(shape, fill=fill))
+                c.bind("<Button-1>", lambda _e: command())
+            return c
+
+        button("done" if last else "next", "✓" if last else "→", self.next, primary=True).pack(
+            side=tk.RIGHT)
+        tk.Label(row, text=f"{self.index + 1}/{total}", bg=bg, fg=MUTED_TEXT_COLOR,
+                 font=(UI_FONT_MEDIUM, -12), width=4).pack(side=tk.RIGHT, padx=4)
+        button("back", "←", self.back, enabled=self.index > 0).pack(side=tk.RIGHT)
+        if not last:
+            skip = tk.Label(row, text="Skip", bg=bg, fg=MUTED_TEXT_COLOR,
+                            font=(UI_FONT_MEDIUM, -12), cursor="hand2")
+            skip.bind("<Button-1>", lambda _e: self.close())
+            skip.bind("<Enter>", lambda _e: skip.configure(fg=TEXT_COLOR))
+            skip.bind("<Leave>", lambda _e: skip.configure(fg=MUTED_TEXT_COLOR))
+            skip.pack(side=tk.LEFT)
+        self._bind_keys(b)
+        b.update_idletasks()
+        self._place_bubble(rise=0 if self.reduced else 6)
+        b.deiconify()
+        b.update_idletasks()
+        _round_corners(b, border="#2a3830")
+        b.lift()
+        b.focus_force()
+
+        def appear(p):
+            if self.bubble is not b:
+                return
+            try:
+                b.attributes("-alpha", p)
+                self._place_bubble(rise=0 if self.reduced else round(6 * (1 - p)))
+            except tk.TclError:
+                pass
+
+        def check():
+            try:
+                _log_reuse(f"TOUR step {self.index + 1}: bubble at {b.winfo_geometry()}, "
+                           f"shown={b.winfo_ismapped()}")
+            except Exception:
+                pass
+
+        _animate(self.root, 0 if self.reduced else self.FADE_MS, appear, done=check)
+
+    def _place_bubble(self, rise=0):
+        b = self.bubble
+        if b is None or self.rect is None:
+            return
+        bw, bh = b.winfo_reqwidth(), b.winfo_reqheight()
+        ox, oy = self.origin
+        x0, y0, x1, y1 = [round(v) for v in self.rect]
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        gap = 16
+        # Beside the lit part if there is room, otherwise below or above it.
+        if x1 + gap + bw <= w:
+            x, y = x1 + gap, y0
+        elif y1 + gap + bh <= h:
+            x, y = x0, y1 + gap
+        elif y0 - gap - bh >= 0:
+            x, y = x0, y0 - gap - bh
+        else:
+            x, y = max(0, x0 - gap - bw), y0
+        x = max(8, min(x, w - bw - 8))
+        y = max(8, min(y, h - bh - 8))
+        b.geometry(f"+{ox + x}+{oy + y + rise}")
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self._fade_bubble_out()
+
+        def finish():
+            try:
+                self.overlay.destroy()
+            except tk.TclError:
+                pass
+            _fine_timer(False)
+            self.on_done()
+
+        _animate(self.root, 0 if self.reduced else 200,
+                 lambda p: self._overlay_alpha(self.DIM * (1 - p)), done=finish)
+
+
 class BootSplash:
     """The card on screen from the moment the app starts until its window is
     ready.
@@ -4167,9 +5647,16 @@ class BootSplash:
     BAR_MS = 420
     GLOW_PERIOD_S = 1.8
 
-    def __init__(self, root):
+    CARD_W, CARD_H = 460, 300
+
+    def __init__(self, root, full=False, static=False):
+        """full: fill the screen like the maximised window instead of a
+        small card. static: appear complete at once, with no entrance -
+        used when continuing a screen another window is already showing."""
         self.root = root
         self.reduced = _prefers_reduced_motion()
+        self.full = full
+        self.static = static
         self._closing = False
         win = self.win = tk.Toplevel(root)
         win.withdraw()
@@ -4181,13 +5668,24 @@ class BootSplash:
         except tk.TclError:
             pass
         screen_w, screen_h = win.winfo_screenwidth(), win.winfo_screenheight()
-        self.x = (screen_w - self.WIDTH) // 2
-        # A little above centre: the optical centre of a screen sits higher
-        # than the geometric one, and a dead-centred card looks low.
-        self.y = (screen_h - self.HEIGHT) // 2 - screen_h // 40
-        self._place(0 if self.reduced else self.CARD_RISE)
+        if full:
+            left, top, right, bottom = _work_area(win)
+            self.WIDTH, self.HEIGHT = right - left, bottom - top
+            self.x, self.y = left, top
+            # The card's contents, centred on the screen (a little high:
+            # the optical centre of a screen sits above the geometric one).
+            ox = (self.WIDTH - self.CARD_W) // 2
+            oy = (self.HEIGHT - self.CARD_H) // 2 - self.HEIGHT // 40
+        else:
+            self.x = (screen_w - self.WIDTH) // 2
+            # A little above centre: the optical centre of a screen sits higher
+            # than the geometric one, and a dead-centred card looks low.
+            self.y = (screen_h - self.HEIGHT) // 2 - screen_h // 40
+            ox = oy = 0
+        self._place(0 if (self.reduced or full) else self.CARD_RISE)
 
         w, h = self.WIDTH, self.HEIGHT
+        cx = ox + self.CARD_W // 2
         c = self.canvas = tk.Canvas(
             win, width=w, height=h, bg=SPLASH_BG, highlightthickness=0, bd=0
         )
@@ -4198,25 +5696,25 @@ class BootSplash:
 
         try:
             self._shield_frames = _fade_frames(_load_mark(84), 14)
-            shield = c.create_image(w // 2, 86, image=self._shield_frames[0])
+            shield = c.create_image(cx, oy + 86, image=self._shield_frames[0])
             self._entrance.append(
-                (40, lambda q: self._fade_image(shield, self._shield_frames, w // 2, 86, q))
+                (40, lambda q: self._fade_image(shield, self._shield_frames, cx, oy + 86, q))
             )
         except Exception:
             self._shield_frames = []
 
-        title = c.create_text(w // 2, 160, text="Image Search", fill=SPLASH_BG,
+        title = c.create_text(cx, oy + 160, text=APP_NAME, fill=SPLASH_BG,
                               font=(UI_FONT_SEMIBOLD, -26))
-        self._entrance.append((90, lambda q: self._fade_text(title, TEXT_COLOR, w // 2, 160, q)))
-        subtitle = c.create_text(w // 2, 190, text="Marketing photo library", fill=SPLASH_BG,
+        self._entrance.append((90, lambda q: self._fade_text(title, TEXT_COLOR, cx, oy + 160, q)))
+        subtitle = c.create_text(cx, oy + 190, text="Marketing photo library", fill=SPLASH_BG,
                                  font=(UI_FONT, -14))
         self._entrance.append(
-            (130, lambda q: self._fade_text(subtitle, MUTED_TEXT_COLOR, w // 2, 190, q))
+            (130, lambda q: self._fade_text(subtitle, MUTED_TEXT_COLOR, cx, oy + 190, q))
         )
 
         self._bar_w = 200
-        self._bar_x = (w - self._bar_w) // 2
-        self._bar_y = 228
+        self._bar_x = ox + (self.CARD_W - self._bar_w) // 2
+        self._bar_y = oy + 228
         track = c.create_rectangle(self._bar_x, self._bar_y, self._bar_x + self._bar_w,
                                    self._bar_y + 3, fill=SPLASH_BG, width=0)
         self._bar = c.create_rectangle(self._bar_x, self._bar_y, self._bar_x,
@@ -4236,7 +5734,7 @@ class BootSplash:
 
         self._entrance.append((170, bar_in))
 
-        self._status_xy = (w // 2, 252)
+        self._status_xy = (cx, oy + 252)
         self._status = c.create_text(*self._status_xy, text="Starting…", fill=SPLASH_BG,
                                      font=(UI_FONT, -12))
         self._entrance.append(
@@ -4244,7 +5742,8 @@ class BootSplash:
         )
         stamp = _build_stamp()
         if stamp:
-            version = c.create_text(w - 16, h - 12, text=f"version {stamp}", anchor="se",
+            version = c.create_text(ox + self.CARD_W - 16, oy + self.CARD_H - 12,
+                                    text=f"version {APP_VERSION}", anchor="se",
                                     fill=SPLASH_BG, font=(UI_FONT, -11))
             self._entrance.append(
                 (240, lambda q: c.itemconfigure(version, fill=_mix(SPLASH_BG, SPLASH_FAINT, q)))
@@ -4287,8 +5786,15 @@ class BootSplash:
     def show(self, on_shown):
         self.win.deiconify()
         self.win.update_idletasks()
-        _round_corners(self.win)
+        if not self.full:
+            _round_corners(self.win)
         self._breathe()
+        if self.static:
+            for _delay, apply in self._entrance:
+                apply(1.0)
+            self._alpha(1.0)
+            self.root.after(0, on_shown)
+            return
         if self.reduced:
             for _delay, apply in self._entrance:
                 apply(1.0)
@@ -4301,7 +5807,8 @@ class BootSplash:
             t = p * total
             card = EASE_OUT(min(1.0, t / self.CARD_IN_MS))
             self._alpha(card)
-            self._place(round(self.CARD_RISE * (1 - card)))
+            if not self.full:
+                self._place(round(self.CARD_RISE * (1 - card)))
             for delay, apply in self._entrance:
                 apply(EASE_OUT(max(0.0, min(1.0, (t - delay) / self.ITEM_IN_MS))))
 
@@ -4381,7 +5888,7 @@ class BootSplash:
     def hide(self, done=None):
         """Fades out faster than it came in - leaving should never hold
         anything up - and keeps drifting the way it arrived."""
-        drift = 0 if self.reduced else 6
+        drift = 0 if (self.reduced or self.full) else 6
 
         def step(p):
             self._alpha(1 - p)
@@ -4425,7 +5932,9 @@ class BootSequence:
     def start(self):
         _fine_timer(True)
         try:
-            self.splash = BootSplash(self.root)
+            self.splash = BootSplash(self.root, full=True, static=AFTER_UPDATE)
+            if AFTER_UPDATE:
+                self.splash.set_status(f"Starting version {APP_VERSION}…")
             _boot_mark("splash built")
             self.splash.show(on_shown=self._on_splash_shown)
         except Exception:
@@ -4438,6 +5947,13 @@ class BootSequence:
 
     def _on_splash_shown(self):
         _boot_mark("splash on screen")
+        if AFTER_UPDATE:
+            # Tells the old version its screen is now covered and it can go.
+            try:
+                with open(_handover_path(), "w", encoding="utf-8") as f:
+                    f.write(str(os.getpid()))
+            except OSError:
+                pass
         self._shown_at = time.perf_counter()
         # Built while the card is still: building the window holds the main
         # thread for a few hundred ms, and a text change started now would
@@ -4531,6 +6047,15 @@ class BootSequence:
             # After the reveal, not during it: importing torch holds the
             # interpreter for seconds and would freeze the crossfade.
             self.root.after(700, self.app._warm_model)
+            # Shared collections and updates are looked up quietly a few
+            # seconds later, from the saved sign-in only - no browser pops up.
+            self.root.after(5000, self.app._start_background_checks)
+            if not AFTER_UPDATE and not self.app._tour_seen():
+                self.root.after(1200, self.app._start_tour)
+            if AFTER_UPDATE:
+                self.root.after(400, lambda: self.app.status_var.set(
+                    f"Updated to version {APP_VERSION}. Everything you had is still here."
+                ))
 
     def _fail(self):
         _fine_timer(False)
@@ -4538,8 +6063,8 @@ class BootSequence:
             self.splash.destroy()
             self.splash = None
         messagebox.showerror(
-            "Image Search",
-            "Image Search could not start. The details were written to "
+            APP_NAME,
+            f"{APP_NAME} could not start. The details were written to "
             "crash.log in %LOCALAPPDATA%\\ImageSearch.",
         )
         self.root.destroy()
@@ -4588,6 +6113,11 @@ def main():
         pass
     _register_bundled_fonts()
     root = ctk.CTk()
+    # Errors inside button clicks, timers and animations are otherwise
+    # printed to a console nobody sees; this keeps a record of them.
+    root.report_callback_exception = lambda kind, value, tb: _log_crash(
+        "UI callback", (kind, value, tb)
+    )
     _choose_ui_fonts(root)
     try:
         font_theme = ctk.ThemeManager.theme["CTkFont"]
