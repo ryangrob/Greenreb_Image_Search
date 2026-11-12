@@ -59,7 +59,9 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageTk
 _T_PIL = time.perf_counter()
 
 from search_engine import ImageSearchEngine, MODEL_TAG
-from app_version import APP_AUTHOR, APP_MODULES, APP_NAME, APP_VERSION, RUNTIME_VERSION, version_tuple
+from app_version import (
+    APP_AUTHOR, APP_MODULES, APP_NAME, APP_VERSION, RUNTIME_VERSION, WHATS_NEW, version_tuple,
+)
 _T_ENGINE = time.perf_counter()
 _SHAREPOINT = None
 
@@ -365,6 +367,8 @@ SOURCE_DOT = "#34d399"
 NAV_HOVER = "#17201b"
 NAV_SELECTED = "#123628"
 SYSTEM_TEXT = "#84928b"  # System items sit back from the rest of the sidebar
+MENU_BORDER = "#2a3830"
+DANGER = "#f87171"
 PRIMARY = "#10a573"
 PRIMARY_HOVER = "#14c088"
 
@@ -378,6 +382,9 @@ _ICON_GLYPHS = {
     "shared": "\uE716", "update": "\uE896", "sync": "\uE72C", "info": "\uE946",
     "support": "\uE897", "local": "\uEDA2",
     "back": "\uE72B", "next": "\uE72A", "done": "\uE73E",
+    "preview": "\uE7B3", "copy": "\uE8C8", "external": "\uE8A7", "newfolder": "\uE8F4",
+    "move": "\uE8DE", "remove": "\uE738", "trash": "\uE74D", "edit": "\uE70F",
+    "whatsnew": "\uE734",
 }
 _icon_cache = {}
 # The same outline icon set as the Sales Cockpit (Lucide), from the bundled
@@ -389,6 +396,9 @@ _LUCIDE_NAMES = {
     "shared": "users", "update": "download", "sync": "refresh-cw", "info": "info",
     "support": "life-buoy", "local": "hard-drive",
     "back": "arrow-left", "next": "arrow-right", "done": "check",
+    "preview": "eye", "copy": "copy", "external": "external-link", "newfolder": "folder-plus",
+    "move": "folder-input", "remove": "folder-minus", "trash": "trash-2", "edit": "pencil",
+    "whatsnew": "sparkles",
 }
 _lucide_codes = None
 
@@ -799,17 +809,37 @@ class ImageSearchApp:
         # grow without pushing it off the window.
         footer = ctk.CTkFrame(nav, fg_color="transparent")
         footer.pack(side=tk.BOTTOM, fill=tk.X)
-        # Shown only when a newer version is ready (see _show_update_notice).
-        self.update_row = ctk.CTkFrame(footer, fg_color="transparent")
-        self.update_label = ctk.CTkLabel(
-            self.update_row, text="", font=_font(12, "medium"), text_color=TEXT_COLOR,
-            anchor="w", justify="left", wraplength=200,
+        # The update card: always says which version this is, and when a newer
+        # one is ready, what it brings and a button to switch to it.
+        card = self.update_card = ctk.CTkFrame(
+            footer, fg_color=SURFACE, corner_radius=10, border_width=1, border_color=BORDER,
         )
-        self.update_label.pack(fill=tk.X, padx=10)
-        self.update_button = _make_primary_button(
-            self.update_row, "Restart to update", self._restart_app, width=200
+        card.pack(fill=tk.X, pady=(0, 10))
+        top = ctk.CTkFrame(card, fg_color="transparent")
+        top.pack(fill=tk.X, padx=12, pady=(9, 0))
+        self.update_title = ctk.CTkLabel(top, text="", font=_font(12, "semibold"),
+                                         text_color=TEXT_COLOR, anchor="w", height=18)
+        self.update_title.pack(side=tk.LEFT)
+        self.update_pill = ctk.CTkLabel(top, text="", font=_font(10, "medium"),
+                                        text_color=FAINT_TEXT, anchor="e", height=18)
+        self.update_pill.pack(side=tk.RIGHT)
+        self.update_detail = ctk.CTkLabel(card, text="", font=_font(11), text_color=MUTED_TEXT_COLOR,
+                                          anchor="w", justify="left", wraplength=196)
+        self.update_detail.pack(fill=tk.X, padx=12, pady=(1, 0))
+        actions = ctk.CTkFrame(card, fg_color="transparent")
+        actions.pack(fill=tk.X, padx=8, pady=(4, 7))
+        self.update_button = _make_primary_button(actions, "Restart to update", self._restart_app,
+                                                  width=0)
+        self.update_button.configure(height=28, font=_font(12, "semibold"))
+        self.whats_new_link = ctk.CTkButton(
+            actions, text="What's new", width=0, height=26, corner_radius=6,
+            fg_color="transparent", hover_color=SURFACE_HOVER, text_color=MUTED_TEXT_COLOR,
+            font=_font(11, "medium"), image=_icon("whatsnew", 13, MUTED_TEXT_COLOR),
+            compound="left", command=self._show_whats_new,
         )
-        self.update_button.configure(height=32)
+        self.whats_new_link.pack(side=tk.LEFT)
+        self._update_info = {"version": APP_VERSION, "changes": list(WHATS_NEW)}
+        self._set_update_card("current")
         self._footer_divider = ctk.CTkFrame(footer, fg_color=BORDER, height=1, corner_radius=0)
         self._footer_divider.pack(fill=tk.X, pady=(0, 10))
         source = ctk.CTkFrame(footer, fg_color="transparent")
@@ -822,13 +852,13 @@ class ImageSearchApp:
             source, textvariable=self.folder_var, text_color=MUTED_TEXT_COLOR, font=_font(12),
             justify="left", anchor="w", wraplength=180,
         ).pack(side=tk.LEFT, padx=(6, 0), fill=tk.X)
-        version = f"Version {APP_VERSION}"
         stamp = _build_stamp()
         if stamp and not getattr(sys, "frozen", False):
-            version += f"  \u00b7  {stamp}"  # running from source: when it last changed
-        ctk.CTkLabel(
-            footer, text=version, text_color=FAINT_TEXT, font=_font(11), anchor="w", height=18,
-        ).pack(fill=tk.X, padx=(28, 10), pady=(2, 0))
+            # Running from source: when the code last changed.
+            ctk.CTkLabel(
+                footer, text=f"Source changed {stamp}", text_color=FAINT_TEXT, font=_font(11),
+                anchor="w", height=18,
+            ).pack(fill=tk.X, padx=(28, 10), pady=(2, 0))
 
         system = self.system_section = ctk.CTkFrame(nav, fg_color="transparent")
         system.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 12))
@@ -869,6 +899,7 @@ class ImageSearchApp:
             font=_font(15, "semibold"),
         )
         add_button.configure(command=lambda: self._show_add_collection_menu(add_button))
+        self.collection_add_button = add_button
         add_button.pack(side=tk.RIGHT, padx=(0, 4))
         # Fetches shared collections now - after someone has been added to
         # one, or to pick up photos others just put in.
@@ -2947,9 +2978,16 @@ class ImageSearchApp:
                 elif kind in ("shared_status", "update_status"):
                     self.status_var.set(event[1])
                 elif kind == "update_ready":
-                    self._show_update_notice(event[1], restart=True)
+                    self._show_update_notice(event[1], restart=True, changes=event[2])
                 elif kind == "update_full":
-                    self._show_update_notice(event[1], restart=False, note=event[2])
+                    self._show_update_notice(event[1], restart=False, note=event[2], changes=event[3])
+                elif kind == "update_uptodate":
+                    if not self._update_ready:
+                        self._set_update_card("uptodate")
+                    if event[1]:
+                        self.status_var.set(f"You're up to date - version {APP_VERSION}.")
+                elif kind == "update_card":
+                    self._set_update_card(event[1])
                 elif kind == "error":
                     self.progress.stop()
                     self.progress.configure(mode="determinate")
@@ -3564,13 +3602,11 @@ class ImageSearchApp:
         if self._is_shared(name):
             self._show_shared_menu(event, name)
             return
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="Rename…", command=lambda: self._rename_collection(name))
-        menu.add_command(label="Remove…", command=lambda: self._remove_collection(name))
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+        self._popup(event.x_root, event.y_root, [
+            ("item", "Rename…", "edit", lambda: self._rename_collection(name)),
+            ("sep",),
+            ("item", "Remove…", "trash", lambda: self._remove_collection(name), {"danger": True}),
+        ])
 
     def _add_to_collection(self, name, path, meta):
         item_id = (meta or {}).get("item_id")
@@ -3877,13 +3913,10 @@ class ImageSearchApp:
         threading.Thread(target=work, daemon=True).start()
 
     def _show_add_collection_menu(self, button):
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="New collection…", command=self._new_collection)
-        menu.add_command(label="New shared collection…", command=self._new_shared_collection)
-        try:
-            menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height() + 2)
-        finally:
-            menu.grab_release()
+        self._popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height() + 4, [
+            ("item", "New collection…", "newfolder", self._new_collection),
+            ("item", "New shared collection…", "shared", self._new_shared_collection),
+        ])
 
     def _show_shared_menu(self, event, name):
         record = self._shared_by_name().get(name) or {}
@@ -3891,24 +3924,17 @@ class ImageSearchApp:
         owner = str(record.get("owner") or "")
         is_owner = bool(me) and owner.lower() == me
         people = len(record.get("members") or [])
-        menu = tk.Menu(self.root, tearoff=0)
+        items = [("header", f"Shared with {people} {'person' if people == 1 else 'people'}"
+                  + ("" if is_owner else f" \u00b7 by {owner or 'someone else'}"))]
         if is_owner:
-            menu.add_command(label="Name and people…", command=lambda: self._manage_shared(name))
-        else:
-            menu.add_command(label=f"Shared by {owner or 'someone else'}", state=tk.DISABLED)
-        menu.add_command(label=f"Shared with {people} {'person' if people == 1 else 'people'}",
-                         state=tk.DISABLED)
-        menu.add_command(label="Sync now",
-                         command=lambda: self._sync_shared(interactive=True, announce=True))
-        menu.add_separator()
-        menu.add_command(
-            label="Delete shared collection…" if is_owner else "Leave this collection…",
-            command=lambda: self._leave_or_delete_shared(name),
-        )
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+            items.append(("item", "Name and people…", "edit", lambda: self._manage_shared(name)))
+        items += [
+            ("item", "Sync now", "sync", lambda: self._sync_shared(interactive=True, announce=True)),
+            ("sep",),
+            ("item", "Delete shared collection…" if is_owner else "Leave this collection…",
+             "trash", lambda: self._leave_or_delete_shared(name), {"danger": True}),
+        ]
+        self._popup(event.x_root, event.y_root, items)
 
     @staticmethod
     def _parse_emails(text):
@@ -4063,6 +4089,9 @@ class ImageSearchApp:
             "It opens in Outlook so you can read it and send it yourself.",
         ):
             return
+        import config
+
+        download = getattr(config, "DOWNLOAD_URL", "")
         subject = f"I've shared the photo collection “{name}” with you"
         body = (
             "Hi,\n\n"
@@ -4071,8 +4100,9 @@ class ImageSearchApp:
             "To see it: open the app and click the sync button (↻) next to Collections - or just "
             f"restart it. “{name}” then appears under Collections, and you can add or remove "
             "photos by dragging them onto it.\n\n"
-            "Don't have the app yet? Just reply and I'll send it to you.\n\n"
-            "Best"
+            + (f"Don't have {APP_NAME} yet? Download it here:\n{download}\n\n" if download
+               else "Don't have the app yet? Just reply and I'll send it to you.\n\n")
+            + "Best"
         )
         url = "mailto:" + ",".join(emails) + "?" + urllib.parse.urlencode(
             {"subject": subject, "body": body}, quote_via=urllib.parse.quote
@@ -4134,18 +4164,14 @@ class ImageSearchApp:
     # ---------- local folder, support ----------
 
     def _show_local_folder_menu(self, anchor):
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="Choose folder…", command=self._choose_folder)
         try:
             enabled = str(self.index_button.cget("state")) == "normal"
         except Exception:
             enabled = False
-        menu.add_command(label="Index folder", command=self._start_indexing,
-                         state=tk.NORMAL if enabled else tk.DISABLED)
-        try:
-            menu.tk_popup(anchor.winfo_rootx() + 12, anchor.winfo_rooty() + anchor.winfo_height())
-        finally:
-            menu.grab_release()
+        self._popup(anchor.winfo_rootx() + 12, anchor.winfo_rooty(), [
+            ("item", "Choose folder…", "open", self._choose_folder),
+            ("item", "Index folder", "index", self._start_indexing, {"enabled": enabled}),
+        ])
 
     def _app_details(self):
         lines = [
@@ -4275,13 +4301,19 @@ class ImageSearchApp:
         if getattr(self, "_tour", None) is not None:
             return
         steps = [
-            (lambda: self.search_frame, "Just describe it",
+            (lambda: [self.search_frame, self.suggestion_bar], "How to browse through the library",
              "Type what you need in plain English - “burger on a tray”, “friends cheering at "
-             "night” - and press Enter. Got a photo that's close? Use Find similar."),
+             "night” - and press Enter. Got a photo that's close? Use Find similar. Your recent "
+             "searches wait right below."),
             (lambda: [self.collections_heading,
                       getattr(self.sidebar, "_parent_frame", self.sidebar)], "Collections",
-             "Drag any photo onto a collection to file it. + creates a new one - or a shared "
-             "one for your team - and ↻ fetches what others added."),
+             "Your own folders for the photos you keep using. Drag any photo onto one to file "
+             "it, or right-click a photo and pick Add to collection."),
+            (lambda: [self.collection_add_button, self.shared_sync_button], "Shared collections",
+             "Click + and choose New shared collection, then add your colleagues' email "
+             "addresses - Topshot drafts the invite for you. Everyone sees the same photos and "
+             "can add their own; ↻ fetches what others added. Right-click a shared collection "
+             "to change who's in it."),
             (lambda: getattr(self.results_frame, "_parent_frame", self.results_frame), "Your photos",
              "Double-click for a big preview, right-click to copy it in full resolution, and "
              "hover to star a favourite."),
@@ -4410,6 +4442,7 @@ class ImageSearchApp:
         self._update_checking = True
         if interactive:
             self.status_var.set("Checking for updates…")
+            self._set_update_card("checking")
 
         def work():
             try:
@@ -4422,17 +4455,16 @@ class ImageSearchApp:
                     config.UPDATE_SITE_PATH, f"{config.UPDATE_FOLDER_PATH}/latest.json"
                 )
                 if raw is None:
-                    if interactive:
-                        self.event_queue.put(("update_status", f"You're up to date (version {APP_VERSION})."))
+                    self.event_queue.put(("update_uptodate", interactive))
                     return
                 manifest = json.loads(raw.decode("utf-8"))
                 version = str(manifest["version"])
+                changes = [str(c) for c in (manifest.get("changes") or [])][:8]
                 if version_tuple(version) <= version_tuple(APP_VERSION):
-                    if interactive:
-                        self.event_queue.put(("update_status", f"You're up to date (version {APP_VERSION})."))
+                    self.event_queue.put(("update_uptodate", interactive))
                     return
                 if int(manifest.get("runtime", -1)) != RUNTIME_VERSION:
-                    self.event_queue.put(("update_full", version, manifest.get("notes") or ""))
+                    self.event_queue.put(("update_full", version, manifest.get("notes") or "", changes))
                     return
                 if self._staged_update() != version:
                     package = client.download_bytes_by_path(
@@ -4443,11 +4475,12 @@ class ImageSearchApp:
                     if hashlib.sha256(package).hexdigest() != str(manifest["sha256"]).lower():
                         raise ValueError("the update package does not match its checksum")
                     self._stage_update(version, package)
-                self.event_queue.put(("update_ready", version))
+                self.event_queue.put(("update_ready", version, changes))
             except Exception as exc:
                 _log_reuse(f"UPDATE CHECK FAILED: {exc!r}")
                 if interactive:
                     self.event_queue.put(("update_status", "Couldn't check for updates - try again later."))
+                    self.event_queue.put(("update_card", "current"))
             finally:
                 self._update_checking = False
 
@@ -4496,19 +4529,95 @@ class ImageSearchApp:
             if not os.path.isfile(os.path.join(partial, f"{module}.py")):
                 raise ValueError(f"update is missing {module}.py")
 
-    def _show_update_notice(self, version, restart, note=""):
+    def _set_update_card(self, state, version=None, changes=None, note=""):
+        """current / checking / uptodate / ready / download."""
+        version = version or APP_VERSION
+        self.update_button.pack_forget()
+        pill, pill_colour, border = "", FAINT_TEXT, BORDER
+        title, detail = f"{APP_NAME} {APP_VERSION}", ""
+        if state == "checking":
+            pill = "Checking…"
+        elif state == "uptodate":
+            pill, pill_colour = "Up to date", SOURCE_DOT
+        elif state == "ready":
+            title, border = f"Update ready · {version}", PRIMARY
+            detail = " · ".join((changes or [])[:2]) or "A newer version is ready."
+            self.update_button.configure(text="Restart to update", command=self._restart_app)
+            self.update_button.pack(side=tk.LEFT, padx=(4, 6), before=self.whats_new_link)
+        elif state == "download":
+            title, border = f"Version {version} available", PRIMARY
+            detail = note or "This one needs a new download."
+            self.update_button.configure(text="Download", command=self._open_download_page)
+            self.update_button.pack(side=tk.LEFT, padx=(4, 6), before=self.whats_new_link)
+        if changes is not None:
+            self._update_info = {"version": version, "changes": list(changes)}
+        self.update_title.configure(text=title)
+        self.update_pill.configure(text=pill, text_color=pill_colour)
+        self.update_detail.configure(text=detail)
+        if detail:
+            self.update_detail.pack(fill=tk.X, padx=12, pady=(1, 0), before=self.update_button.master)
+        else:
+            self.update_detail.pack_forget()
+        previous = self.update_card.cget("border_color")
+        if state in ("ready", "download") and previous != border:
+            # Draws the eye once: the border warms to green.
+            _animate(self.root, 500, lambda p: self.update_card.configure(
+                border_color=_mix(BORDER, border, p)))
+        else:
+            self.update_card.configure(border_color=border)
+
+    def _show_update_notice(self, version, restart, note="", changes=None):
         if restart:
             self._update_ready = version
-            self.update_label.configure(text=f"Version {version} is ready")
-            self.update_button.pack(anchor="w", padx=10, pady=(6, 0))
+            self._set_update_card("ready", version, changes)
         else:
-            self.update_label.configure(
-                text=f"Version {version} is available as a new download. "
-                + (note or "Ask the app owner for the link.")
-            )
-            self.update_button.pack_forget()
-        if not self.update_row.winfo_ismapped():
-            self.update_row.pack(fill=tk.X, pady=(0, 12), before=self._footer_divider)
+            self._set_update_card("download", version, changes, note)
+
+    def _open_download_page(self):
+        import config
+
+        url = getattr(config, "DOWNLOAD_URL", "")
+        if url:
+            try:
+                os.startfile(url)
+            except Exception:
+                pass
+
+    def _show_whats_new(self):
+        info = self._update_info or {"version": APP_VERSION, "changes": WHATS_NEW}
+        win = ctk.CTkToplevel(self.root)
+        win.title("What's new")
+        win.configure(fg_color=BG_COLOR)
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.after(250, lambda: win.iconbitmap(_resource_path("assets", "app_icon.ico")))
+        body = ctk.CTkFrame(win, fg_color="transparent")
+        body.pack(fill=tk.BOTH, expand=True, padx=26, pady=(22, 18))
+        upcoming = info["version"] != APP_VERSION
+        ctk.CTkLabel(body, text=f"What's new in {info['version']}", font=_font(17, "semibold"),
+                     text_color=TEXT_COLOR, anchor="w").pack(fill=tk.X)
+        ctk.CTkLabel(body, text=("Ready to install - restart to switch." if upcoming
+                                 else "The version you are using."),
+                     font=_font(12), text_color=MUTED_TEXT_COLOR, anchor="w").pack(fill=tk.X, pady=(2, 12))
+        for line in info["changes"] or ["Improvements and fixes."]:
+            row = ctk.CTkFrame(body, fg_color="transparent")
+            row.pack(fill=tk.X, pady=3)
+            ctk.CTkLabel(row, text="", image=_icon("done", 14, SOURCE_DOT), width=18).pack(
+                side=tk.LEFT, anchor="n", pady=(2, 0))
+            ctk.CTkLabel(row, text=line, font=_font(13), text_color=TEXT_SOFT, anchor="w",
+                         justify="left", wraplength=340).pack(side=tk.LEFT, padx=(8, 0), fill=tk.X)
+        buttons = ctk.CTkFrame(body, fg_color="transparent")
+        buttons.pack(fill=tk.X, pady=(16, 0))
+        _make_secondary_button(buttons, "Close", win.destroy, width=90).pack(side=tk.RIGHT)
+        if upcoming and self._update_ready:
+            _make_primary_button(buttons, "Restart to update",
+                                 lambda: (win.destroy(), self._restart_app()), width=150).pack(
+                side=tk.RIGHT, padx=(0, 8))
+        win.bind("<Escape>", lambda _e: win.destroy())
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
 
     def _restart_app(self):
         """Starts the app again through the launcher, which picks up the
@@ -4557,47 +4666,42 @@ class ImageSearchApp:
 
         self.root.after(400, wait_for_handover)
 
+    def _popup(self, x_root, y_root, items):
+        """Opens the app's own menu at a screen point, closing any open one."""
+        if getattr(self, "_menu", None) is not None:
+            self._menu.close(animate=False)
+        self._menu = PopMenu(self, x_root, y_root, items)
+
     def _show_result_menu(self, event, path, meta):
         """Right-click menu on a result: the keyboard-and-mouse route into a
         collection, for anyone who would rather not drag."""
-        menu = tk.Menu(self.root, tearoff=0)
         names = self._collection_names()
         in_collection = self._view in names
-        for name in names:
-            if name == self._view:
-                continue
-            if in_collection:
-                menu.add_command(
-                    label=f"Move to {name}",
-                    command=lambda n=name, v=self._view: (
-                        self._move_to_collection(v, n, path, meta), self._pulse_card(n)),
-                )
-            else:
-                menu.add_command(
-                    label=f"Add to {name}",
-                    command=lambda n=name: (
-                        self._add_to_collection(n, path, meta), self._pulse_card(n)),
-                )
-        if self._view in self._collection_names():
-            menu.add_separator()
-            menu.add_command(
-                label=f"Remove from {self._view}",
-                command=lambda: self._remove_from_collection(self._view, meta),
-            )
-        menu.add_separator()
-        menu.add_command(label="Preview", command=lambda: self._show_preview(path, meta))
-        menu.add_command(label="Copy image", command=lambda: self._copy_to_clipboard(path, meta))
+        shared = set(self._shared_by_name())
         if meta and meta.get("item_id"):
-            menu.add_command(
-                label="Open original",
-                command=lambda: self._open_sp_result(meta["item_id"], meta["name"]),
-            )
+            open_original = lambda: self._open_sp_result(meta["item_id"], meta["name"])
         else:
-            menu.add_command(label="Open original", command=lambda: open_in_system_viewer(path))
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+            open_original = lambda: open_in_system_viewer(path)
+        items = [
+            ("item", "Preview", "preview", lambda: self._show_preview(path, meta)),
+            ("item", "Copy image", "copy", lambda: self._copy_to_clipboard(path, meta)),
+            ("item", "Open original", "external", open_original),
+        ]
+        targets = [n for n in names if n != self._view]
+        if targets:
+            items += [("sep",), ("header", "Move to" if in_collection else "Add to collection")]
+            for name in targets:
+                icon = "shared" if name in shared else "folder"
+                if in_collection:
+                    action = lambda n=name, v=self._view: (
+                        self._move_to_collection(v, n, path, meta), self._pulse_card(n))
+                else:
+                    action = lambda n=name: (self._add_to_collection(n, path, meta), self._pulse_card(n))
+                items.append(("item", name, icon, action))
+        if in_collection:
+            items += [("sep",), ("item", f"Remove from {self._view}", "remove",
+                                 lambda: self._remove_from_collection(self._view, meta), {"danger": True})]
+        self._popup(event.x_root, event.y_root, items)
 
     # ---------- drag a photo onto a collection ----------
 
@@ -5236,6 +5340,53 @@ def _prefers_reduced_motion():
         return False
 
 
+def _start_freeze_watchdog(root):
+    """Writes what every thread was doing to freeze.log whenever the window
+    stops responding for a few seconds (and again if it stays stuck), plus a
+    line when it recovers. A hang on someone else's computer can't be
+    watched; this records where it happened."""
+    import faulthandler
+
+    path = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                        "ImageSearch", "freeze.log")
+    beat = [time.monotonic()]
+
+    def pulse():
+        beat[0] = time.monotonic()
+        try:
+            root.after(250, pulse)
+        except tk.TclError:
+            pass
+
+    def note(text, dump=False):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"--- {datetime.datetime.now().isoformat(timespec='seconds')} "
+                        f"{APP_VERSION}: {text}\n")
+                f.flush()
+                if dump:
+                    faulthandler.dump_traceback(file=f, all_threads=True)
+                    f.write("\n")
+        except Exception:
+            pass
+
+    def watch():
+        dumps = 0
+        while True:
+            time.sleep(0.5)
+            stalled = time.monotonic() - beat[0]
+            if stalled >= 3.0 and dumps == 0 or stalled >= 12.0 and dumps == 1:
+                dumps += 1
+                note(f"window not responding for {stalled:.1f}s", dump=True)
+            elif stalled < 1.0 and dumps:
+                note(f"responding again (dumped {dumps}x)")
+                dumps = 0
+
+    pulse()
+    threading.Thread(target=watch, name="freeze-watchdog", daemon=True).start()
+
+
 def _fine_timer(on):
     """Windows runs Tk's timers at about 15ms by default - 64 frames a second
     at best, visibly steppy on a fast display. A 1ms resolution is asked for
@@ -5272,6 +5423,33 @@ def _round_corners(win, border=SPLASH_BORDER):
 AFTER_UPDATE = "--after-update" in sys.argv
 
 
+def _set_window_icons(root):
+    """Hands Windows the 256 px and 32 px icons directly. Tk only gives it the
+    32 px one, which the taskbar then stretches - why the icon looked soft
+    next to other apps."""
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        user32.GetParent.restype = ctypes.c_void_p
+        user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
+                                        ctypes.c_void_p]
+        path = _resource_path("assets", "app_icon.ico")
+        hwnd = user32.GetParent(root.winfo_id())
+        big = user32.LoadImageW(None, path, 1, 256, 256, 0x10)    # IMAGE_ICON, LR_LOADFROMFILE
+        small = user32.LoadImageW(None, path, 1, 32, 32, 0x10)
+        if big:
+            user32.SendMessageW(hwnd, 0x80, 1, big)               # WM_SETICON, ICON_BIG
+        if small:
+            user32.SendMessageW(hwnd, 0x80, 0, small)             # ICON_SMALL
+        root._icon_handles = (big, small)
+    except Exception:
+        pass
+
+
 def _handover_path():
     return os.path.join(
         os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch", "app", "handover"
@@ -5292,22 +5470,146 @@ def _work_area(win):
     return 0, 0, win.winfo_screenwidth(), win.winfo_screenheight()
 
 
+class PopMenu:
+    """The app's own right-click menu, in its colours and type.
+
+    Drawn inside the main window (not as a separate pop-up window), so it
+    never lands on the wrong monitor or behind anything. It opens from the
+    point that was clicked - down and to the right, or up/left near an edge -
+    unfolding in one short ease-out, and folds back the same way, faster.
+    A click anywhere else, or Esc, closes it.
+    """
+
+    WIDTH = 248
+    OPEN_MS, CLOSE_MS = 170, 110
+
+    def __init__(self, app, x_root, y_root, items):
+        self.app, self.root = app, app.root
+        self.closed = False
+        # CustomTkinter panels can't be sized by place(), so a plain Tk frame
+        # is placed and sized (it clips the panel while the menu unfolds) and
+        # the styled panel sits inside it at its natural size.
+        self.holder = tk.Frame(self.root, bg=BG_COLOR, bd=0, highlightthickness=0)
+        f = self.frame = ctk.CTkFrame(self.holder, fg_color=SURFACE, corner_radius=10,
+                                      border_width=1, border_color=MENU_BORDER,
+                                      bg_color=BG_COLOR)
+        inner = ctk.CTkFrame(f, fg_color="transparent")
+        inner.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        for item in items:
+            kind = item[0]
+            if kind == "sep":
+                ctk.CTkFrame(inner, fg_color=BORDER, height=1, corner_radius=0).pack(
+                    fill=tk.X, padx=8, pady=4)
+            elif kind == "header":
+                ctk.CTkLabel(inner, text=item[1].upper(), font=_font(10, "medium"),
+                             text_color=FAINT_TEXT, anchor="w", height=22).pack(fill=tk.X, padx=10)
+            else:
+                label, icon, command = item[1], item[2], item[3]
+                options = item[4] if len(item) > 4 else {}
+                colour = DANGER if options.get("danger") else TEXT_SOFT
+                enabled = options.get("enabled", True)
+                shown = label if len(label) <= 30 else label[:29].rstrip() + "…"
+                ctk.CTkButton(
+                    inner, text=f"  {shown}", image=_icon(icon, 15, colour if enabled else FAINT_TEXT),
+                    compound="left", anchor="w", height=30, corner_radius=6,
+                    fg_color="transparent", hover_color=NAV_SELECTED, text_color=colour,
+                    text_color_disabled=FAINT_TEXT, font=_font(13),
+                    state=tk.NORMAL if enabled else tk.DISABLED,
+                    command=lambda c=command: self._choose(c),
+                ).pack(fill=tk.X)
+        f.place(x=0, y=0, relwidth=1)
+        self.root.update_idletasks()
+        w, h = self.WIDTH, f.winfo_reqheight()
+        rx, ry = x_root - self.root.winfo_rootx(), y_root - self.root.winfo_rooty()
+        W, H = self.root.winfo_width(), self.root.winfo_height()
+        x = rx if rx + w + 8 <= W else rx - w
+        self.upward = ry + h + 8 > H
+        y = ry - h if self.upward else ry
+        self.x, self.y = max(8, min(x, W - w - 8)), max(8, min(y, H - h - 8))
+        self.w, self.h = w, h
+        self._show(0.0)
+        self.holder.lift()
+        app.__dict__.setdefault("_menu_clicks_bound", False)
+        if not app._menu_clicks_bound:
+            # One binding for every menu: a click elsewhere closes the open one.
+            self.root.bind("<Button-1>", lambda e: app._menu and app._menu._outside(e), add="+")
+            self.root.bind("<Escape>", lambda _e: app._menu and app._menu.close(), add="+")
+            app._menu_clicks_bound = True
+        reduced = _prefers_reduced_motion()
+        _animate(self.root, 0 if reduced else self.OPEN_MS, self._show, ease=EASE_OUT)
+
+    def _show(self, p):
+        """p=0: folded towards the click point; p=1: fully open."""
+        if self.closed and p > 0.99:
+            return
+        visible = round(self.h * (0.78 + 0.22 * p))
+        drift = 5 * (1 - p)
+        y = self.y + (self.h - visible + drift if self.upward else -drift)
+        try:
+            self.holder.place(x=self.x, y=round(y), width=self.w, height=visible)
+            # Opening upwards the panel is anchored at the bottom, so it
+            # unfolds from the point that was clicked.
+            self.frame.place(x=0, y=(visible - self.h) if self.upward else 0, relwidth=1)
+        except tk.TclError:
+            pass
+
+    def _outside(self, event):
+        if self.closed:
+            return
+        if str(event.widget).startswith(str(self.holder)):
+            return
+        self.close()
+
+    def _choose(self, command):
+        self.close(animate=False)
+        self.root.after(10, command)
+
+    def close(self, animate=True):
+        if self.closed:
+            return
+        self.closed = True
+        if self.app._menu is self:
+            self.app._menu = None
+
+        def gone():
+            try:
+                self.holder.destroy()
+            except tk.TclError:
+                pass
+
+        if not animate or _prefers_reduced_motion():
+            gone()
+            return
+
+        def fold(p):
+            visible = round(self.h * (1 - 0.18 * p))
+            y = self.y + (self.h - visible if self.upward else 0)
+            try:
+                self.holder.place(x=self.x, y=round(y), width=self.w, height=visible)
+                self.frame.place(x=0, y=(visible - self.h) if self.upward else 0, relwidth=1)
+            except tk.TclError:
+                pass
+
+        _animate(self.root, self.CLOSE_MS, fold, done=gone, ease=EASE_OUT)
+
+
 class Tour:
     """A five-step guided tour. The window dims, the part being explained
-    stays lit with a ring around it, and a bubble beside it says what it is.
+    stays lit with a ring around it, and a card beside it says what it is.
     Moving on, the lit area glides and resizes to the next part in one eased
-    motion. Clicking anywhere in the app (outside the bubble) ends the tour.
+    motion. Clicking anywhere in the app outside the card ends the tour.
 
-    The dimmed layer is a translucent window over the app with a hole in it
-    (a colour Windows treats as see-through), so what is lit is the real,
-    live control - not a picture of it.
+    The dimmed layer is a translucent window over the app with holes in it
+    (a colour Windows treats as see-through): one over the part being
+    explained, one over the card. The card itself is part of the main
+    window, so it is always drawn, on the right monitor, at the right size.
     """
 
     KEY = "#ff00fe"      # drawn in this colour = see-through
     DIM = 0.62           # how dark the rest of the window goes
     PAD = 8              # space between a control and its ring
     MOVE_MS = 420        # the lit area gliding to the next part
-    FADE_MS = 200
+    CARD_MS = 180
 
     def __init__(self, app, steps, on_done):
         self.app, self.root, self.steps, self.on_done = app, app.root, steps, on_done
@@ -5316,9 +5618,12 @@ class Tour:
         self.rect = None
         self.closed = False
         self.bubble = None
+        self.bubble_box = None
+        self._moving = False
+        self._still = 0
         self.overlay = tk.Toplevel(self.root)
         self.overlay.overrideredirect(True)
-        self.overlay.transient(self.root)  # stays above the app
+        self.overlay.transient(self.root)
         self.overlay.configure(bg="#000000")
         try:
             self.overlay.attributes("-transparentcolor", self.KEY)
@@ -5328,34 +5633,33 @@ class Tour:
         self.canvas = tk.Canvas(self.overlay, bg="#000000", highlightthickness=0, bd=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.hole = self.canvas.create_polygon(0, 0, 0, 0, fill=self.KEY, outline="", smooth=True)
+        self.card_hole = self.canvas.create_polygon(0, 0, 0, 0, fill=self.KEY, outline="",
+                                                    smooth=True)
         self.ring = self.canvas.create_polygon(0, 0, 0, 0, fill="", outline="#34d399", width=2,
                                                smooth=True)
         self._place_overlay()
-        # A click anywhere but the bubble ends the tour: on the dimmed area,
-        # or through the hole on the lit control itself. (Never unbound -
-        # tkinter's unbind would drop other handlers - it is inert once closed.)
+        # Never unbound (tkinter's unbind would drop other handlers too);
+        # they do nothing once the tour is closed.
         self.canvas.bind("<Button-1>", lambda _e: self.close())
-        self.root.bind("<Button-1>", lambda _e: self.close(), add="+")
-        self.root.bind("<Configure>", self._on_root_moved, add="+")
-        self._bind_keys(self.overlay)
-        self._last_geometry = None
+        self.root.bind("<Button-1>", self._on_root_click, add="+")
+        for key, action in (("<Escape>", self.close), ("<Right>", self.next),
+                            ("<Left>", self.back)):
+            self.root.bind(key, lambda _e, a=action: None if self.closed else a(), add="+")
+        self._last_geometry = self._window_geometry()
         self._follow_window()
         _fine_timer(True)
         _animate(self.root, 0 if self.reduced else 240,
                  lambda p: self._overlay_alpha(self.DIM * p))
         self._go(0, first=True)
 
-    def _bind_keys(self, widget):
-        for key, action in (("<Escape>", self.close), ("<Right>", self.next),
-                            ("<Return>", self.next), ("<Left>", self.back)):
-            widget.bind(key, lambda _e, a=action: a())
-
     # --- geometry ---
 
+    def _window_geometry(self):
+        r = self.root
+        return (r.winfo_rootx(), r.winfo_rooty(), r.winfo_width(), r.winfo_height())
+
     def _place_overlay(self):
-        x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
-        w, h = self.root.winfo_width(), self.root.winfo_height()
-        self.origin = (x, y)
+        x, y, w, h = self._window_geometry()
         self.overlay.geometry(f"{w}x{h}+{x}+{y}")
         self.canvas.configure(width=w, height=h)
         self.overlay.lift()
@@ -5367,19 +5671,24 @@ class Tour:
             pass
 
     def _target_rect(self, step):
-        """The area to light: one widget, or the span of several."""
+        """The area to light, in window coordinates: one widget or the span of several."""
         widgets = self.steps[step][0]()
         if not isinstance(widgets, (list, tuple)):
             widgets = [widgets]
         self.root.update_idletasks()
+        ox, oy = self.root.winfo_rootx(), self.root.winfo_rooty()
         boxes = [(w.winfo_rootx(), w.winfo_rooty(),
                   w.winfo_rootx() + w.winfo_width(), w.winfo_rooty() + w.winfo_height())
                  for w in widgets]
-        x0 = min(b[0] for b in boxes) - self.origin[0] - self.PAD
-        y0 = min(b[1] for b in boxes) - self.origin[1] - self.PAD
-        x1 = max(b[2] for b in boxes) - self.origin[0] + self.PAD
-        y1 = max(b[3] for b in boxes) - self.origin[1] + self.PAD
-        y1 = min(y1, y0 + 380)  # the photo grid runs off the screen: light its top
+        x0 = min(b[0] for b in boxes) - ox - self.PAD
+        y0 = min(b[1] for b in boxes) - oy - self.PAD
+        x1 = max(b[2] for b in boxes) - ox + self.PAD
+        y1 = max(b[3] for b in boxes) - oy + self.PAD
+        # Never past the window's edges: the photo grid runs on below the
+        # window, so its ring stops just above the bottom edge.
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        x1 = min(x1, w - self.PAD)
+        y1 = min(y1, h - self.PAD)
         return [x0, y0, x1, y1]
 
     @staticmethod
@@ -5394,54 +5703,85 @@ class Tour:
         x0, y0, x1, y1 = rect
         self.canvas.coords(self.ring, *self._rounded(x0 - 2, y0 - 2, x1 + 2, y1 + 2, 14))
 
-    def _window_geometry(self):
-        r = self.root
-        return (r.winfo_rootx(), r.winfo_rooty(), r.winfo_width(), r.winfo_height())
-
     def _follow_window(self):
-        """Keeps the dimming and the lit area on the window when it is moved,
-        resized, maximised or dragged to another monitor: checked ten times a
-        second, and everything is re-measured as soon as it changes."""
+        """While the window is being moved or resized (or dragged to another
+        monitor) the dimming steps aside instead of chasing it; once it has
+        been still for a moment, everything is re-measured and fades back."""
         if self.closed:
             return
         try:
             geometry = self._window_geometry()
-            if self._last_geometry is not None and geometry != self._last_geometry:
-                self._realign()
-            self._last_geometry = geometry
         except tk.TclError:
             return
-        self.root.after(100, self._follow_window)
+        if geometry != self._last_geometry:
+            if not self._moving:
+                self._moving = True
+                self._overlay_alpha(0.0)
+                _log_reuse(f"TOUR window moving: {self._last_geometry} -> {geometry}")
+            self._still = 0
+        elif self._moving:
+            self._still += 1
+            if self._still >= 4:  # about 160 ms without movement
+                self._moving = False
+                try:
+                    self._place_overlay()
+                    self._draw(self._target_rect(self.index))
+                    self._place_bubble()
+                except Exception:
+                    pass
+                _animate(self.root, 0 if self.reduced else 180,
+                         lambda p: self._overlay_alpha(self.DIM * p))
+        self._last_geometry = geometry
+        if not self._moving:
+            self._keep_on_top()
+        self.root.after(40, self._follow_window)
 
-    def _realign(self):
+    def _keep_on_top(self):
+        """Clicking the app (or its taskbar button) raises the main window
+        above the dimmed layer, which hid the highlight. While the app is the
+        active window the layer is put back on top; when another app is in
+        front it is left alone, so it never covers other programs."""
         try:
-            self._place_overlay()
-            self.overlay.update_idletasks()
-            self._draw(self._target_rect(self.index))
-            self._place_bubble()
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            user32.GetParent.restype = ctypes.c_void_p
+            user32.GetForegroundWindow.restype = ctypes.c_void_p
+            mine = {user32.GetParent(self.root.winfo_id()),
+                    user32.GetParent(self.overlay.winfo_id())}
+            if user32.GetForegroundWindow() in mine:
+                self.overlay.lift()
         except Exception:
             pass
 
-    def _on_root_moved(self, event=None):
-        if self.closed or (event is not None and event.widget is not self.root):
+    def _on_root_click(self, event):
+        if self.closed:
             return
-        try:
-            self._place_overlay()
-            self._draw(self._target_rect(self.index))
-            self._place_bubble()
-        except Exception:
-            pass
+        if self.bubble is not None and str(event.widget).startswith(str(self.bubble)):
+            return  # a click on the card itself
+        self.close()
 
     # --- steps ---
 
+    def _settled(self):
+        """Ignores a second step request that arrives while the light is still
+        travelling - a held arrow key would otherwise skip whole steps."""
+        now = time.perf_counter()
+        if now - getattr(self, "_last_step_at", 0.0) < 0.3:
+            return False
+        self._last_step_at = now
+        return True
+
     def next(self):
+        if not self._settled():
+            return
         if self.index + 1 >= len(self.steps):
             self.close()
         else:
             self._go(self.index + 1)
 
     def back(self):
-        if self.index > 0:
+        if self.index > 0 and self._settled():
             self._go(self.index - 1)
 
     def _go(self, index, first=False):
@@ -5455,7 +5795,7 @@ class Tour:
             return
         self.index = index
         start = self.rect or target
-        self._fade_bubble_out()
+        self._remove_bubble()
         token = self._move_token = object()
 
         def step(p):
@@ -5465,134 +5805,92 @@ class Tour:
                 self._draw([a + (b - a) * p for a, b in zip(start, target)])
 
         def arrived():
-            if self._move_token is token:
-                self._show_bubble()
+            if self._move_token is token and not self.closed:
+                try:
+                    self._build_bubble()
+                except Exception:
+                    _log_crash("tour card", sys.exc_info())
 
         _animate(self.root, 0 if (self.reduced or first) else self.MOVE_MS, step,
                  done=arrived, ease=EASE_IN_OUT)
 
-    # --- the bubble ---
+    # --- the card ---
 
-    def _fade_bubble_out(self):
-        bubble, self.bubble = self.bubble, None
-        if bubble is None:
-            return
-
-        def fade(p):
-            try:
-                bubble.attributes("-alpha", 1 - p)
-            except tk.TclError:
-                pass
-
-        def gone():
+    def _remove_bubble(self):
+        bubble, self.bubble, self.bubble_box = self.bubble, None, None
+        try:
+            self.canvas.coords(self.card_hole, 0, 0, 0, 0)
+        except tk.TclError:
+            pass
+        if bubble is not None:
             try:
                 bubble.destroy()
             except tk.TclError:
                 pass
 
-        _animate(self.root, 0 if self.reduced else 120, fade, done=gone)
-
-    def _show_bubble(self):
-        if self.closed:
-            return
-        try:
-            self._build_bubble()
-        except Exception:
-            _log_crash("tour bubble", sys.exc_info())
-
     def _build_bubble(self):
         _getter, title, text = self.steps[self.index]
         total = len(self.steps)
         last = self.index + 1 == total
-        bg = "#141917"
-        # Plain Tk only: a CustomTkinter widget in a window CustomTkinter
-        # didn't create can fail to draw, which left the first version of
-        # this bubble invisible.
-        b = self.bubble = tk.Toplevel(self.root)
-        b.withdraw()
-        b.overrideredirect(True)
-        b.transient(self.overlay)
-        b.configure(bg=bg)
-        try:
-            b.attributes("-topmost", True)
-            b.attributes("-alpha", 0.0)
-        except tk.TclError:
-            pass
-        frame = tk.Frame(b, bg=bg, padx=18, pady=16)
-        frame.pack(fill=tk.BOTH, expand=True)
-        tk.Label(frame, text=title, bg=bg, fg=TEXT_COLOR, font=(UI_FONT_SEMIBOLD, -16),
-                 anchor="w", justify="left").pack(fill=tk.X)
-        tk.Label(frame, text=text, bg=bg, fg=TEXT_SOFT, font=(UI_FONT, -13), anchor="w",
-                 justify="left", wraplength=300).pack(fill=tk.X, pady=(6, 14))
-        row = tk.Frame(frame, bg=bg)
+        # A plain Tk frame is placed and sized; the styled card fills it.
+        # (CustomTkinter panels refuse a size from place(), which is what
+        # kept the card from ever appearing.)
+        holder = self.bubble = tk.Frame(self.root, bg=BG_COLOR, bd=0, highlightthickness=0)
+        card = ctk.CTkFrame(holder, fg_color=SURFACE, corner_radius=12, border_width=1,
+                            border_color=MENU_BORDER, bg_color=BG_COLOR)
+        card.pack(fill=tk.BOTH, expand=True)
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.pack(fill=tk.BOTH, expand=True, padx=18, pady=(15, 13))
+        ctk.CTkLabel(body, text=title, font=_font(15, "semibold"), text_color=TEXT_COLOR,
+                     anchor="w").pack(fill=tk.X)
+        ctk.CTkLabel(body, text=text, font=_font(13), text_color=TEXT_SOFT, anchor="w",
+                     justify="left", wraplength=300).pack(fill=tk.X, pady=(4, 14))
+        row = ctk.CTkFrame(body, fg_color="transparent")
         row.pack(fill=tk.X)
 
-        def button(icon, fallback, command, primary=False, enabled=True):
-            fill = PRIMARY if primary else bg
-            hover = PRIMARY_HOVER if primary else SURFACE_HOVER
-            ink = PRIMARY_TEXT if primary else (TEXT_COLOR if enabled else "#3f4a44")
-            c = tk.Canvas(row, width=36, height=32, bg=bg, highlightthickness=0, bd=0,
-                          cursor="hand2" if enabled else "")
-            shape = c.create_polygon(*Tour._rounded(1, 1, 35, 31, 8), fill=fill,
-                                     outline="" if primary else ("#2a3830" if enabled else "#1d2621"),
-                                     smooth=True)
-            image = _icon_tk(icon, 16, ink)
-            if image is not None:
-                c.create_image(18, 16, image=image)
-                c.image = image
-            else:
-                c.create_text(18, 16, text=fallback, fill=ink, font=(UI_FONT_SEMIBOLD, -14))
-            if enabled:
-                c.bind("<Enter>", lambda _e: c.itemconfigure(shape, fill=hover))
-                c.bind("<Leave>", lambda _e: c.itemconfigure(shape, fill=fill))
-                c.bind("<Button-1>", lambda _e: command())
-            return c
+        def arrow(icon, fallback, command, primary=False, enabled=True):
+            ink = PRIMARY_TEXT if primary else (TEXT_COLOR if enabled else FAINT_TEXT)
+            image = _icon(icon, 16, ink)
+            return ctk.CTkButton(
+                row, text="" if image else fallback, image=image, width=36, height=32,
+                corner_radius=8, command=command, state=tk.NORMAL if enabled else tk.DISABLED,
+                fg_color=PRIMARY if primary else "transparent",
+                hover_color=PRIMARY_HOVER if primary else SURFACE_HOVER,
+                border_width=0 if primary else 1, border_color=MENU_BORDER,
+                text_color=ink, text_color_disabled=FAINT_TEXT, font=_font(14, "semibold"),
+            )
 
-        button("done" if last else "next", "✓" if last else "→", self.next, primary=True).pack(
+        arrow("done" if last else "next", "✓" if last else "→", self.next, primary=True).pack(
             side=tk.RIGHT)
-        tk.Label(row, text=f"{self.index + 1}/{total}", bg=bg, fg=MUTED_TEXT_COLOR,
-                 font=(UI_FONT_MEDIUM, -12), width=4).pack(side=tk.RIGHT, padx=4)
-        button("back", "←", self.back, enabled=self.index > 0).pack(side=tk.RIGHT)
+        ctk.CTkLabel(row, text=f"{self.index + 1}/{total}", font=_font(12, "medium"),
+                     text_color=MUTED_TEXT_COLOR, width=38).pack(side=tk.RIGHT, padx=4)
+        arrow("back", "←", self.back, enabled=self.index > 0).pack(side=tk.RIGHT)
         if not last:
-            skip = tk.Label(row, text="Skip", bg=bg, fg=MUTED_TEXT_COLOR,
-                            font=(UI_FONT_MEDIUM, -12), cursor="hand2")
-            skip.bind("<Button-1>", lambda _e: self.close())
-            skip.bind("<Enter>", lambda _e: skip.configure(fg=TEXT_COLOR))
-            skip.bind("<Leave>", lambda _e: skip.configure(fg=MUTED_TEXT_COLOR))
-            skip.pack(side=tk.LEFT)
-        self._bind_keys(b)
-        b.update_idletasks()
-        self._place_bubble(rise=0 if self.reduced else 6)
-        b.deiconify()
-        b.update_idletasks()
-        _round_corners(b, border="#2a3830")
-        b.lift()
-        b.focus_force()
+            ctk.CTkButton(row, text="Skip", width=0, height=32, fg_color="transparent",
+                          hover_color=SURFACE_HOVER, text_color=MUTED_TEXT_COLOR,
+                          font=_font(12, "medium"), command=self.close).pack(side=tk.LEFT)
+        self.root.update_idletasks()
+        self.bubble_box = (card.winfo_reqwidth(), card.winfo_reqheight())
+        rise = 0 if self.reduced else 8
 
         def appear(p):
-            if self.bubble is not b:
-                return
-            try:
-                b.attributes("-alpha", p)
-                self._place_bubble(rise=0 if self.reduced else round(6 * (1 - p)))
-            except tk.TclError:
-                pass
+            if self.bubble is holder:
+                self._place_bubble(rise=round(rise * (1 - p)))
 
-        def check():
-            try:
-                _log_reuse(f"TOUR step {self.index + 1}: bubble at {b.winfo_geometry()}, "
-                           f"shown={b.winfo_ismapped()}")
-            except Exception:
-                pass
-
-        _animate(self.root, 0 if self.reduced else self.FADE_MS, appear, done=check)
+        _animate(self.root, 0 if self.reduced else self.CARD_MS, appear, ease=EASE_OUT)
+        try:
+            state = (f"overlay alpha={self.overlay.attributes('-alpha')} "
+                     f"geometry={self.overlay.winfo_geometry()} mapped={self.overlay.winfo_ismapped()} "
+                     f"moving={self._moving} window={self._window_geometry()}")
+        except Exception as exc:
+            state = repr(exc)
+        _log_reuse(f"TOUR step {self.index + 1}: card {self.bubble_box}; {state}")
 
     def _place_bubble(self, rise=0):
-        b = self.bubble
-        if b is None or self.rect is None:
+        card = self.bubble
+        if card is None or self.rect is None or self.bubble_box is None:
             return
-        bw, bh = b.winfo_reqwidth(), b.winfo_reqheight()
-        ox, oy = self.origin
+        bw, bh = self.bubble_box
         x0, y0, x1, y1 = [round(v) for v in self.rect]
         w, h = self.root.winfo_width(), self.root.winfo_height()
         gap = 16
@@ -5606,14 +5904,26 @@ class Tour:
         else:
             x, y = max(0, x0 - gap - bw), y0
         x = max(8, min(x, w - bw - 8))
-        y = max(8, min(y, h - bh - 8))
-        b.geometry(f"+{ox + x}+{oy + y + rise}")
+        y = max(8, min(y, h - bh - 8)) + rise
+        try:
+            # Width is fixed; the height follows the content, so the last
+            # row (the arrows) can never be cut off.
+            card.place(x=x, y=y, width=bw)
+            card.lift()
+            card.update_idletasks()
+            real = card.winfo_height()
+            if real > 1 and real != bh:
+                self.bubble_box = (bw, real)
+                bh = real
+            self.canvas.coords(self.card_hole, *self._rounded(x, y, x + bw, y + bh, 12))
+        except (tk.TclError, ValueError):
+            _log_crash("tour card placement", sys.exc_info())
 
     def close(self):
         if self.closed:
             return
         self.closed = True
-        self._fade_bubble_out()
+        self._remove_bubble()
 
         def finish():
             try:
@@ -6050,6 +6360,7 @@ class BootSequence:
             # Shared collections and updates are looked up quietly a few
             # seconds later, from the saved sign-in only - no browser pops up.
             self.root.after(5000, self.app._start_background_checks)
+            self.root.after(50, lambda: _set_window_icons(self.root))
             if not AFTER_UPDATE and not self.app._tour_seen():
                 self.root.after(1200, self.app._start_tour)
             if AFTER_UPDATE:
@@ -6118,6 +6429,7 @@ def main():
     root.report_callback_exception = lambda kind, value, tb: _log_crash(
         "UI callback", (kind, value, tb)
     )
+    _start_freeze_watchdog(root)
     _choose_ui_fonts(root)
     try:
         font_theme = ctk.ThemeManager.theme["CTkFont"]

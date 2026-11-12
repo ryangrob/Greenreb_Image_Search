@@ -26,7 +26,7 @@ import zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from app_version import APP_MODULES, APP_VERSION, RUNTIME_VERSION  # noqa: E402
+from app_version import APP_MODULES, APP_VERSION, RUNTIME_VERSION, WHATS_NEW  # noqa: E402
 
 ASSET_EXTENSIONS = {".ttf", ".css", ".txt", ".json", ".png", ".ico"}
 SKIP_ASSETS = {"app_icon_master.png"}  # the 1024px source of the icon; not used at runtime
@@ -69,6 +69,7 @@ def main():
         "size": len(package),
         "published": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "notes": args.notes,
+        "changes": list(WHATS_NEW),
     }
     out = os.path.join(HERE, "dist_update")
     os.makedirs(out, exist_ok=True)

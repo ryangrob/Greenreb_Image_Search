@@ -16,6 +16,17 @@ APP_VERSION = "3.2.0"
 APP_NAME = "Topshot"
 APP_AUTHOR = "Ryan Grob"
 
+# Shown under "What's new" in the app, and sent with an update so people see
+# what they are about to get. Keep each line short; the first two are the
+# summary on the update card.
+WHATS_NEW = [
+    "Topshot: a new name, icon and green look",
+    "Updates itself - “Restart to update” appears here",
+    "Shared collections for your team, with email invites",
+    "A short tour of the app, and Support built in",
+    "A smoother start and a new right-click menu",
+]
+
 # Bump only when a release changes what the .exe itself contains (Python,
 # a library, the model). Code-only updates cannot deliver those, so an
 # update built for a different runtime asks for a full download instead.

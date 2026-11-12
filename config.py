@@ -26,6 +26,11 @@ SHAREPOINT_SEARCH_ROOT_PATH = "General/Greenreb Shared External Marketing Drive/
 UPDATE_SITE_PATH = SHAREPOINT_SITE_PATH
 UPDATE_FOLDER_PATH = "General/Image Search Releases"
 
+# Where colleagues can download the app - put into invitation emails.
+# The GitHub repository is private, so this only works for people with
+# access to it; a SharePoint link shared with Greenreb is the better home.
+DOWNLOAD_URL = "https://github.com/ryangrob/Greenreb_Image_Search/releases/latest"
+
 # Where the Support form in the app sends messages.
 SUPPORT_EMAIL = "grobr1903@gmail.com"
 
