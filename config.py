@@ -50,3 +50,21 @@ SHARED_FOLDER_PATH = SHAREPOINT_SEARCH_ROOT_PATH
 # TODO before rollout: an internal site agreed with the CTO.
 REPORTS_SITE_PATH = UPDATE_SITE_PATH
 REPORTS_FOLDER_PATH = "General/Topshot Reports"
+
+# The starter package: one compact file on SharePoint (next to the photos)
+# with everything search needs, so a new computer can search after a minute
+# or two instead of downloading every folder's index first. Any computer
+# uploads a fresh one after a sync when the library changed - at most once
+# every STARTER_MIN_HOURS_BETWEEN_UPLOADS hours across everyone - or when
+# the published one is older than STARTER_MAX_AGE_DAYS. Switching it off
+# only stops this computer from using and publishing it; nothing else changes.
+STARTER_PACKAGE_ENABLED = True
+# "float16" halves the download (about 31 MB instead of 63 MB). Results are
+# the same except that near-identical shots (scores closer than 0.0003) can
+# swap places; "float32" is bit-identical to a normal sync.
+STARTER_EMBEDDING_DTYPE = "float16"
+STARTER_MIN_HOURS_BETWEEN_UPLOADS = 6
+STARTER_MAX_AGE_DAYS = 7
+# Thumbnails of a library loaded from the package are fetched as photos are
+# looked at, this many at a time.
+STARTER_LAZY_THUMB_WORKERS = 4

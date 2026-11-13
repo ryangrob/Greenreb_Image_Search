@@ -86,6 +86,9 @@ IS_MAC = sys.platform == "darwin"
 def _data_dir():
     """Settings, caches, logs and downloaded updates: %LOCALAPPDATA%\\ImageSearch
     on Windows, ~/Library/Application Support/Topshot on a Mac."""
+    override = os.environ.get("TOPSHOT_DATA_DIR")
+    if override:
+        return override  # for trying a first start without touching the real library
     if IS_MAC:
         return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Topshot")
     return os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ImageSearch")
@@ -838,6 +841,269 @@ def folder_name_match(query, folder_name):
         return 0.0
     hits = sum(1 for t in terms if t in f)
     return hits / len(terms)
+
+
+# ---------- starter package ----------
+#
+# A new computer used to fetch every folder's shared index - about 650 MB,
+# most of it thumbnails - before the first search. The starter package is
+# one file with what search needs: every photo's embedding, name, folder,
+# eTag and thumbnail size. A computer with an empty library downloads it,
+# can search at once, and loads thumbnails as they are looked at.
+#
+# It is strictly an extra: if the package is missing, damaged, for another
+# model or of another format, the app syncs exactly as it always has.
+#
+# How later syncs stay correct on such a computer:
+#  - Its first sync is its own full listing (no shared delta link). Photos
+#    whose eTag and folder match the package are dropped from the work
+#    list, so only what is new or changed since the package is fetched.
+#  - The package stays on disk as the base of the library. A folder gets a
+#    local index file only once something in it changes - built from the
+#    complete shared index plus the change, never from the changes alone,
+#    so a partial index can never be written or uploaded. Where that
+#    shared index cannot be read, the folder is left as it is and retried.
+#  - Base entries count only while the photo is still listed and its
+#    folder has no local index file; from then on the file is the truth.
+
+STARTER_PACKAGE_NAME = ".imagesearch_starter.npz"
+STARTER_MANIFEST_NAME = ".imagesearch_starter.json"
+STARTER_SEED_FILE = "starter_seed.npz"
+STARTER_FORMAT = 1
+
+
+def _starter_setting(name, default):
+    try:
+        import config
+
+        return getattr(config, name, default)
+    except Exception:
+        return default
+
+
+def _starter_fingerprint(ids, etags, model):
+    """Identifies a library state: the same photos at the same versions give
+    the same value on every computer, so the package is not re-uploaded."""
+    digest = hashlib.sha1(str(model).encode("utf-8"))
+    for line in sorted(f"{i}:{e or ''}" for i, e in zip(ids, etags)):
+        digest.update(line.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _starter_pack(ids, names, folder_ids, folder_names, etags, sizes, embeddings, model,
+                  created_at, dtype="float16"):
+    """Builds the package: one compressed .npz with the embeddings, the
+    thumbnail sizes and a JSON block for everything else."""
+    n = len(ids)
+    emb = np.asarray(embeddings)
+    if not n or not (len(names) == len(folder_ids) == len(etags) == len(sizes) == n):
+        raise ValueError("starter package: lists of different lengths")
+    if emb.ndim != 2 or emb.shape[0] != n:
+        raise ValueError("starter package: embeddings do not match the photos")
+    folders = sorted(set(folder_ids))
+    position = {folder_id: k for k, folder_id in enumerate(folders)}
+    info = {
+        "format": STARTER_FORMAT,
+        "model": model,
+        "created_at": created_at,
+        "count": n,
+        "ids": list(ids),
+        "names": list(names),
+        "etags": [e or "" for e in etags],
+        "folder_index": [position[f] for f in folder_ids],
+        "folders": [[f, folder_names.get(f, "")] for f in folders],
+    }
+    blob = np.frombuffer(json.dumps(info, ensure_ascii=False).encode("utf-8"), dtype=np.uint8)
+    size_array = np.clip(np.asarray(sizes, dtype=np.int64).reshape(n, 2), 0, 65535).astype(np.uint16)
+    buf = io.BytesIO()
+    np.savez_compressed(
+        buf,
+        embeddings=emb.astype(np.float32 if dtype == "float32" else np.float16),
+        sizes=size_array,
+        info=blob,
+    )
+    return buf.getvalue()
+
+
+def _starter_unpack(source, model, with_embeddings=True):
+    """Reads a package (bytes or a file path) and checks every part of it.
+    Raises ValueError for anything unexpected - the caller then carries on
+    without it."""
+    try:
+        handle = io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source
+        with np.load(handle, allow_pickle=False) as z:
+            info = json.loads(z["info"].tobytes().decode("utf-8"))
+            sizes = np.array(z["sizes"])
+            emb = np.array(z["embeddings"]) if with_embeddings else None
+    except Exception as exc:
+        raise ValueError(f"starter package unreadable: {exc!r}") from exc
+    if not isinstance(info, dict) or info.get("format") != STARTER_FORMAT:
+        raise ValueError("starter package: unknown format")
+    if info.get("model") != model:
+        raise ValueError(f"starter package: made for {info.get('model')!r}, not {model!r}")
+    ids, names, etags = info.get("ids"), info.get("names"), info.get("etags")
+    folder_index, folders = info.get("folder_index"), info.get("folders")
+    if not all(isinstance(x, list) for x in (ids, names, etags, folder_index, folders)):
+        raise ValueError("starter package: missing lists")
+    n = len(ids)
+    if not n or n != info.get("count") or not (len(names) == len(etags) == len(folder_index) == n):
+        raise ValueError("starter package: counts do not match")
+    if not all(isinstance(i, str) and i for i in ids) or len(set(ids)) != n:
+        raise ValueError("starter package: bad photo ids")
+    if sizes.shape != (n, 2):
+        raise ValueError("starter package: bad thumbnail sizes")
+    try:
+        folder_ids = [folders[k][0] for k in folder_index]
+        folder_names = {f[0]: f[1] for f in folders if f[0]}
+    except Exception as exc:
+        raise ValueError("starter package: bad folder list") from exc
+    if emb is not None:
+        if emb.ndim != 2 or emb.shape[0] != n or emb.shape[1] < 1 or emb.dtype.kind != "f":
+            raise ValueError("starter package: bad embeddings")
+        emb = emb.astype(np.float32)
+        if not np.isfinite(emb).all():
+            raise ValueError("starter package: embeddings are not numbers")
+        norms = np.linalg.norm(emb, axis=1)
+        if norms.min() < 0.9 or norms.max() > 1.1:
+            raise ValueError("starter package: embeddings are not normalised")
+    return {
+        "count": n,
+        "created_at": info.get("created_at"),
+        "ids": ids,
+        "names": names,
+        "etags": etags,
+        "folder_ids": folder_ids,
+        "folder_names": folder_names,
+        "sizes": sizes,
+        "embeddings": emb,
+    }
+
+
+def _starter_should_publish(remote, count, fingerprint, model, changed, failed, now,
+                            min_hours, max_days):
+    """Whether this computer should upload a fresh package. Returns
+    (yes, reason). At most one upload per `min_hours` across everyone, never
+    a library that is clearly incomplete, never the same state twice."""
+    if count <= 0:
+        return False, "empty library"
+    if failed > max(25, count // 100):
+        return False, f"{failed} photos failed this run"
+    usable = (
+        isinstance(remote, dict)
+        and remote.get("format") == STARTER_FORMAT
+        and remote.get("model") == model
+        and isinstance(remote.get("count"), int)
+        and remote.get("count") > 0
+    )
+    if not usable:
+        return True, "no usable package on SharePoint yet"
+    if remote.get("fingerprint") == fingerprint:
+        return False, "this library state is already published"
+    try:
+        age_hours = (now - float(remote.get("created_at"))) / 3600.0
+    except (TypeError, ValueError):
+        return True, "published package has no date"
+    if count < 0.9 * remote["count"] and age_hours < 30 * 24:
+        return False, "this library is smaller than the published one"
+    if changed and age_hours >= min_hours:
+        return True, "the library changed"
+    if age_hours >= max_days * 24:
+        return True, f"published package is {age_hours / 24:.0f} days old"
+    return False, "published recently"
+
+
+def _starter_drop_unchanged(changed_by_folder, seed_etag, seed_folder, has_local_index):
+    """Takes out of a listing the photos this computer already holds from
+    the starter package, unchanged: same eTag, same folder. Folders with
+    their own local index are left to the usual path. Returns how many
+    were taken out."""
+    dropped = 0
+    for folder_id in list(changed_by_folder):
+        if has_local_index(folder_id):
+            continue
+        keep = []
+        for item in changed_by_folder[folder_id]:
+            item_id, etag = item.get("id"), item.get("eTag")
+            if etag and seed_etag.get(item_id) == etag and seed_folder.get(item_id) == folder_id:
+                dropped += 1
+            else:
+                keep.append(item)
+        if keep:
+            changed_by_folder[folder_id] = keep
+        else:
+            del changed_by_folder[folder_id]
+    return dropped
+
+
+def _starter_add_base(all_entries, seed, item_folder_map, folder_names, has_local_index):
+    """Completes the searchable index with the package's entries: every
+    photo that is still listed, is not already there from a local index
+    file, and whose folder has no local index file. Returns how many."""
+    added = 0
+    emb, names, etags = seed["embeddings"], seed["names"], seed["etags"]
+    seed_folder_names = seed["folder_names"]
+    for k, item_id in enumerate(seed["ids"]):
+        if item_id in all_entries:
+            continue
+        folder_id = item_folder_map.get(item_id)
+        if not folder_id or has_local_index(folder_id):
+            continue
+        all_entries[item_id] = {
+            "name": names[k],
+            "embedding": emb[k],
+            "folder": folder_names.get(folder_id) or seed_folder_names.get(folder_id, ""),
+            "etag": etags[k],
+            "folder_id": folder_id,
+        }
+        added += 1
+    return added
+
+
+def _starter_folder_plan(folder_in_package, has_local_file, remote_items):
+    """What to build a folder's index on, on a computer that started from
+    the package: "normal" (as always), "merge" (the complete shared index)
+    or "skip" (no complete base to be had - leave the folder alone)."""
+    if has_local_file:
+        return "normal"
+    if remote_items:
+        return "merge"
+    return "skip" if folder_in_package else "normal"
+
+
+_starter_placeholders = {}
+
+
+def _starter_placeholder(width, height):
+    """A calm stand-in for a thumbnail that is still on its way, in the
+    photo's own proportions. Pure Pillow, so it is safe off the UI thread."""
+    if not width or not height:
+        width, height = 4, 3
+    scale = 352.0 / max(width, height)
+    size = (max(24, round(width * scale)), max(24, round(height * scale)))
+    cached = _starter_placeholders.get(size)
+    if cached is not None:
+        return cached
+    top = Image.new("RGB", size, _hex_rgb(SURFACE_HOVER))
+    bottom = Image.new("RGB", size, _hex_rgb(SURFACE))
+    img = Image.composite(bottom, top, Image.linear_gradient("L").resize(size))
+    try:
+        glyph = _lucide_glyph("photos")
+        if glyph:
+            icon = max(20, min(size) // 5)
+            font = ImageFont.truetype(_resource_path("assets", "fonts", "lucide.ttf"), icon)
+            draw = ImageDraw.Draw(img)
+            left, upper, right, lower = draw.textbbox((0, 0), glyph, font=font)
+            draw.text(
+                ((size[0] - (right - left)) / 2 - left, (size[1] - (lower - upper)) / 2 - upper),
+                glyph, font=font, fill=_hex_rgb(_mix(FAINT_TEXT, BG_COLOR, 0.45)),
+            )
+    except Exception:
+        pass
+    if len(_starter_placeholders) > 64:
+        _starter_placeholders.clear()
+    _starter_placeholders[size] = img
+    return img
 
 
 def open_in_system_viewer(path):
@@ -2448,7 +2714,7 @@ class ImageSearchApp:
                 width, height = img.size
             landscape = width > height
         except Exception:
-            landscape = False
+            landscape = self._starter_landscape(index)
         self._landscape_cache[index] = landscape
         return landscape
 
@@ -2925,6 +3191,14 @@ class ImageSearchApp:
                 remote_index_error = str(exc)
                 self.event_queue.put(("status", f"Couldn't read shared index: {exc}"))
 
+        starter_base = self._starter_folder_base(
+            folder_id, local_index_path, remote_items, changed_items, failed_items
+        )
+        if starter_base is False:
+            return {}
+        if starter_base:
+            local_items = starter_base
+
         for item_id in deleted_ids:
             local_items.pop(item_id, None)
 
@@ -3081,8 +3355,8 @@ class ImageSearchApp:
                 delta_status = lambda msg: self.event_queue.put(("status", msg))
                 root = self.sp_client.get_search_root_item()
                 try:
-                    raw_items, new_delta_link = self.sp_client.get_delta_items(
-                        root["id"], delta_link, status_callback=delta_status
+                    raw_items, new_delta_link = self._starter_delta_items(
+                        root["id"], delta_link, delta_status
                     )
                 except _sharepoint().DeltaExpired:
                     self.event_queue.put(("status", "Delta expired - doing a full resync..."))
@@ -3138,6 +3412,7 @@ class ImageSearchApp:
                     changed_by_folder.setdefault(parent_id, []).append(item)
                     item_folder_map[item_id] = parent_id
 
+                self._starter_filter_listing(changed_by_folder)
                 affected_folders = set(changed_by_folder) | set(deleted_by_folder)
                 total_changed = sum(len(v) for v in changed_by_folder.values())
                 self.event_queue.put(("sp_scan_done", total_changed))
@@ -3182,11 +3457,14 @@ class ImageSearchApp:
                                 all_entries[item_id] = {
                                     "name": entry["name"],
                                     "embedding": entry["embedding"],
+                                    "etag": entry.get("etag"),
+                                    "folder_id": folder_id,
                                     "folder": folder_names.get(folder_id, ""),
                                 }
                         except (json.JSONDecodeError, OSError, KeyError):
                             pass
 
+                self._starter_complete(all_entries, item_folder_map, folder_names)
                 sp_items = [
                     {
                         "path": os.path.join(thumbs_dir, f"{item_id}.jpg"),
@@ -3220,12 +3498,620 @@ class ImageSearchApp:
                 with open(folder_map_path, "w", encoding="utf-8") as f:
                     json.dump(item_folder_map, f)
 
+                self._starter_publish_later(root["id"], all_entries, len(affected_folders), len(failed_items))
                 self.event_queue.put(("sp_index_done", count, len(affected_folders), len(failed_items)))
             except Exception as exc:
                 _log_crash("SharePoint indexing", sys.exc_info())
                 self.event_queue.put(("error", str(exc)))
 
         self._run_in_background(work)
+
+    # ---------- starter package: a new computer's shortcut ----------
+    # (the design is described above _starter_pack)
+
+    def _starter_seed_path(self):
+        return os.path.join(self._sp_cache_dirs()[0], STARTER_SEED_FILE)
+
+    def _starter_seed(self, with_embeddings=False):
+        """The package this computer's library started from - or None on
+        every computer that synced the usual way. The small parts (eTags,
+        folders, thumbnail sizes) are kept in memory; the embeddings are
+        read only when asked for."""
+        path = self._starter_seed_path()
+        try:
+            stamp = os.path.getmtime(path)
+        except OSError:
+            return None
+        cache = self.__dict__.get("_starter_seed_cache")
+        if cache is None or cache[0] != stamp:
+            try:
+                seed = _starter_unpack(path, MODEL_TAG, with_embeddings=False)
+                ids = seed["ids"]
+                seed["etag_of"] = dict(zip(ids, seed["etags"]))
+                seed["folder_of"] = dict(zip(ids, seed["folder_ids"]))
+                seed["size_of"] = {
+                    i: (int(w), int(h)) for i, (w, h) in zip(ids, seed["sizes"].tolist())
+                }
+                seed["folders"] = set(seed["folder_ids"])
+            except ValueError as exc:
+                _log_reuse(f"STARTER SEED UNREADABLE: {exc!r}")
+                seed = None
+            cache = self._starter_seed_cache = (stamp, seed)
+        seed = cache[1]
+        if seed is not None and with_embeddings:
+            seed = dict(seed, embeddings=_starter_unpack(path, MODEL_TAG)["embeddings"])
+        return seed
+
+    def _starter_has_local_index(self):
+        """folder id -> whether this computer has its own index file for
+        that folder. Remembered for one sync run."""
+        indexes_dir = self._sp_cache_dirs()[3]
+        known = {}
+
+        def has(folder_id):
+            if folder_id not in known:
+                known[folder_id] = os.path.exists(os.path.join(indexes_dir, f"{folder_id}.json"))
+            return known[folder_id]
+
+        return has
+
+    # --- hooks in the sync (each does nothing on a computer without a package) ---
+
+    def _starter_delta_items(self, root_id, delta_link, status):
+        """The listing for a sync: the one fetched in the background right
+        after the starter package was loaded, if it is still fresh,
+        otherwise a normal request."""
+        listing = self.__dict__.pop("_starter_listing", None)
+        if (listing is not None and delta_link is None and listing[0] == root_id
+                and time.time() - listing[3] < 600):
+            return listing[1], listing[2]
+        return self.sp_client.get_delta_items(root_id, delta_link, status_callback=status)
+
+    def _starter_filter_listing(self, changed_by_folder):
+        seed = self._starter_seed()
+        if seed is None:
+            return
+        dropped = _starter_drop_unchanged(
+            changed_by_folder, seed["etag_of"], seed["folder_of"], self._starter_has_local_index()
+        )
+        left = sum(len(v) for v in changed_by_folder.values())
+        _log_reuse(f"STARTER: {dropped} listed photo(s) already held from the package, {left} to process")
+
+    def _starter_folder_base(self, folder_id, local_index_path, remote_items, changed_items,
+                             failed_items):
+        """What a folder's index is built on, on a computer that started from
+        the package and has no index file for this folder yet.
+
+        None: nothing special. A dict: the complete shared index, to apply
+        the changes to. False: there is no complete base (the shared index is
+        missing or could not be read), so the folder must be left alone -
+        writing or uploading an index made of the changes only would wipe
+        every other photo of the folder out of the shared index.
+        """
+        if os.path.exists(local_index_path):
+            return None
+        seed = self._starter_seed()
+        if seed is None:
+            return None
+        if not remote_items and not changed_items:
+            # Only deletions were reported, so the shared index has not been
+            # fetched yet.
+            try:
+                remote_items = (self.sp_client.download_index_file(folder_id) or {}).get("items", {})
+            except Exception as exc:
+                _log_reuse(f"STARTER: shared index of folder={folder_id} unreadable: {exc!r}")
+                remote_items = {}
+        plan = _starter_folder_plan(folder_id in seed["folders"], False, remote_items)
+        if plan == "merge":
+            return dict(remote_items)
+        if plan == "skip":
+            for item in changed_items:
+                failed_items[item["id"]] = item
+                self.event_queue.put(("sp_item_done",))
+            _log_reuse(
+                f"STARTER: folder={folder_id} left as it is - no shared index to build on "
+                f"({len(changed_items)} change(s) will be retried)"
+            )
+            return False
+        return None
+
+    def _starter_complete(self, all_entries, item_folder_map, folder_names):
+        """Adds the package's entries to the index a sync has just put
+        together from the local index files."""
+        path = self._starter_seed_path()
+        if not os.path.exists(path):
+            return
+        try:
+            seed = self._starter_seed(with_embeddings=True)
+            if seed is None:
+                raise ValueError("unreadable")
+        except Exception as exc:
+            # Carrying on would save a library made of the few folders that
+            # have their own index file. Instead the damaged package is set
+            # aside and this computer's sync state is reset, so the next
+            # sync rebuilds everything the long, usual way.
+            local_folder = self._sp_cache_dirs()[0]
+            try:
+                os.replace(path, path + ".bad")
+            except OSError:
+                pass
+            for name in ("delta_link.txt", "item_folder_map.json"):
+                try:
+                    os.remove(os.path.join(local_folder, name))
+                except OSError:
+                    pass
+            _log_reuse(f"STARTER SEED DAMAGED, sync state reset: {exc!r}")
+            raise RuntimeError(
+                "The saved photo library was damaged. Click Check for new photos again to "
+                "rebuild it - this one time it takes longer."
+            ) from exc
+        added = _starter_add_base(
+            all_entries, seed, item_folder_map, folder_names, self._starter_has_local_index()
+        )
+        _log_reuse(f"STARTER: {added} of {len(all_entries)} photos come from the package")
+
+    def _starter_publish_later(self, root_id, all_entries, changed_folders, failed):
+        """Called at the end of a successful sync. Hands a snapshot to a
+        background thread, which uploads a fresh package if one is due - the
+        sync itself does not wait for it."""
+        try:
+            # Positions in the library have just changed.
+            self._landscape_cache = {}
+            if not _starter_setting("STARTER_PACKAGE_ENABLED", True):
+                return
+            if self.__dict__.get("_starter_publishing"):
+                return
+            emb = self.engine.embeddings
+            if emb is None or not len(all_entries) or len(emb) != len(all_entries):
+                return
+            rows = [
+                (item_id, e.get("name") or "", e.get("folder_id") or "", e.get("etag") or "",
+                 e.get("folder") or "")
+                for item_id, e in all_entries.items()
+            ]
+            self._starter_publishing = True
+            threading.Thread(
+                target=self._starter_publish,
+                args=(self.sp_client, root_id, rows, emb, changed_folders, failed),
+                name="starter-publish", daemon=True,
+            ).start()
+        except Exception:
+            _log_crash("starter package snapshot", sys.exc_info())
+
+    def _starter_publish(self, client, root_id, rows, emb, changed_folders, failed):
+        try:
+            ids = [r[0] for r in rows]
+            etags = [r[3] for r in rows]
+            fingerprint = _starter_fingerprint(ids, etags, MODEL_TAG)
+            try:
+                remote = client.download_json_file(root_id, STARTER_MANIFEST_NAME)
+            except Exception as exc:
+                _log_reuse(f"STARTER PUBLISH skipped: manifest unreadable: {exc!r}")
+                return
+            publish, reason = _starter_should_publish(
+                remote, len(ids), fingerprint, MODEL_TAG, bool(changed_folders), failed,
+                time.time(),
+                float(_starter_setting("STARTER_MIN_HOURS_BETWEEN_UPLOADS", 6)),
+                float(_starter_setting("STARTER_MAX_AGE_DAYS", 7)),
+            )
+            if not publish:
+                _log_reuse(f"STARTER PUBLISH not needed: {reason}")
+                return
+            dtype = str(_starter_setting("STARTER_EMBEDDING_DTYPE", "float16"))
+            created_at = time.time()
+            payload = _starter_pack(
+                ids, [r[1] for r in rows], [r[2] for r in rows],
+                {r[2]: r[4] for r in rows if r[2]}, etags, self._starter_thumb_sizes(ids),
+                emb, MODEL_TAG, created_at, dtype=dtype,
+            )
+            _starter_unpack(payload, MODEL_TAG)  # never share a package this app could not read
+            # The package first, then the manifest that describes it: in
+            # between, the old manifest's checksum does not match and a new
+            # computer simply syncs the usual way.
+            client.upload_file_bytes(root_id, STARTER_PACKAGE_NAME, payload)
+            client.upload_json_file(root_id, STARTER_MANIFEST_NAME, {
+                "format": STARTER_FORMAT,
+                "model": MODEL_TAG,
+                "count": len(ids),
+                "created_at": created_at,
+                "created": datetime.datetime.now().isoformat(timespec="seconds"),
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "fingerprint": fingerprint,
+                "dtype": dtype,
+                "by": machine_key(),
+                "app": APP_VERSION,
+            })
+            _log_reuse(
+                f"STARTER PUBLISHED: photos={len(ids)} size={len(payload) / 1048576:.1f}MB "
+                f"dtype={dtype} reason={reason!r}"
+            )
+        except Exception as exc:
+            _log_reuse(f"STARTER PUBLISH FAILED: {exc!r}")
+        finally:
+            self._starter_publishing = False
+
+    def _starter_thumb_sizes(self, ids):
+        """[width, height] of every photo's thumbnail, for the package: read
+        from the files' headers once and remembered in thumb_sizes.json."""
+        local_folder, thumbs_dir, _full, _indexes = self._sp_cache_dirs()
+        cache_path = os.path.join(local_folder, "thumb_sizes.json")
+        known = self._read_json(cache_path)
+        seed = self._starter_seed()
+        seed_sizes = seed["size_of"] if seed else {}
+        out, fresh = [], 0
+        for item_id in ids:
+            size = known.get(item_id)
+            if not (isinstance(size, list) and len(size) == 2):
+                try:
+                    with Image.open(os.path.join(thumbs_dir, f"{item_id}.jpg")) as img:
+                        size = [int(img.size[0]), int(img.size[1])]
+                    known[item_id] = size
+                    fresh += 1
+                except Exception:
+                    size = list(seed_sizes.get(item_id, (0, 0)))
+            out.append(size)
+        if fresh:
+            try:
+                with open(cache_path + ".tmp", "w", encoding="utf-8") as f:
+                    json.dump(known, f)
+                os.replace(cache_path + ".tmp", cache_path)
+            except OSError:
+                pass
+        return out
+
+    # --- a computer with an empty library ---
+
+    def _starter_wanted(self):
+        """True only on a computer that has never held the library: nothing
+        cached, nothing synced."""
+        if not _starter_setting("STARTER_PACKAGE_ENABLED", True):
+            return False
+        local_folder, _thumbs, _full, indexes_dir = self._sp_cache_dirs()
+        emb_path, meta_path = self._fast_cache_paths()
+        present = (emb_path, meta_path, self._starter_seed_path(),
+                   os.path.join(local_folder, "delta_link.txt"))
+        if any(os.path.exists(p) for p in present):
+            return False
+        try:
+            if any(name.endswith(".json") for name in os.listdir(indexes_dir)):
+                return False
+        except OSError:
+            pass
+        return True
+
+    def _after_sign_in(self):
+        if self._starter_wanted():
+            self._starter_bootstrap()
+        else:
+            self._index_sharepoint_tree()
+
+    def _starter_bootstrap(self):
+        """Downloads the starter package and makes the library searchable.
+        Whatever goes wrong, the usual sync takes over."""
+        state = {"done": 0, "total": 0, "phase": "look", "bar": False}
+        client = self.sp_client
+        self._set_busy(True)
+        self.progress.configure(mode="indeterminate")
+        self.progress.start()
+        self.status_var.set("Looking for the photo library...")
+
+        def work():
+            try:
+                root_id = client.get_search_root_item()["id"]
+                manifest = client.download_json_file(root_id, STARTER_MANIFEST_NAME)
+                if not (isinstance(manifest, dict) and manifest.get("format") == STARTER_FORMAT
+                        and manifest.get("model") == MODEL_TAG and manifest.get("count")):
+                    state["result"] = ("none",)
+                    return
+                state["total"] = int(manifest.get("size") or 0)
+                state["phase"] = "download"
+
+                def progress(done, total):
+                    state["done"] = done
+                    if total:
+                        state["total"] = total
+
+                data = client.download_file_bytes(root_id, STARTER_PACKAGE_NAME, progress)
+                if data is None:
+                    state["result"] = ("none",)
+                    return
+                if hashlib.sha256(data).hexdigest() != manifest.get("sha256"):
+                    raise ValueError("checksum does not match the manifest")
+                state["phase"] = "unpack"
+                seed = _starter_unpack(data, MODEL_TAG)
+                count = self._starter_install(seed, data)
+                _log_reuse(
+                    f"STARTER LOADED: photos={count} size={len(data) / 1048576:.1f}MB "
+                    f"published={manifest.get('created')!r}"
+                )
+                state["result"] = ("ok", count)
+            except Exception as exc:
+                _log_reuse(f"STARTER BOOTSTRAP FAILED, syncing the usual way: {exc!r}")
+                state["result"] = ("failed",)
+
+        threading.Thread(target=work, name="starter-bootstrap", daemon=True).start()
+
+        def poll():
+            result = state.get("result")
+            if result is None:
+                if state["phase"] == "download" and state["total"]:
+                    if not state["bar"]:
+                        state["bar"] = True
+                        self.progress.stop()
+                        self.progress.configure(mode="determinate")
+                    self.progress.set(min(1.0, state["done"] / state["total"]))
+                    self.status_var.set(
+                        "Downloading the photo library - 1 of 1 file, "
+                        f"{state['done'] / 1048576:.0f} of {state['total'] / 1048576:.0f} MB"
+                    )
+                elif state["phase"] == "unpack":
+                    self.status_var.set("Preparing the photo library...")
+                self.root.after(150, poll)
+                return
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            self.progress.set(0)
+            self._set_busy(False)
+            if result[0] == "ok":
+                self._starter_ready(result[1])
+            else:
+                self._index_sharepoint_tree()
+
+        self.root.after(150, poll)
+
+    def _starter_install(self, seed, data):
+        """Writes the package to disk and loads it. The package itself goes
+        first: with only that on disk the next sync still completes the
+        library from it. Worker thread."""
+        local_folder, thumbs_dir, _full, indexes_dir = self._sp_cache_dirs()
+        for folder in (local_folder, thumbs_dir, indexes_dir):
+            os.makedirs(folder, exist_ok=True)
+        seed_path = self._starter_seed_path()
+        with open(seed_path + ".tmp", "wb") as f:
+            f.write(data)
+        os.replace(seed_path + ".tmp", seed_path)
+        names_path = os.path.join(local_folder, "folder_names.json")
+        if not os.path.exists(names_path):
+            with open(names_path, "w", encoding="utf-8") as f:
+                json.dump(seed["folder_names"], f, ensure_ascii=False)
+        emb_path, meta_path = self._fast_cache_paths()
+        folder_names = seed["folder_names"]
+        meta = {
+            "paths": [os.path.join(thumbs_dir, f"{item_id}.jpg") for item_id in seed["ids"]],
+            "meta": [
+                {"item_id": item_id, "name": name, "folder": folder_names.get(folder_id, "")}
+                for item_id, name, folder_id in zip(seed["ids"], seed["names"], seed["folder_ids"])
+            ],
+        }
+        with open(emb_path + ".tmp", "wb") as f:
+            np.save(f, seed["embeddings"])
+        os.replace(emb_path + ".tmp", emb_path)
+        with open(meta_path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
+        os.replace(meta_path + ".tmp", meta_path)
+        count = self._load_fast_cache()
+        if count != seed["count"]:
+            raise ValueError(f"loaded {count} of {seed['count']} photos")
+        return count
+
+    def _starter_ready(self, count):
+        """The package is loaded: show the library, then fetch what is newer."""
+        self._sp_mode_active = True
+        self.folder_var.set("SharePoint: Fotos & Videos (all subfolders)")
+        self._landscape_cache = {}
+        self._update_search_buttons_state()
+        self._show_all_photos()
+        self._refresh_suggestions()
+        self._refresh_collections(from_cache=True)
+        self._warm_model()
+        self.status_var.set(
+            f"{count:,} photos ready to search. Checking SharePoint for newer ones in the background..."
+        )
+        self._starter_followup()
+
+    def _starter_followup(self):
+        """Lists the library in the background - the slow part of a first
+        sync - while the app stays usable, then runs the sync itself, which
+        with the listing in hand only has the new and changed photos to do."""
+        state = {}
+        client = self.sp_client
+        delta_path = os.path.join(self._sp_cache_dirs()[0], "delta_link.txt")
+
+        def work():
+            try:
+                root_id = client.get_search_root_item()["id"]
+                items, link = client.get_delta_items(root_id, None)
+                state["listing"] = (root_id, items, link, time.time())
+            except Exception as exc:
+                _log_reuse(f"STARTER: background listing failed: {exc!r}")
+                state["listing"] = None
+
+        threading.Thread(target=work, name="starter-listing", daemon=True).start()
+
+        def poll():
+            if "listing" not in state or self._busy:
+                self.root.after(400, poll)
+                return
+            if os.path.exists(delta_path):
+                return  # a sync has run in the meantime
+            if state["listing"] is not None:
+                self._starter_listing = state["listing"]
+            self._index_sharepoint_tree()
+
+        self.root.after(400, poll)
+
+    # --- thumbnails that are fetched when they are first looked at ---
+
+    def _starter_landscape(self, index):
+        """Orientation from the package when the thumbnail is not on disk."""
+        try:
+            seed = self._starter_seed()
+            if seed is None:
+                return False
+            item_id = (self.engine.meta[index] or {}).get("item_id")
+            width, height = seed["size_of"].get(item_id, (0, 0))
+            return width > height
+        except Exception:
+            return False
+
+    def _lazy_state(self):
+        lazy = self.__dict__.get("_lazy")
+        if lazy is None:
+            lazy = self.__dict__.setdefault("_lazy", {
+                "lock": threading.Lock(), "queue": queue.Queue(), "done": queue.Queue(),
+                "wanted": {}, "failed": {}, "workers": 0, "pumping": False,
+            })
+        return lazy
+
+    def _lazy_thumb(self, path):
+        """For a thumbnail that is not on disk: a placeholder in the photo's
+        proportions, while the real one is fetched in the background - or
+        None when this is not a photo from the starter package (then the
+        caller behaves as it always has). Safe from any thread."""
+        folder, name = os.path.split(path)
+        if not name.endswith(".jpg"):
+            return None
+        if os.path.normcase(folder) != os.path.normcase(self._sp_cache_dirs()[1]):
+            return None
+        seed = self._starter_seed()
+        if seed is None:
+            return None
+        item_id = name[:-4]
+        size = seed["size_of"].get(item_id)
+        if size is None:
+            return None
+        lazy = self._lazy_state()
+        view = self.__dict__.get("_shown_results")
+        with lazy["lock"]:
+            failed_at = lazy["failed"].get(path)
+            if failed_at == 0:
+                return None  # SharePoint has no thumbnail for it: left out, as before
+            if failed_at is not None and time.time() - failed_at >= 45:
+                del lazy["failed"][path]
+                failed_at = None
+            if failed_at is None:
+                if path not in lazy["wanted"]:
+                    lazy["queue"].put((path, item_id))
+                lazy["wanted"][path] = view
+                while lazy["workers"] < int(_starter_setting("STARTER_LAZY_THUMB_WORKERS", 4)):
+                    lazy["workers"] += 1
+                    threading.Thread(target=self._lazy_worker, name="lazy-thumbs",
+                                     daemon=True).start()
+        if threading.current_thread() is threading.main_thread():
+            self._lazy_pump_start()
+        return _starter_placeholder(*size)
+
+    def _lazy_worker(self):
+        lazy = self._lazy_state()
+        while True:
+            path, item_id = lazy["queue"].get()
+            with lazy["lock"]:
+                if path not in lazy["wanted"]:
+                    continue
+                if lazy["wanted"][path] is not self.__dict__.get("_shown_results"):
+                    # Asked for by a view that is gone; it is asked for again
+                    # if it is shown again.
+                    del lazy["wanted"][path]
+                    continue
+            outcome = "retry"
+            try:
+                if os.path.exists(path):
+                    outcome = "ok"
+                else:
+                    client = self._sp_client(False)
+                    if client is not None:
+                        part = f"{path}.{threading.get_ident()}.part"
+                        if client.download_thumbnail({"id": item_id}, part):
+                            os.replace(part, path)
+                            outcome = "ok"
+                        else:
+                            outcome = "none"
+            except Exception as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                outcome = "none" if status == 404 else "retry"
+            lazy["done"].put((path, outcome))
+
+    def _lazy_pump_start(self):
+        lazy = self._lazy_state()
+        if not lazy["pumping"]:
+            lazy["pumping"] = True
+            self.root.after(120, self._lazy_pump)
+
+    def _lazy_pump(self):
+        """UI thread: takes in the thumbnails that have arrived and repaints
+        their tiles. Runs only while some are on their way."""
+        lazy = self._lazy_state()
+        arrived = []
+        try:
+            while True:
+                path, outcome = lazy["done"].get_nowait()
+                with lazy["lock"]:
+                    lazy["wanted"].pop(path, None)
+                    if outcome == "none":
+                        lazy["failed"][path] = 0
+                    elif outcome == "retry":
+                        lazy["failed"][path] = time.time()
+                if outcome == "ok":
+                    arrived.append(path)
+        except queue.Empty:
+            pass
+        if arrived:
+            try:
+                self._lazy_repaint(arrived)
+            except Exception:
+                _log_crash("showing fetched thumbnails", sys.exc_info())
+        with lazy["lock"]:
+            waiting = bool(lazy["wanted"])
+        if waiting or not lazy["done"].empty():
+            self.root.after(120, self._lazy_pump)
+        else:
+            lazy["pumping"] = False
+
+    def _lazy_repaint(self, paths):
+        arrived = set(paths)
+        for path in arrived:
+            self._thumb_cache.pop(path, None)
+        reduced = self._motion_reduced()
+        for label in list((self.__dict__.get("_tile_by_pos") or {}).values()):
+            try:
+                tile = getattr(label, "tile", None)
+                if tile is None or tile[0] not in arrived or not label.winfo_exists():
+                    continue
+                path, size, key = tile
+                new = self._tile_pil(path, size, key in self._render_favs)
+                label.image = ImageTk.PhotoImage(new)
+                label.hover_image = None
+                label.sel_image = None
+                if reduced or getattr(label, "selected", False) or getattr(label, "dragging", False):
+                    self._paint_tile(label)
+                    continue
+                old = Image.new("RGBA", size, _hex_rgb(BG_COLOR) + (255,))
+                old.paste(ImageOps.fit(_starter_placeholder(*size), size, Image.BILINEAR), (0, 0),
+                          self._tile_mask(size))
+                frames = [ImageTk.PhotoImage(Image.blend(old, new, a)) for a in (0.4, 0.75)]
+                self._lazy_fade(label, frames)
+            except Exception:
+                continue
+
+    def _lazy_fade(self, label, frames):
+        """The photo comes up out of its placeholder (ease-out, 160 ms)."""
+        label.fade_frames = frames
+
+        def step(p):
+            try:
+                if getattr(label, "selected", False) or getattr(label, "dragging", False):
+                    return
+                k = int(p * (len(frames) + 1))
+                label.configure(image=frames[k] if k < len(frames) else label.image)
+            except tk.TclError:
+                pass
+
+        def done():
+            label.fade_frames = None
+            self._paint_tile(label)
+
+        _animate(self.root, 160, step, done=done, ease=EASE_OUT)
 
     def _deliver_to_download_folder(self, source, name):
         """Copies an opened image into the user's chosen folder, if set.
@@ -3333,7 +4219,7 @@ class ImageSearchApp:
                     self._end_sharpening(event[1])
                 elif kind == "sp_signed_in":
                     self._set_busy(False)
-                    self._index_sharepoint_tree()
+                    self._after_sign_in()
                 elif kind == "sp_scan_done":
                     self._sp_total_images = event[1]
                     self._sp_done_images = 0
@@ -3500,6 +4386,10 @@ class ImageSearchApp:
         """
         img = self._thumb_cache.get(path)
         if img is None:
+            if not os.path.exists(path):
+                placeholder = self._lazy_thumb(path)
+                if placeholder is not None:
+                    return placeholder  # not cached: the real one is on its way
             with Image.open(path) as source:
                 img = source.convert("RGB")
             img.thumbnail(THUMB_SIZE)

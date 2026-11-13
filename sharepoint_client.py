@@ -417,6 +417,48 @@ class SharePointClient:
             chunk_resp.raise_for_status()
             start = end + 1
 
+    def download_file_bytes(self, folder_item_id, filename, progress=None):
+        """A file from a folder as bytes, or None if it is not there.
+        progress(done, total) is called as it arrives."""
+        self._resolve_site_and_drive()
+        url = f"{GRAPH_BASE}/drives/{self._drive_id}/items/{folder_item_id}:/{filename}"
+        try:
+            entry = self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return None
+            raise
+        download_url = entry.get("@microsoft.graph.downloadUrl")
+        if not download_url:
+            detail = self._get(f"{GRAPH_BASE}/drives/{self._drive_id}/items/{entry['id']}")
+            download_url = detail["@microsoft.graph.downloadUrl"]
+        total = int(entry.get("size") or 0)
+        resp = requests.get(download_url, stream=True, timeout=60)
+        resp.raise_for_status()
+        chunks, done = [], 0
+        for chunk in resp.iter_content(chunk_size=1 << 18):
+            chunks.append(chunk)
+            done += len(chunk)
+            if progress:
+                progress(done, total)
+        return b"".join(chunks)
+
+    def upload_file_bytes(self, folder_item_id, filename, payload):
+        """Uploads (creates/overwrites) a binary file into a folder - in
+        chunks through an upload session when it is large."""
+        self._resolve_site_and_drive()
+        if len(payload) >= SIMPLE_UPLOAD_LIMIT:
+            return self._upload_file_chunked(folder_item_id, filename, payload)
+        url = f"{GRAPH_BASE}/drives/{self._drive_id}/items/{folder_item_id}:/{filename}:/content"
+        resp = requests.put(
+            url,
+            headers={**self._headers(), "Content-Type": "application/octet-stream"},
+            data=payload,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def download_index_file(self, folder_item_id):
         """Returns the parsed shared index dict for a folder, or None."""
         return self.download_json_file(folder_item_id, INDEX_FILENAME)
