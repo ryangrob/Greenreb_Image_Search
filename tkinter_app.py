@@ -5939,7 +5939,7 @@ class ImageSearchApp:
         except Exception:
             pass
         state = {"full": None, "icc": None, "format": "original", "kind": "JPEG", "open": True}
-        panel = ctk.CTkFrame(win, fg_color=SIDEBAR_BG, width=272, corner_radius=0)
+        panel = ctk.CTkFrame(win, fg_color=SIDEBAR_BG, width=300, corner_radius=0)
         panel.pack(side=tk.RIGHT, fill=tk.Y)
         panel.pack_propagate(False)
         crop = CropCanvas(win, on_change=lambda: update_info())
@@ -5997,9 +5997,9 @@ class ImageSearchApp:
 
         buttons = ctk.CTkFrame(inner, fg_color="transparent")
         buttons.pack(side=tk.BOTTOM, fill=tk.X)
-        save_button = _make_primary_button(buttons, "Save…", lambda: save(), width=110)
+        save_button = _make_primary_button(buttons, "Save…", lambda: save(), width=96)
         save_button.pack(side=tk.RIGHT)
-        copy_button = _make_secondary_button(buttons, "Copy", lambda: copy(), width=80)
+        copy_button = _make_secondary_button(buttons, "Copy", lambda: copy(), width=72)
         copy_button.pack(side=tk.RIGHT, padx=(0, 8))
         ctk.CTkButton(buttons, text="Cancel", width=0, height=32, corner_radius=8,
                       fg_color="transparent", hover_color=SURFACE_HOVER,
