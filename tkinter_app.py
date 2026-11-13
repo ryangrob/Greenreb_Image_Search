@@ -941,7 +941,7 @@ class ImageSearchApp:
             footer, fg_color=SURFACE, corner_radius=10, border_width=1, border_color=BORDER,
         )
         card.pack(fill=tk.X, pady=(0, 10))
-        top = ctk.CTkFrame(card, fg_color="transparent")
+        top = self._update_top = ctk.CTkFrame(card, fg_color="transparent")
         top.pack(fill=tk.X, padx=12, pady=(9, 0))
         self.update_title = ctk.CTkLabel(top, text="", font=_font(12, "semibold"),
                                          text_color=TEXT_COLOR, anchor="w", height=18)
@@ -949,10 +949,17 @@ class ImageSearchApp:
         self.update_pill = ctk.CTkLabel(top, text="", font=_font(10, "medium"),
                                         text_color=FAINT_TEXT, anchor="e", height=18)
         self.update_pill.pack(side=tk.RIGHT)
+        # On a short screen the card is one line: this small button stands in
+        # for the What's new link below.
+        self._whats_new_icon = ctk.CTkButton(
+            top, text="", width=22, height=20, corner_radius=6, fg_color="transparent",
+            hover_color=SURFACE_HOVER, image=_icon("whatsnew", 13, MUTED_TEXT_COLOR),
+            command=self._show_whats_new,
+        )
         self.update_detail = ctk.CTkLabel(card, text="", font=_font(11), text_color=MUTED_TEXT_COLOR,
                                           anchor="w", justify="left", wraplength=196)
         self.update_detail.pack(fill=tk.X, padx=12, pady=(1, 0))
-        actions = ctk.CTkFrame(card, fg_color="transparent")
+        actions = self._update_actions = ctk.CTkFrame(card, fg_color="transparent")
         actions.pack(fill=tk.X, padx=8, pady=(4, 7))
         self.update_button = _make_primary_button(actions, "Restart to update", self._restart_app,
                                                   width=0)
@@ -968,7 +975,7 @@ class ImageSearchApp:
         self._set_update_card("current")
         self._footer_divider = ctk.CTkFrame(footer, fg_color=BORDER, height=1, corner_radius=0)
         self._footer_divider.pack(fill=tk.X, pady=(0, 10))
-        source = ctk.CTkFrame(footer, fg_color="transparent")
+        source = self._source_row = ctk.CTkFrame(footer, fg_color="transparent")
         source.pack(fill=tk.X, padx=10)
         ctk.CTkLabel(
             source, text="\u25cf", text_color=SOURCE_DOT, font=_font(10), width=12, height=18,
@@ -979,19 +986,21 @@ class ImageSearchApp:
             justify="left", anchor="w", wraplength=180,
         ).pack(side=tk.LEFT, padx=(6, 0), fill=tk.X)
         stamp = _build_stamp()
+        self._stamp_label = None
         if stamp and not getattr(sys, "frozen", False):
             # Running from source: when the code last changed.
-            ctk.CTkLabel(
+            self._stamp_label = ctk.CTkLabel(
                 footer, text=f"Source changed {stamp}", text_color=FAINT_TEXT, font=_font(11),
                 anchor="w", height=18,
-            ).pack(fill=tk.X, padx=(28, 10), pady=(2, 0))
+            )
+            self._stamp_label.pack(fill=tk.X, padx=(28, 10), pady=(2, 0))
 
         system = self.system_section = ctk.CTkFrame(nav, fg_color="transparent")
         system.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 10))
         # Everything one click away, but small: a full row for the thing done
         # most often, the rest as compact pairs - about half the height of a
         # plain list, so the collections above keep their room.
-        section(system, "SYSTEM", pady=(4, 0))
+        self._system_header = section(system, "SYSTEM", pady=(4, 0))
         self.sharepoint_button = self._make_system_item(
             system, "  Check for new photos", self._browse_sharepoint, icon="refresh"
         )
@@ -1138,7 +1147,9 @@ class ImageSearchApp:
         self.search_button.pack(side=tk.LEFT, padx=(0, 8), pady=8)
         self.search_button.configure(state=tk.DISABLED)
 
-        self.suggestion_bar = ctk.CTkFrame(main, fg_color="transparent")
+        # height=1: an empty CTkFrame is 200 px tall by default, which left a
+        # gap under the search box on a computer without any history yet.
+        self.suggestion_bar = ctk.CTkFrame(main, fg_color="transparent", height=1)
         self.suggestion_bar.pack(fill=tk.X, pady=(0, 14))
 
         # Scrollable results grid - CTkScrollableFrame already handles its
@@ -1170,7 +1181,85 @@ class ImageSearchApp:
 
         self._update_favourites_button()
         self._bind_selection_keys()
+        self._refresh_suggestions()  # the filters are there from the start
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
+        self.root.after(300, lambda: self._apply_sidebar_density(force=True))
         self._set_view("all")
+
+    # ---------- short screens ----------
+    #
+    # On a laptop screen the sidebar tightens up by itself so the
+    # collections keep their room: the update card becomes one line, the
+    # SYSTEM heading and the source lines at the bottom step aside. A tall
+    # screen shows everything.
+
+    SHORT_SCREEN = 860  # window height, in px, below which the sidebar tightens
+
+    def _on_root_configure(self, event):
+        if event.widget is not self.root:
+            return
+        if getattr(self, "_density_after", None) is not None:
+            try:
+                self.root.after_cancel(self._density_after)
+            except Exception:
+                pass
+        self._density_after = self.root.after(120, self._apply_sidebar_density)
+
+    def _sidebar_is_compact(self):
+        return bool(getattr(self, "_sidebar_compact", False))
+
+    def _apply_sidebar_density(self, force=False):
+        self._density_after = None
+        try:
+            height = self.root.winfo_height()
+        except tk.TclError:
+            return
+        if height <= 1:
+            return
+        compact = height < self.SHORT_SCREEN
+        if not force and compact == getattr(self, "_sidebar_compact", None):
+            return
+        self._sidebar_compact = compact
+        footer_rows = [
+            (self._footer_divider, {"fill": tk.X, "pady": (0, 10)}, self.update_card),
+            (self._source_row, {"fill": tk.X, "padx": 10}, self._footer_divider),
+            (self._stamp_label, {"fill": tk.X, "padx": (28, 10), "pady": (2, 0)}, self._source_row),
+        ]
+        try:
+            if compact:
+                for widget, _opts, _after in footer_rows:
+                    if widget is not None:
+                        widget.pack_forget()
+                self._system_header.pack_forget()
+                self.update_card.pack_configure(pady=(0, 8))
+            else:
+                for widget, opts, after in footer_rows:
+                    if widget is not None:
+                        widget.pack(after=after, **opts)
+                self._system_header.pack(fill=tk.X, pady=(4, 0), before=self.sharepoint_button)
+                self.update_card.pack_configure(pady=(0, 10))
+        except tk.TclError:
+            pass
+        self._apply_update_card_density()
+
+    def _apply_update_card_density(self):
+        """One line on a short screen, unless an update needs its button."""
+        if not hasattr(self, "_update_actions"):
+            return
+        quiet = getattr(self, "_update_state", "current") in ("current", "checking", "uptodate")
+        one_line = self._sidebar_is_compact() and quiet
+        try:
+            if one_line:
+                self._update_actions.pack_forget()
+                self._update_top.pack_configure(pady=(8, 8))
+                self._whats_new_icon.pack(side=tk.RIGHT, padx=(0, 4), before=self.update_pill)
+            else:
+                self._whats_new_icon.pack_forget()
+                self._update_top.pack_configure(pady=(9, 0))
+                if not self._update_actions.winfo_manager():
+                    self._update_actions.pack(fill=tk.X, padx=8, pady=(4, 7))
+        except tk.TclError:
+            pass
 
     def _make_system_item(self, parent, text, command, icon, compact=False):
         """A System entry: smaller and quieter than the library and
@@ -4810,6 +4899,11 @@ class ImageSearchApp:
     def _set_update_card(self, state, version=None, changes=None, note=""):
         """current / checking / uptodate / ready / download."""
         version = version or APP_VERSION
+        # The one-line card (short screens) packs its button row away; it is
+        # put back first, so the button and the text below can find their place.
+        actions = getattr(self, "_update_actions", None)
+        if actions is not None and not actions.winfo_manager():
+            actions.pack(fill=tk.X, padx=8, pady=(4, 7))
         self.update_button.pack_forget()
         pill, pill_colour, border = "", FAINT_TEXT, BORDER
         title, detail = f"{APP_NAME} {APP_VERSION}", ""
@@ -4827,6 +4921,7 @@ class ImageSearchApp:
             detail = note or "This one needs a new download."
             self.update_button.configure(text="Download", command=self._open_download_page)
             self.update_button.pack(side=tk.LEFT, padx=(4, 6), before=self.whats_new_link)
+        self._update_state = state
         if changes is not None:
             self._update_info = {"version": version, "changes": list(changes)}
         self.update_title.configure(text=title)
@@ -4843,6 +4938,7 @@ class ImageSearchApp:
                 border_color=_mix(BORDER, border, p)))
         else:
             self.update_card.configure(border_color=border)
+        self._apply_update_card_density()
 
     def _show_update_notice(self, version, restart, note="", changes=None):
         if restart:
