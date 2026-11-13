@@ -3,6 +3,7 @@ of images and ranks them against a text query or a reference image."""
 
 import json
 import os
+import re
 import threading
 import time
 
@@ -51,6 +52,215 @@ def _standardize(v):
     return (v - v.mean()) / (std if std else 1.0)
 
 
+
+# ---------- German queries ----------
+#
+# CLIP reads English: a German query ("Burger mit Pommes") lands somewhere
+# vague in its space. So a query that looks German is turned into English
+# words first ("burger with fries"), from a vocabulary made for this photo
+# library - food, drinks, events, golf, the venue, people, moods, seasons,
+# colours. Compound words are split ("Weihnachtsfeier" -> "christmas
+# party"), endings are tried off ("Getränken" -> "getraenk"), and anything
+# unknown - names, brands, English words - passes through unchanged.
+
+_DE_GLOSSARY = """
+burger=burger|pommes=fries|fritten=fries|essen=food|gericht=dish|speise=dish|speisen=dishes
+teller=plate|nachtisch=dessert|nachspeise=dessert|dessert=dessert|kuchen=cake|torte=cake
+eis=ice cream|eisbecher=ice cream sundae|schokolade=chocolate|schoko=chocolate|pizza=pizza
+salat=salad|suppe=soup|fleisch=meat|steak=steak|haehnchen=chicken|huhn=chicken|fluegel=wings
+chickenwings=chicken wings|fisch=fish|nudel=pasta|nudeln=pasta|brot=bread|broetchen=bun
+sandwich=sandwich|wrap=wrap|taco=taco|tacos=tacos|nachos=nachos|kaese=cheese|snack=snack
+fingerfood=finger food|haeppchen=canapes|fruehstueck=breakfast|brunch=brunch
+mittagessen=lunch|abendessen=dinner|buffet=buffet|bueffet=buffet|grill=grill|grillen=barbecue
+vegan=vegan|vegetarisch=vegetarian|obst=fruit|frucht=fruit|fruechte=fruits|erdbeere=strawberry
+beere=berries|beeren=berries|popcorn=popcorn|sosse=sauce|sauce=sauce|dip=dip|bowl=bowl
+donut=donut|waffel=waffle|pfannkuchen=pancakes|kartoffel=potato|tomate=tomato|zitrone=lemon
+limette=lime|minze=mint|kraeuter=herbs|scharf=spicy|suess=sweet|lecker=delicious
+getraenk=drink|getraenke=drinks|drink=drink|cocktail=cocktail|cocktails=cocktails|bier=beer
+wein=wine|rotwein=red wine|weisswein=white wine|sekt=sparkling wine|champagner=champagne
+prosecco=prosecco|glas=glass|glaeser=glasses|flasche=bottle|kaffee=coffee|tee=tea|saft=juice
+limonade=lemonade|wasser=water|softdrink=soft drink|cola=cola|longdrink=long drink|shot=shot
+shots=shots|bar=bar|theke=bar counter|tresen=bar counter|barkeeper=bartender|eiswuerfel=ice cubes
+anstossen=toasting|prost=cheers|trinken=drinking|trinkend=drinking|zapfhahn=beer tap
+feier=party|party=party|fest=celebration|feiern=celebrating|feiernd=celebrating|geburtstag=birthday
+firma=company|firmen=company|weihnacht=christmas|weihnachten=christmas|markt=market
+silvester=new year's eve|neujahr=new year|ostern=easter|halloween=halloween|hochzeit=wedding
+junggesellenabschied=bachelor party|jga=bachelor party|veranstaltung=event|event=event
+teambuilding=team building|konferenz=conference|besprechung=meeting|meeting=meeting
+tagung=conference|praesentation=presentation|empfang=reception|gala=gala|turnier=tournament
+wettbewerb=competition|konzert=concert|dj=dj|musik=music|tanzen=dancing|tanz=dance
+jubilaeum=anniversary|eroeffnung=opening|feierabend=after work|weihnachtsmarkt=christmas market
+mensch=person|menschen=people|leute=people|person=person|personen=people|gruppe=group
+freund=friend|freunde=friends|freundin=friend|freundinnen=friends|familie=family
+kind=child|kinder=children|jugendliche=teenagers|paar=couple|frau=woman|frauen=women
+mann=man|maenner=men|maedchen=girl|junge=boy|jungs=boys|kollege=colleague|kollegen=colleagues
+team=team|mitarbeiter=staff|gast=guest|gaeste=guests|kunde=customer|kunden=customers
+personal=staff|kellner=waiter|kellnerin=waitress|koch=chef|koeche=chefs|golfer=golfer
+golferin=golfer|spieler=player|spielerin=player|trainer=coach|publikum=crowd|zuschauer=spectators
+lachen=laughing|lach=laughing|lachend=laughing|laecheln=smiling|laechelnd=smiling
+gluecklich=happy|froehlich=cheerful|spass=fun|freude=joy|jubeln=cheering|jubelnd=cheering
+spielen=playing|spielend=playing|spiel=game|schlagen=hitting|abschlag=tee shot|schwung=swing
+zielen=aiming|gewinnen=winning|sieger=winner|entspannt=relaxed|entspannen=relaxing
+gemuetlich=cozy|sitzen=sitting|sitzend=sitting|stehen=standing|stehend=standing|reden=talking
+unterhalten=talking|umarmen=hugging|umarmung=hug|posieren=posing|aufregend=exciting
+stimmung=atmosphere|atmosphaere=atmosphere|golfen=playing golf|golf=golf|schlaeger=golf club
+golfschlaeger=golf club|ball=ball|baelle=balls|golfball=golf ball|golfbaelle=golf balls
+handschuh=glove|golfhandschuh=golf glove|abschlagplatz=hitting bay|bucht=bay|range=range
+ziel=target|zielscheibe=target|gruen=green|rasen=grass|golfplatz=golf course|platz=place
+loch=hole|fahne=flag|bildschirm=screen|monitor=screen|fernseher=tv|leinwand=big screen
+terrasse=terrace|dach=roof|dachterrasse=rooftop terrace|lounge=lounge|sofa=sofa|couch=couch
+sessel=armchair|tisch=table|tische=tables|stuhl=chair|stuehle=chairs|raum=room|saal=hall
+eventraum=event room|flaeche=space|restaurant=restaurant|kueche=kitchen|eingang=entrance
+gebaeude=building|fassade=facade|aussen=outside|aussenansicht=exterior|innen=inside
+innenansicht=interior|parkplatz=parking lot|auto=car|autos=cars|logo=logo|schild=sign
+schriftzug=lettering|dekoration=decoration|deko=decoration|luftballon=balloon
+luftballons=balloons|ballon=balloon|ballons=balloons|lichter=lights|beleuchtung=lighting
+licht=light|neon=neon|lichterkette=string lights|kerze=candle|kerzen=candles|blume=flower
+blumen=flowers|weihnachtsbaum=christmas tree|tannenbaum=christmas tree|geschenk=present
+geschenke=presents|schnee=snow|nacht=night|nachts=at night|abend=evening|abends=in the evening
+tag=day|tagsueber=daytime|morgen=morning|morgens=in the morning|sonnenuntergang=sunset
+sonnenaufgang=sunrise|sonne=sun|sonnig=sunny|sommer=summer|winter=winter|herbst=autumn
+fruehling=spring|regen=rain|himmel=sky|wolke=cloud|wolken=clouds|dunkel=dark|hell=bright
+rot=red|blau=blue|gelb=yellow|orange=orange|lila=purple|violett=purple|rosa=pink|pink=pink
+schwarz=black|weiss=white|grau=grey|braun=brown|gold=gold|silber=silver|bunt=colorful
+farbenfroh=colorful|gross=big|klein=small|viele=many|voll=full|leer=empty|modern=modern
+schoen=beautiful|frisch=fresh|warm=warm|kalt=cold|heiss=hot|nahaufnahme=close-up
+detail=detail|draussen=outdoors|drinnen=indoors|luftaufnahme=aerial view|drohne=drone
+hochformat=portrait|querformat=landscape|foto=photo|bild=picture|kamera=camera|handy=phone
+selfie=selfie|gruppenfoto=group photo|teamfoto=team photo|portraet=portrait|ohne=without
+mit=with|und=and|oder=or|im=in|in=in|am=at|an=at|auf=on|bei=at|beim=at|vom=from|von=of
+zum=for|zur=for|fuer=for|unter=under|ueber=over|vor=in front of|hinter=behind|neben=next to
+zwischen=between|aus=from|zusammen=together|allein=alone|einzeln=single|viel=a lot
+stossen=toasting|stoessen=toasting|stosst=toasting|stoesst=toasting|kindergeburtstag=children's birthday party
+"""
+# "beim Essen", "zum Golfen": after these, a verb-noun is an activity.
+_DE_ACTIVITY = {"essen": "eating", "golfen": "playing golf", "trinken": "drinking",
+                "spielen": "playing", "feiern": "celebrating", "tanzen": "dancing",
+                "lachen": "laughing", "anstossen": "toasting", "grillen": "having a barbecue"}
+# Particles a German verb leaves at the end ("stossen ... an").
+_DE_TRAILING_PARTICLES = {"an", "auf", "zu", "mit", "ab", "aus"}
+
+_DE_PHRASES = {
+    "von oben": "from above", "bei nacht": "at night", "in der nacht": "at night",
+    "stossen an": "toasting", "stoessen an": "toasting", "driving range": "driving range",
+    "live musik": "live music", "high five": "high five", "happy hour": "happy hour",
+}
+_DE_DROP = {"der", "die", "das", "den", "dem", "des", "ein", "eine", "einer", "einem", "einen",
+            "eines", "sich", "ist", "sind", "wird", "werden", "einem"}
+# English words that would make an English query look German - never used
+# to decide that a query is German.
+_DE_AMBIGUOUS = {"an", "in", "am", "so", "was", "will", "hat", "tag", "rot", "bad", "hell",
+                 "kind", "art", "see", "rock", "gift", "die", "fest", "bar", "spiel", "team",
+                 "golf", "range", "ball", "event", "party", "shot", "dip", "drink", "grill",
+                 "lounge", "sofa", "couch", "logo", "neon", "gala", "dj", "warm", "modern",
+                 "detail", "winter", "orange", "pink", "gold", "foto", "selfie", "bowl", "brunch",
+                 "buffet", "cola", "pizza", "steak", "burger", "sandwich", "wrap", "taco",
+                 "tacos", "nachos", "snack", "donut", "vegan", "restaurant", "monitor", "trainer",
+                 "golfer", "person", "meeting", "dessert", "sauce", "cocktail", "cocktails",
+                 "shots", "popcorn", "prosecco", "halloween", "sekt"}
+
+
+def _de_norm(text):
+    text = text.lower()
+    for a, b in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+        text = text.replace(a, b)
+    return text
+
+
+_DE_WORDS = {}
+for _line in _DE_GLOSSARY.strip().splitlines():
+    for _pair in _line.split("|"):
+        if "=" in _pair:
+            _k, _v = _pair.split("=", 1)
+            _DE_WORDS[_de_norm(_k.strip())] = _v.strip()
+_DE_MARKERS = {k for k in _DE_WORDS if k not in _DE_AMBIGUOUS} | {"mit", "und", "oder", "beim",
+               "vom", "zum", "zur", "fuer", "auf", "bei", "der", "das", "ein", "eine", "im", "dem"}
+_DE_ENDINGS = ("end", "en", "er", "es", "em", "nd", "e", "n", "s", "t")
+
+
+def _de_word(token):
+    if token in _DE_DROP:
+        return ""
+    if token in _DE_WORDS:
+        return _DE_WORDS[token]
+    for ending in _DE_ENDINGS:
+        stem = token[: -len(ending)]
+        if token.endswith(ending) and len(stem) >= 3 and stem in _DE_WORDS:
+            return _DE_WORDS[stem]
+    return None
+
+
+def _de_compound(token, depth=0):
+    """A word, or a compound of known words with the longest known ending
+    first: "golfhandschuh" -> "golf" + "handschuh"."""
+    found = _de_word(token)
+    if found is not None:
+        return found
+    if depth > 2 or len(token) < 6:
+        return None
+    for i in range(3, len(token) - 2):
+        head, tail = token[:i], token[i:]
+        right = _de_word(tail)
+        if not right:
+            continue
+        for left_part in (head, head[:-1] if head.endswith("s") else None,
+                          head[:-2] if head.endswith("es") else None,
+                          head[:-1] if head.endswith("n") else None,
+                          head[:-2] if head.endswith("en") else None):
+            if not left_part or len(left_part) < 3:
+                continue
+            left = _de_compound(left_part, depth + 1)
+            if left:
+                return f"{left} {right}"
+    return None
+
+
+def looks_german(text):
+    if any(ch in text for ch in "äöüÄÖÜß"):
+        return True
+    tokens = re.findall(r"[a-z]+", _de_norm(text))
+    return any(t in _DE_MARKERS for t in tokens) or any(
+        _de_compound(t) and t not in _DE_AMBIGUOUS and len(t) >= 6 and _de_compound(t) != t
+        for t in tokens)
+
+
+def to_english(text):
+    """The query in English words when it looks German, else unchanged."""
+    if not text or not looks_german(text):
+        return text
+    norm = _de_norm(text).replace("-", " ")
+    for de, en in _DE_PHRASES.items():
+        norm = re.sub(rf"\b{re.escape(de)}\b", en.replace(" ", "_"), norm)
+    tokens = re.findall(r"[a-z0-9_']+", norm)
+    if len(tokens) > 2 and tokens[-1] in _DE_TRAILING_PARTICLES:
+        tokens = tokens[:-1]
+    words = []
+    previous = ""
+    for token in tokens:
+        if previous in ("beim", "zum") and token in _DE_ACTIVITY:
+            if words and words[-1] in ("at", "for"):
+                words.pop()
+            words.append(_DE_ACTIVITY[token])
+            previous = token
+            continue
+        previous = token
+        if "_" in token:
+            words.append(token.replace("_", " "))
+            continue
+        english = _de_compound(token)
+        if english is None:
+            words.append(token)          # names, brands, English words
+        elif english:
+            words.append(english)
+    out = []
+    for w in words:
+        if not out or out[-1] != w:
+            out.append(w)
+    if len(out) > 1 and out[0] == "group" and out[1] not in ("with", "and", "at", "in"):
+        out[0] = "group of"
+    return " ".join(out) or text
+
+
 class ImageSearchEngine:
     def __init__(self):
         self.model = None
@@ -64,6 +274,7 @@ class ImageSearchEngine:
         self.paths = []
         self.meta = []  # parallel to paths: None for local-folder items, dict for SharePoint items
         self.embeddings = None  # np.ndarray, shape (N, D), L2-normalized
+        self.last_translation = None  # the English a German query was searched as
 
     def load_model(self, status_callback=None):
         if self.model is not None:
@@ -204,7 +415,7 @@ class ImageSearchEngine:
             return " ".join(positives), " ".join(negatives)
         return text, ""
 
-    def embed_query(self, text):
+    def embed_query(self, text, translate=True):
         """Embeds a search query as an average over several caption-shaped
         phrasings rather than the bare words.
 
@@ -223,6 +434,15 @@ class ImageSearchEngine:
         re-indexing and stays compatible with every existing index.
         """
         wanted, unwanted = self.split_negation(text)
+        if translate:
+            english_wanted, english_unwanted = to_english(wanted), to_english(unwanted)
+            changed = english_wanted != wanted or english_unwanted != unwanted
+            self.last_translation = (
+                english_wanted + (f" without {english_unwanted}" if english_unwanted else "")
+                if changed else None)
+            wanted, unwanted = english_wanted, english_unwanted
+        else:
+            self.last_translation = None
         return (
             self._embed_phrasings(wanted),
             self._embed_phrasings(unwanted) if unwanted else None,
@@ -404,9 +624,10 @@ class ImageSearchEngine:
         query_emb = self.embed_image_file(path)
         return self._rank(query_emb, top_k, subset=subset)
 
-    def search_text(self, text, top_k=24, status_callback=None, bonus=None, subset=None):
+    def search_text(self, text, top_k=24, status_callback=None, bonus=None, subset=None,
+                    translate=True):
         self.load_model(status_callback)
-        query_emb, exclude_emb = self.embed_query(text)
+        query_emb, exclude_emb = self.embed_query(text, translate=translate)
         return self._rank(
             query_emb, top_k, bonus=bonus, subset=subset, exclude_emb=exclude_emb,
         )

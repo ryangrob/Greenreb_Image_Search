@@ -8,7 +8,7 @@ releases folder on SharePoint and launcher.py runs that copy instead of the
 one inside the .exe.
 """
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.4.0"
 
 # What people see the app called (window title, sidebar, intro, About).
 # Folders, settings and file names keep "ImageSearch" so a rename never
@@ -20,11 +20,10 @@ APP_AUTHOR = "Ryan Grob"
 # what they are about to get. Keep each line short; the first two are the
 # summary on the update card.
 WHATS_NEW = [
-    "Pick several photos at once - Ctrl-click or Shift-click (⌘ on a Mac)",
-    "Filters for landscape, portrait and photos with or without people",
-    "Favourites: every photo has its gold star - click it to remove the photo",
-    "Invitations to shared collections are sent for you",
-    "A smaller System section, so more collections fit",
+    "Search in German too - „Burger mit Pommes“ finds the same as “burger with fries”",
+    "Ctrl+F (⌘F on a Mac) jumps to search, Esc empties it",
+    "Ctrl+C copies the photos you picked, or the one under the mouse",
+    "Right-click a photo › Details: size, date taken, camera, who added it, its folder",
 ]
 
 # Bump only when a release changes what the .exe itself contains (Python,

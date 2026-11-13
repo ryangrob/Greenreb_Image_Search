@@ -58,7 +58,7 @@ _T_NUMPY = time.perf_counter()
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageTk
 _T_PIL = time.perf_counter()
 
-from search_engine import ImageSearchEngine, MODEL_TAG
+from search_engine import ImageSearchEngine, MODEL_TAG, to_english
 from app_version import (
     APP_AUTHOR, APP_MODULES, APP_NAME, APP_VERSION, RUNTIME_VERSION, WHATS_NEW, version_tuple,
 )
@@ -1126,7 +1126,7 @@ class ImageSearchApp:
             search_frame, textvariable=self.query_var, fg_color=SURFACE,
             text_color=TEXT_COLOR, border_width=0, corner_radius=8, height=38,
             font=_font(14),
-            placeholder_text="Describe an image in English...",
+            placeholder_text="Describe a photo - in English or German…",
             placeholder_text_color=FAINT_TEXT,
         )
         self.query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8), pady=8)
@@ -1407,7 +1407,7 @@ class ImageSearchApp:
             card.configure(**look(view == name))
 
         if view == "history":
-            self.query_entry.configure(placeholder_text="Describe an image in English...")
+            self.query_entry.configure(placeholder_text="Describe a photo - in English or German…")
             self._show_history()
         elif view == "favourites":
             self.query_entry.configure(placeholder_text="Search your favourites...")
@@ -1416,7 +1416,7 @@ class ImageSearchApp:
             self.query_entry.configure(placeholder_text=f"Search within {view}...")
             self._show_collection(view)
         else:
-            self.query_entry.configure(placeholder_text="Describe an image in English...")
+            self.query_entry.configure(placeholder_text="Describe a photo - in English or German…")
             self._show_all_photos()
 
     def _show_all_photos(self):
@@ -1623,7 +1623,7 @@ class ImageSearchApp:
                     query, DEFAULT_TOP_K, status_callback=on_status, bonus=bonus,
                     subset=effective_subset,
                 )
-                if self._query_wants_objects(query):
+                if self._query_wants_objects(to_english(query)):
                     self._last_search_mode = "objects"
                     # Relevance-preserving: splits on "has guests in it" and
                     # keeps each half in the engine's order, so this can be
@@ -3135,6 +3135,9 @@ class ImageSearchApp:
                         note = "  \u00b7  Close-ups first, people shots below."
                     elif mode == "image":
                         note = "  \u00b7  Most visually similar first."
+                    searched_as = getattr(self.engine, "last_translation", None)
+                    if searched_as and mode != "image":
+                        note = f"  \u00b7  Searched as “{searched_as}”." + note
                     self.status_var.set(f"Found {len(event[1])} results.{note}")
                 elif kind == "clipboard_status":
                     message, target = event[2], event[1]
@@ -3380,6 +3383,10 @@ class ImageSearchApp:
         return tile
 
     def _tile_hover(self, label, on):
+        if on:
+            self._hover_label = label
+        elif getattr(self, "_hover_label", None) is label:
+            self._hover_label = None
         tile = getattr(label, "tile", None)
         if tile is None or getattr(label, "dragging", False) or getattr(label, "selected", False):
             return
@@ -5363,6 +5370,63 @@ class ImageSearchApp:
 
         self.root.bind("<Escape>", escape, add="+")
         self.root.bind("<Command-a>" if IS_MAC else "<Control-a>", select_all, add="+")
+        self._bind_shortcuts()
+
+    def _typing(self):
+        """Whether the keyboard is in a text field, where keys keep their
+        usual meaning (Ctrl+C copies text, / types a slash)."""
+        try:
+            return isinstance(self.root.focus_get(), (tk.Entry, tk.Text))
+        except Exception:
+            return False
+
+    def _bind_shortcuts(self):
+        """Ctrl+F (Cmd+F) or / jumps to the search box, Ctrl+C copies the
+        picked photos or the one under the pointer, Esc empties the search
+        box. Instant, without animation - they are used all day."""
+        mod = "Command" if IS_MAC else "Control"
+
+        def find(_e=None):
+            try:
+                self.query_entry.focus_set()
+                inner = getattr(self.query_entry, "_entry", self.query_entry)
+                inner.select_range(0, "end")
+                inner.icursor("end")
+            except Exception:
+                pass
+            return "break"
+
+        def slash(_e):
+            return None if self._typing() else find()
+
+        def copy(_e):
+            if self._typing():
+                return None
+            if getattr(self, "_sel", None):
+                self._copy_selection()
+                return "break"
+            label = getattr(self, "_hover_label", None)
+            try:
+                if label is not None and label.winfo_exists():
+                    path, _size, _key = label.tile
+                    self._copy_to_clipboard(path, getattr(label, "meta", None))
+                    return "break"
+            except Exception:
+                pass
+            return None
+
+        def clear_search(_e):
+            if self.query_var.get():
+                self.query_var.set("")
+                return "break"
+            return None
+
+        for key in ("f", "F"):
+            self.root.bind(f"<{mod}-{key}>", find, add="+")
+        self.root.bind("<slash>", slash, add="+")
+        for key in ("c", "C"):
+            self.root.bind(f"<{mod}-{key}>", copy, add="+")
+        self.query_entry.bind("<Escape>", clear_search, add="+")
 
     def _select_click(self, pos, mode):
         self._suppress_release = True
@@ -5843,6 +5907,219 @@ class ImageSearchApp:
         else:
             self.root.after(700, lambda: self._start_tour_when_ready(waited + 700))
 
+    # ---------- a card over the dimmed window ----------
+
+    def _card_shell(self, width=440):
+        """The What's new look for small panels: a card that rises in over
+        the dimmed window (ease-out, 240 ms) and leaves faster (150 ms).
+        Returns dict(win, body, show, close, refit)."""
+        root = self.root
+        reduced = self._motion_reduced()
+        root.update_idletasks()
+        rx, ry = root.winfo_rootx(), root.winfo_rooty()
+        rw, rh = root.winfo_width(), root.winfo_height()
+        scrim = tk.Toplevel(root)
+        scrim.overrideredirect(True)
+        scrim.configure(bg="#000000")
+        try:
+            scrim.attributes("-alpha", 0.0)
+            scrim.transient(root)
+        except tk.TclError:
+            pass
+        scrim.geometry(f"{rw}x{rh}+{rx}+{ry}")
+        win = ctk.CTkToplevel(root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.configure(fg_color=SURFACE)
+        try:
+            win.attributes("-alpha", 0.0)
+            win.transient(root)
+        except tk.TclError:
+            pass
+        body = ctk.CTkFrame(win, fg_color="transparent", width=width)
+        body.pack(fill=tk.BOTH, expand=True, padx=26, pady=(22, 20))
+        spot = {"x": 0, "y": 0, "closing": False}
+
+        def place(rise=0):
+            win.update_idletasks()
+            h = win.winfo_reqheight()
+            spot["x"] = rx + max(0, (rw - width) // 2)
+            spot["y"] = ry + max(0, (rh - h) // 2 - 12)
+            win.geometry(f"{width}x{h}+{spot['x']}+{spot['y'] + rise}")
+
+        def close(then=None):
+            if spot["closing"]:
+                return
+            spot["closing"] = True
+
+            def step(p):
+                try:
+                    win.attributes("-alpha", 1.0 - p)
+                    scrim.attributes("-alpha", 0.4 * (1.0 - p))
+                    win.geometry(f"+{spot['x']}+{spot['y'] + round(6 * p)}")
+                except tk.TclError:
+                    pass
+
+            def gone():
+                for w in (win, scrim):
+                    try:
+                        w.destroy()
+                    except tk.TclError:
+                        pass
+                if then:
+                    then()
+
+            _animate(root, 0 if reduced else 150, step, done=gone, ease=EASE_OUT)
+
+        def show():
+            rise = 0 if reduced else 12
+            place(rise)
+            win.deiconify()
+            win.update_idletasks()
+            _round_corners(win, border=MENU_BORDER)
+            try:
+                scrim.lift()
+            except tk.TclError:
+                pass
+            win.lift()
+            win.focus_force()
+            win.bind("<Escape>", lambda _e: close())
+            scrim.bind("<Button-1>", lambda _e: close())
+
+            def enter(p):
+                try:
+                    win.attributes("-alpha", p)
+                    scrim.attributes("-alpha", 0.4 * p)
+                    win.geometry(f"+{spot['x']}+{spot['y'] + round(rise * (1 - p))}")
+                except tk.TclError:
+                    pass
+
+            _animate(root, 120 if reduced else 240, enter, ease=EASE_OUT)
+
+        def refit():
+            if not spot["closing"]:
+                try:
+                    place()
+                except tk.TclError:
+                    pass
+
+        return {"win": win, "body": body, "show": show, "close": close, "refit": refit}
+
+    # ---------- photo details ----------
+
+    def _show_details(self, path, meta):
+        """Right-click > Details: what the file is and where it lives. Shown
+        on request only, not under every photo."""
+        meta = meta or {}
+        card = self._card_shell(440)
+        body = card["body"]
+        name = meta.get("name") or os.path.basename(path)
+        head = ctk.CTkFrame(body, fg_color="transparent")
+        head.pack(fill=tk.X)
+        try:
+            thumb = self._thumb_image(path).copy()
+            thumb.thumbnail((96, 96))
+            pic = ctk.CTkImage(thumb, thumb, size=thumb.size)
+            ctk.CTkLabel(head, text="", image=pic).pack(side=tk.LEFT, padx=(0, 16), anchor="n")
+        except Exception:
+            pass
+        words = ctk.CTkFrame(head, fg_color="transparent")
+        words.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ctk.CTkLabel(words, text="DETAILS", font=_font(11, "semibold"), text_color=SPLASH_ACCENT,
+                     anchor="w").pack(fill=tk.X)
+        ctk.CTkLabel(words, text=name, font=_font(16, "semibold"), text_color=TEXT_COLOR,
+                     anchor="w", justify="left", wraplength=280).pack(fill=tk.X)
+        ctk.CTkLabel(words, text=meta.get("folder") or "This computer", font=_font(12),
+                     text_color=MUTED_TEXT_COLOR, anchor="w", justify="left",
+                     wraplength=280).pack(fill=tk.X)
+        ctk.CTkFrame(body, height=1, fg_color=BORDER).pack(fill=tk.X, pady=(16, 10))
+        grid = ctk.CTkFrame(body, fg_color="transparent")
+        grid.pack(fill=tk.X)
+        grid.grid_columnconfigure(1, weight=1)
+        fields = ("Dimensions", "File size", "Taken", "Camera", "Added", "Added by", "Folder")
+        values = {}
+        for row, label in enumerate(fields):
+            ctk.CTkLabel(grid, text=label, font=_font(12), text_color=FAINT_TEXT, anchor="w",
+                         width=90).grid(row=row, column=0, sticky="nw", pady=2)
+            value = ctk.CTkLabel(grid, text="…", font=_font(12), text_color=TEXT_SOFT,
+                                 anchor="w", justify="left", wraplength=280)
+            value.grid(row=row, column=1, sticky="w", pady=2)
+            values[label] = value
+        buttons = ctk.CTkFrame(body, fg_color="transparent")
+        buttons.pack(fill=tk.X, pady=(18, 0))
+        link = {"url": ""}
+        open_sp = _make_secondary_button(buttons, "Open in SharePoint",
+                                         lambda: link["url"] and _open_external(link["url"]),
+                                         width=160)
+        _make_primary_button(buttons, "Close", lambda: card["close"](), width=90).pack(side=tk.RIGHT)
+        card["show"]()
+
+        result = {}
+
+        def work():
+            info = {}
+            try:
+                item_id = meta.get("item_id")
+                if item_id:
+                    client = self._sp_client(False)
+                    if client is not None:
+                        info = client.get_item_by_path(item_id, by_id=True) or {}
+                result["info"] = info
+            except Exception as exc:
+                _log_reuse(f"DETAILS FAILED: {exc!r}")
+                result["info"] = {}
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def when(text):
+            try:
+                stamp = datetime.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+                return stamp.astimezone().strftime("%d %b %Y, %H:%M")
+            except Exception:
+                return ""
+
+        def fill():
+            if "info" not in result:
+                card["win"].after(120, fill)
+                return
+            info = result["info"]
+            image, photo = info.get("image") or {}, info.get("photo") or {}
+            size = info.get("size")
+            width, height = image.get("width"), image.get("height")
+            if not (width and height):
+                try:
+                    with Image.open(path) as im:  # this computer's copy, if that's all there is
+                        if not meta.get("item_id"):
+                            width, height = im.size
+                except Exception:
+                    pass
+            if size is None and not meta.get("item_id"):
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    size = None
+            folder_path = ((info.get("parentReference") or {}).get("path") or "").split("root:", 1)[-1]
+            shown = {
+                "Dimensions": f"{width} × {height} px" if width and height else "-",
+                "File size": f"{size / 1048576:.1f} MB" if size else "-",
+                "Taken": when(photo.get("takenDateTime")) or "-",
+                "Camera": " ".join(x for x in (photo.get("cameraMake"), photo.get("cameraModel")) if x) or "-",
+                "Added": when(info.get("createdDateTime")) or "-",
+                "Added by": ((info.get("createdBy") or {}).get("user") or {}).get("displayName") or "-",
+                "Folder": folder_path.strip("/") or meta.get("folder") or "-",
+            }
+            for label, widget in values.items():
+                try:
+                    widget.configure(text=shown[label])
+                except tk.TclError:
+                    return
+            link["url"] = info.get("webUrl") or ""
+            if link["url"]:
+                open_sp.pack(side=tk.LEFT)
+            card["refit"]()
+
+        card["win"].after(120, fill)
+
     def _popup(self, x_root, y_root, items):
         """Opens the app's own menu at a screen point, closing any open one."""
         if getattr(self, "_menu", None) is not None:
@@ -5863,6 +6140,7 @@ class ImageSearchApp:
             ("item", "Preview", "preview", lambda: self._show_preview(path, meta)),
             ("item", "Copy image", "copy", lambda: self._copy_to_clipboard(path, meta)),
             ("item", "Open original", "external", open_original),
+            ("item", "Details…", "info", lambda: self._show_details(path, meta)),
         ]
         targets = [n for n in names if n != self._view]
         if targets:
@@ -6418,6 +6696,7 @@ class ImageSearchApp:
             label.image = photo  # a PhotoImage only lives while something refers to it
             label.hover_image = None
             label.tile = (path, size, key)
+            label.meta = meta
             label.pack(side=tk.LEFT, padx=(0 if i == 0 else TILE_GAP, 0))
             # Double-click previews in-app; the original is one click away
             # from inside the preview. A click on the star toggles it.
