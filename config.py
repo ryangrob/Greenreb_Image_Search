@@ -41,3 +41,12 @@ SUPPORT_EMAIL = "grobr1903@gmail.com"
 # email addresses are not stored on the externally shared drive.
 SHARED_SITE_PATH = SHAREPOINT_SITE_PATH
 SHARED_FOLDER_PATH = SHAREPOINT_SEARCH_ROOT_PATH
+
+# Where the app puts its error reports: the new entries of crash.log and
+# freeze.log, one small file per batch (see "error reports" in
+# tkinter_app.py; fetch_reports.py downloads them). Everyone using the app
+# needs to be able to write here; only the people looking after the app need
+# to read it. The reports contain the user's email address and file paths.
+# TODO before rollout: an internal site agreed with the CTO.
+REPORTS_SITE_PATH = UPDATE_SITE_PATH
+REPORTS_FOLDER_PATH = "General/Topshot Reports"

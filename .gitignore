@@ -23,3 +23,6 @@ __pycache__/
 
 # Update packages built by make_update.py (published to SharePoint, not committed)
 /dist_update/
+
+# Error reports downloaded by fetch_reports.py (contain email addresses)
+/error_reports/

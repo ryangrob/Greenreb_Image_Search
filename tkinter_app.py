@@ -632,6 +632,179 @@ def query_key(text):
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
+# ---------- error reports ----------
+#
+# New entries of crash.log and freeze.log are uploaded to a folder on
+# SharePoint, one small file per batch, so a problem on someone else's
+# computer can be looked at without asking them for log files. Only from
+# the saved sign-in, in the background, and never more than every few
+# minutes. What has been sent is remembered as a byte offset per log.
+
+REPORT_PREFIX = "report_"
+REPORT_LOGS = ("crash.log", "freeze.log")
+REPORT_MAX_BYTES = 200 * 1024      # of each log, per report: the newest part
+REPORT_MIN_GAP_S = 5 * 60          # between two reports from this computer
+REPORT_TICK_MS = 60 * 1000         # how often the logs are looked at
+REPORT_SESSION_MAX = 20            # a runaway error can't flood the folder
+_REPORT_HEADER = re.compile(r"^--- (\d{4}-\d\d-\d\dT[0-9:.]+) ?(.*)$")
+
+
+def _reports_state_path(data_dir):
+    return os.path.join(data_dir, "reports_state.json")
+
+
+def _reports_read_state(data_dir):
+    """{"offsets": {log name: bytes already sent}}; empty when there is none."""
+    try:
+        with open(_reports_state_path(data_dir), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        offsets = data.get("offsets") if isinstance(data, dict) else None
+        if isinstance(offsets, dict):
+            return {"offsets": {k: int(v) for k, v in offsets.items()
+                                if isinstance(v, (int, float)) and v >= 0}}
+    except (OSError, ValueError, TypeError):
+        pass
+    return {"offsets": {}}
+
+
+def _reports_write_state(data_dir, offsets):
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        tmp = _reports_state_path(data_dir) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"offsets": offsets,
+                       "last": datetime.datetime.now().isoformat(timespec="seconds")}, f)
+        os.replace(tmp, _reports_state_path(data_dir))
+        return True
+    except OSError:
+        return False
+
+
+def _reports_pending(data_dir, offsets):
+    """Whether a log has grown (or been replaced) since the last report."""
+    for name in REPORT_LOGS:
+        try:
+            size = os.path.getsize(os.path.join(data_dir, name))
+        except OSError:
+            continue
+        if size and size != offsets.get(name, 0):
+            return True
+    return False
+
+
+def _reports_split(text):
+    """Log text as entries: [{"at", "what", "text", "count", "last"}].
+
+    Both logs start an entry with "--- <time> ...". The same error repeated
+    (same heading, same traceback) is kept once, with how often it happened
+    and when last - a recurring error must not bury the others."""
+    entries, current = [], None
+    for line in text.splitlines():
+        match = _REPORT_HEADER.match(line)
+        if match:
+            what = match.group(2).strip()
+            if what.endswith("---"):
+                what = what[:-3].strip()
+            current = {"at": match.group(1), "what": what, "lines": []}
+            entries.append(current)
+        elif current is None:
+            if line.strip():  # the tail of an entry that started before this part
+                current = {"at": "", "what": "(continued)", "lines": [line]}
+                entries.append(current)
+        else:
+            current["lines"].append(line)
+    out, seen = [], {}
+    for entry in entries:
+        body = "\n".join(entry["lines"]).strip("\n")
+        key = (entry["what"], body)
+        if key in seen:
+            first = seen[key]
+            first["count"] += 1
+            first["last"] = entry["at"]
+            continue
+        item = {"at": entry["at"], "what": entry["what"], "text": body, "count": 1,
+                "last": entry["at"]}
+        seen[key] = item
+        out.append(item)
+    return out
+
+
+def _reports_collect(data_dir, offsets):
+    """What is new in the logs since `offsets`.
+
+    Returns (logs, new_offsets). logs is {name: {"entries": [...],
+    "skipped_bytes": n}} for the logs with something new; new_offsets is
+    what to remember once the report has been delivered. A log that got
+    shorter was replaced and is read from its start; more than
+    REPORT_MAX_BYTES of news is cut to its newest part; a last line still
+    being written is left for the next report."""
+    logs, new_offsets = {}, dict(offsets)
+    for name in REPORT_LOGS:
+        path = os.path.join(data_dir, name)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            new_offsets.pop(name, None)
+            continue
+        sent = offsets.get(name, 0)
+        if size < sent:
+            sent = 0
+        if size == sent:
+            new_offsets[name] = size
+            continue
+        start = max(sent, size - REPORT_MAX_BYTES)
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                data = f.read(size - start)
+        except OSError:
+            continue
+        end = start + len(data)
+        cut = data.rfind(b"\n")
+        if cut != -1 and cut + 1 < len(data):
+            end = start + cut + 1          # an unfinished last line waits
+            data = data[:cut + 1]
+        if start > sent:                   # capped: begin at a whole line
+            first = data.find(b"\n")
+            data = data[first + 1:] if first != -1 else data
+        new_offsets[name] = end
+        entries = _reports_split(data.decode("utf-8", errors="replace"))
+        if entries:
+            logs[name] = {"entries": entries, "skipped_bytes": start - sent}
+    return logs, new_offsets
+
+
+def _reports_filename(now=None):
+    """Unique per computer and second, so nobody overwrites anyone."""
+    now = now or datetime.datetime.now()
+    version = re.sub(r"[^0-9A-Za-z.]", "", str(APP_VERSION))
+    return f"{REPORT_PREFIX}{machine_key()}_{now.strftime('%Y%m%d-%H%M%S')}_{version}.json"
+
+
+def _reports_payload(logs, context, now=None):
+    now = now or datetime.datetime.now()
+    report = {
+        "report": 1,
+        "machine": machine_key(),
+        "created": now.isoformat(timespec="seconds"),
+        "app_version": APP_VERSION,
+        "runtime": RUNTIME_VERSION,
+        "system": _system_description(),
+        "build": "installed app" if getattr(sys, "frozen", False) else "from source",
+        "python": platform.python_version(),
+    }
+    report.update(context or {})
+    report["logs"] = logs
+    return json.dumps(report, ensure_ascii=False, indent=1).encode("utf-8")
+
+
+def _reports_location(config):
+    site = getattr(config, "REPORTS_SITE_PATH", None) or getattr(
+        config, "UPDATE_SITE_PATH", config.SHAREPOINT_SITE_PATH)
+    folder = getattr(config, "REPORTS_FOLDER_PATH", None) or "General/Topshot Reports"
+    return site, folder
+
+
 def machine_key():
     """Opaque per-machine id used to name this machine's feedback file, so
     the filenames don't advertise who searched for what either."""
@@ -4469,10 +4642,84 @@ class ImageSearchApp:
         return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
     def _start_background_checks(self):
+        self.root.after(8000, self._reports_tick)  # error reports, see _send_error_report
         self._sync_shared()
         self.root.after(3000, self._check_for_updates)
         self.root.after(SHARED_SYNC_MS, self._periodic_shared_sync)
         self.root.after(UPDATE_CHECK_MS, self._periodic_update_check)
+
+    # ---------- error reports ----------
+
+    def _reports_enabled(self):
+        """settings.json "error_reports" - on unless switched off."""
+        try:
+            return bool(self._load_settings().get("error_reports", True))
+        except Exception:
+            return True
+
+    def _reports_tick(self):
+        """Once a minute: if a log has something new and the last report was
+        a while ago, send one. Costs two file-size lookups when idle."""
+        try:
+            offsets = self.__dict__.get("_report_offsets")
+            if offsets is None:
+                offsets = self._report_offsets = _reports_read_state(DATA_DIR)["offsets"]
+            last = self.__dict__.get("_report_last_try")
+            due = last is None or time.monotonic() - last >= REPORT_MIN_GAP_S
+            if (due and self._reports_enabled()
+                    and not self.__dict__.get("_report_sending")
+                    and self.__dict__.get("_report_count", 0) < REPORT_SESSION_MAX
+                    and _reports_pending(DATA_DIR, offsets)):
+                self._send_error_report()
+        except Exception as exc:
+            _log_reuse(f"ERROR REPORT CHECK FAILED: {exc!r}")
+        try:
+            self.root.after(REPORT_TICK_MS, self._reports_tick)
+        except tk.TclError:
+            pass
+
+    def _send_error_report(self):
+        """Uploads what is new in the logs, in the background, from the saved
+        sign-in only - it never opens a sign-in window and never shows an
+        error. Whatever goes wrong is noted and tried again later; nothing is
+        marked as sent until the upload has succeeded."""
+        self._report_sending = True
+        self._report_last_try = time.monotonic()
+        offsets = dict(self.__dict__.get("_report_offsets") or {})
+        try:
+            photos = len(getattr(self.engine, "paths", None) or [])
+        except Exception:
+            photos = 0
+
+        def work():
+            try:
+                import config
+
+                client = self._sp_client(False)
+                if client is None:
+                    return  # not signed in yet - next time
+                logs, new_offsets = _reports_collect(DATA_DIR, offsets)
+                if logs:
+                    context = {"user": client.account_email(), "photos": photos,
+                               "first_report": not offsets}
+                    site, folder = _reports_location(config)
+                    if not self.__dict__.get("_report_folder_ready"):
+                        client.ensure_folder(site, folder)
+                        self._report_folder_ready = True
+                    name = _reports_filename()
+                    client.upload_bytes_by_path(site, folder, name, _reports_payload(logs, context))
+                    self._report_count = self.__dict__.get("_report_count", 0) + 1
+                    _log_reuse(f"ERROR REPORT SENT: {name} "
+                               + ", ".join(f"{k}={len(v['entries'])}" for k, v in logs.items()))
+                self._report_offsets = new_offsets
+                _reports_write_state(DATA_DIR, new_offsets)
+            except Exception as exc:
+                # Deliberately not crash.log: that would be a new entry to report.
+                _log_reuse(f"ERROR REPORT FAILED: {exc!r}")
+            finally:
+                self._report_sending = False
+
+        threading.Thread(target=work, name="error-report", daemon=True).start()
 
     def _periodic_shared_sync(self):
         self._sync_shared()
