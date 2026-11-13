@@ -292,6 +292,24 @@ EMPTY_PROMPTS = [
     "an empty venue interior",
     "a close up of an object",
 ]
+# For the People / No people filter: is anyone in the photo at all - a
+# single golfer counts - rather than "guests having fun", which is what
+# ranking uses.
+PERSON_PROMPTS = [
+    "a photo of a person",
+    "a photo of people",
+    "a man or a woman in the picture",
+    "a golfer swinging a club",
+    "a portrait of someone smiling",
+]
+NOBODY_PROMPTS = [
+    "a photo with nobody in it",
+    "a close up of food on a plate",
+    "a drink on a table",
+    "an empty room",
+    "an empty golf range",
+    "the outside of a building",
+]
 OBJECT_PROMPTS = [
     "a close up photograph of food on a plate",
     "a drink in a glass on a bar",
@@ -450,7 +468,9 @@ _LUCIDE_NAMES = {
     "back": "arrow-left", "next": "arrow-right", "done": "check",
     "preview": "eye", "copy": "copy", "external": "external-link", "newfolder": "folder-plus",
     "move": "folder-input", "remove": "folder-minus", "trash": "trash-2", "edit": "pencil",
-    "whatsnew": "sparkles",
+    "whatsnew": "sparkles", "more": "ellipsis", "save": "download", "close": "x",
+    "selected": "check", "landscape": "rectangle-horizontal", "portrait": "rectangle-vertical",
+    "people": "users", "nopeople": "user-x", "filter": "filter", "tour": "mouse-pointer-click",
 }
 _lucide_codes = None
 
@@ -689,6 +709,25 @@ def _system_description():
     if sys.platform == "darwin":
         return f"macOS {platform.mac_ver()[0]} ({platform.machine()})"
     return f"Windows {platform.release()} ({platform.version()})"
+
+
+_selection_badge_cache = []
+
+
+def _selection_badge(d=22):
+    """A green disc with a white tick, drawn once."""
+    if _selection_badge_cache:
+        return _selection_badge_cache[0]
+    k = 4
+    big = Image.new("RGBA", (d * k, d * k), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(big)
+    draw.ellipse((0, 0, d * k - 1, d * k - 1), fill=_hex_rgb(PRIMARY) + (255,),
+                 outline=(255, 255, 255, 235), width=2 * k)
+    draw.line([(d * k * 0.28, d * k * 0.52), (d * k * 0.44, d * k * 0.68), (d * k * 0.73, d * k * 0.36)],
+              fill=(255, 255, 255, 255), width=int(2.4 * k), joint="curve")
+    badge = big.resize((d, d), Image.LANCZOS)
+    _selection_badge_cache.append(badge)
+    return badge
 
 
 def _make_ghost_button(parent, text, command, width=0, icon=None):
@@ -948,25 +987,18 @@ class ImageSearchApp:
             ).pack(fill=tk.X, padx=(28, 10), pady=(2, 0))
 
         system = self.system_section = ctk.CTkFrame(nav, fg_color="transparent")
-        system.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 12))
-        section(system, "SYSTEM")
+        system.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 10))
+        # Two quiet rows instead of a whole section: fetching new photos is
+        # the one thing people do from here often. Updates, settings, support
+        # and the tour sit behind More, so the collections above get the room.
         self.sharepoint_button = self._make_system_item(
             system, "  Check for new photos", self._browse_sharepoint, icon="refresh"
         )
-        self._make_system_item(
-            system, "  Check for updates", lambda: self._check_for_updates(interactive=True),
-            icon="update",
-        )
-        # Searching a folder on this computer instead of SharePoint is rare,
-        # so both of its actions sit behind one item.
-        local = self._make_system_item(system, "  Local folder", None, icon="local")
-        local.configure(command=lambda: self._show_local_folder_menu(local))
-        # Not shown: only its enabled state is used, by the menu above.
+        more = self.more_button = self._make_system_item(system, "  More", None, icon="more")
+        more.configure(command=lambda: self._show_more_menu(more))
+        # Not shown: only its enabled state is used, by the Local folder menu.
         self.index_button = ctk.CTkButton(system, text="", command=self._start_indexing)
         self.index_button.configure(state=tk.DISABLED)
-        self._make_system_item(system, "  Settings", self._open_settings, icon="settings")
-        self._make_system_item(system, "  Support", self._show_support_form, icon="support")
-        self._make_system_item(system, "  About", self._show_about, icon="info")
 
         section(nav, "LIBRARY")
         self.all_card = self._make_collection_card(
@@ -1122,6 +1154,7 @@ class ImageSearchApp:
         )
 
         self._update_favourites_button()
+        self._bind_selection_keys()
         self._set_view("all")
 
     def _make_system_item(self, parent, text, command, icon):
@@ -1297,9 +1330,13 @@ class ImageSearchApp:
                 "shared drive, or 'Choose Folder...' for photos on this computer."
             )
             return
-        idxs = self._startup_sample_indices()
+        idxs = (self._filtered_sample_indices() if self._filters_active()
+                else self._startup_sample_indices())
         results = [(self.engine.paths[i], 1.0, self.engine.meta[i]) for i in idxs]
         self._render_results(self._interleave_by_folder(results))
+        self._sample_view = True
+        if getattr(self, "_filter_count_var", None) is not None:
+            self._filter_count_var.set("")
         self.status_var.set(
             f"{total:,} photos ready. Type what you are looking for, "
             "or pick a collection on the left."
@@ -1634,12 +1671,14 @@ class ImageSearchApp:
         return [t for t, _ in sorted(counts.items(), key=lambda kv: -kv[1])][:count]
 
     def _refresh_suggestions(self):
-        """Rebuilds the shortcut buttons under the search box."""
+        """Rebuilds the row under the search box: recent searches on the
+        left, the filters on the right."""
         if getattr(self, "suggestion_bar", None) is None:
             return
         for child in self.suggestion_bar.winfo_children():
             child.destroy()
-        terms = [h.get("term") for h in self._load_history()[:5] if h.get("term")]
+        self._build_filter_chips(self.suggestion_bar)
+        terms = [h.get("term") for h in self._load_history()[:4] if h.get("term")]
         if not terms:
             return
         ctk.CTkLabel(
@@ -3109,6 +3148,10 @@ class ImageSearchApp:
         return width
 
     def _on_results_area_resized(self):
+        self.root.after_idle(self._place_selection_bar)
+        self._on_results_area_resized_grid()
+
+    def _on_results_area_resized_grid(self):
         """Re-lays out the current results at the new column count, once
         resizing has paused rather than on every intermediate size during a
         window drag."""
@@ -3172,10 +3215,10 @@ class ImageSearchApp:
         mask.paste(br, (w - r, h - r))
         return mask
 
-    def _tile_photo(self, path, size, favourite, hover=False):
-        return ImageTk.PhotoImage(self._tile_pil(path, size, favourite, hover))
+    def _tile_photo(self, path, size, favourite, hover=False, selected=False):
+        return ImageTk.PhotoImage(self._tile_pil(path, size, favourite, hover, selected))
 
-    def _tile_pil(self, path, size, favourite, hover=False):
+    def _tile_pil(self, path, size, favourite, hover=False, selected=False):
         """One grid tile, ready for Tk: the photo filled to `size` (centre
         crop of at most a few pixels, never stretched), rounded corners, and
         the star - always when it is a favourite, otherwise only on hover,
@@ -3189,11 +3232,13 @@ class ImageSearchApp:
             tile.alpha_composite(
                 badge, (size[0] - badge.width - STAR_BADGE_INSET, STAR_BADGE_INSET)
             )
+        if selected:
+            tile = self._selected_look(tile, size)
         return tile
 
     def _tile_hover(self, label, on):
         tile = getattr(label, "tile", None)
-        if tile is None or getattr(label, "dragging", False):
+        if tile is None or getattr(label, "dragging", False) or getattr(label, "selected", False):
             return
         path, size, key = tile
         if key in self._render_favs:
@@ -3221,12 +3266,25 @@ class ImageSearchApp:
                 and event.y <= STAR_BADGE_INSET + badge_h + 4)
 
     def _on_thumb_release(self, event, key, path, meta):
+        if getattr(self, "_suppress_release", False):
+            self._suppress_release = False  # this click was a Ctrl/Shift selection
+            return
         dragged = self._drag is not None and self._drag.get("active")
         self._drag_release(event)
+        if not dragged and getattr(self, "_sel", None):
+            # While photos are picked, a plain click adds or drops one.
+            pos = getattr(event.widget, "pos", None)
+            if pos is not None:
+                self._select_pos(pos, pos not in self._sel)
+                self._sel_anchor = pos
+                self._update_selection_bar()
+            return
         if not dragged and self._in_star(event):
             self._on_star_clicked(key, path, meta, event.widget)
 
     def _on_thumb_double(self, event, path, meta):
+        if getattr(self, "_sel", None):
+            return  # picking photos, not opening one
         if self._in_star(event):
             return  # the clicks were for the star, not for opening the photo
         self._show_preview(path, meta)
@@ -4436,30 +4494,33 @@ class ImageSearchApp:
         steps = [
             (lambda: [self.search_frame, self.suggestion_bar], "How to browse through the library",
              "Type what you need in plain English - “burger on a tray”, “friends cheering at "
-             "night” - and press Enter. Got a photo that's close? Use Find similar. Your recent "
-             "searches wait right below."),
+             "night” - and press Enter. Got a photo that's close? Use Find similar. Below: your "
+             "recent searches, and filters for landscape, portrait and people."),
             (lambda: [self.collections_heading,
                       getattr(self.sidebar, "_parent_frame", self.sidebar)], "Collections",
              "Your own folders for the photos you keep using. Drag any photo onto one to file "
              "it, or right-click a photo and pick Add to collection."),
             (lambda: [self.collection_add_button, self.shared_sync_button], "Shared collections",
              "Click + and choose New shared collection, then add your colleagues' email "
-             "addresses - Topshot drafts the invite for you. Everyone sees the same photos and "
+             "addresses - Topshot sends them the invite. Everyone sees the same photos and "
              "can add their own; ↻ fetches what others added. Right-click a shared collection "
              "to change who's in it."),
             (lambda: getattr(self.results_frame, "_parent_frame", self.results_frame), "Your photos",
              "Double-click for a big preview, right-click to copy it in full resolution, and "
-             "hover to star a favourite."),
+             "hover to star a favourite. " + ("⌘" if IS_MAC else "Ctrl") + "-click or Shift-click "
+             "to pick several - then add, copy or save them in one go."),
             (lambda: [self.fav_card, self.history_card], "Favourites and history",
              "Every photo you starred and every search you ran - one click to get back to them."),
-            (lambda: self.system_section, "Updates and help",
-             "The app keeps itself up to date. Settings, support and the story behind it live "
-             "down here. Enjoy!"),
+            (lambda: self.system_section, "New photos, updates and help",
+             "Check for new photos brings in the latest shots. The app keeps itself up to date - "
+             "settings, support and this tour live under More. Enjoy!"),
         ]
         self._tour = Tour(self, steps, on_done=self._end_tour)
 
-    def _end_tour(self):
+    def _end_tour(self, completed=True):
         self._tour = None
+        if not completed:
+            return  # it broke off on its own: shown again next start
         try:
             os.makedirs(os.path.dirname(self._tour_path()), exist_ok=True)
             with open(self._tour_path(), "w", encoding="utf-8") as f:
@@ -4716,41 +4777,152 @@ class ImageSearchApp:
             except Exception:
                 pass
 
-    def _show_whats_new(self):
-        info = self._update_info or {"version": APP_VERSION, "changes": WHATS_NEW}
-        win = ctk.CTkToplevel(self.root)
-        win.title("What's new")
-        win.configure(fg_color=BG_COLOR)
-        win.resizable(False, False)
-        win.transient(self.root)
-        win.after(250, lambda: _apply_icon(win))
-        body = ctk.CTkFrame(win, fg_color="transparent")
-        body.pack(fill=tk.BOTH, expand=True, padx=26, pady=(22, 18))
+    def _show_whats_new(self, fresh=False):
+        """The version and what changed, on a card over the dimmed window.
+
+        Shown by itself once after an update (fresh=True), and from the
+        What's new link any time - then it describes an update that is
+        waiting, if there is one. Rare, so it can take a moment: the card
+        rises and fades in (ease-out, 260 ms), the lines follow one after
+        another, and it leaves faster than it came (150 ms).
+        """
+        if getattr(self, "_whats_new_win", None) is not None:
+            return
+        info = (self._update_info if (self._update_info and not fresh)
+                else {"version": APP_VERSION, "changes": WHATS_NEW})
         upcoming = info["version"] != APP_VERSION
-        ctk.CTkLabel(body, text=f"What's new in {info['version']}", font=_font(17, "semibold"),
-                     text_color=TEXT_COLOR, anchor="w").pack(fill=tk.X)
-        ctk.CTkLabel(body, text=("Ready to install - restart to switch." if upcoming
-                                 else "The version you are using."),
-                     font=_font(12), text_color=MUTED_TEXT_COLOR, anchor="w").pack(fill=tk.X, pady=(2, 12))
-        for line in info["changes"] or ["Improvements and fixes."]:
-            row = ctk.CTkFrame(body, fg_color="transparent")
-            row.pack(fill=tk.X, pady=3)
-            ctk.CTkLabel(row, text="", image=_icon("done", 14, SOURCE_DOT), width=18).pack(
-                side=tk.LEFT, anchor="n", pady=(2, 0))
-            ctk.CTkLabel(row, text=line, font=_font(13), text_color=TEXT_SOFT, anchor="w",
-                         justify="left", wraplength=340).pack(side=tk.LEFT, padx=(8, 0), fill=tk.X)
-        buttons = ctk.CTkFrame(body, fg_color="transparent")
-        buttons.pack(fill=tk.X, pady=(16, 0))
-        _make_secondary_button(buttons, "Close", win.destroy, width=90).pack(side=tk.RIGHT)
-        if upcoming and self._update_ready:
-            _make_primary_button(buttons, "Restart to update",
-                                 lambda: (win.destroy(), self._restart_app()), width=150).pack(
-                side=tk.RIGHT, padx=(0, 8))
-        win.bind("<Escape>", lambda _e: win.destroy())
+        reduced = self._motion_reduced()
+        root = self.root
+        root.update_idletasks()
+        rx, ry = root.winfo_rootx(), root.winfo_rooty()
+        rw, rh = root.winfo_width(), root.winfo_height()
+
+        scrim = tk.Toplevel(root)
+        scrim.overrideredirect(True)
+        scrim.configure(bg="#000000")
         try:
-            win.grab_set()
+            scrim.attributes("-alpha", 0.0)
+            scrim.transient(root)
         except tk.TclError:
             pass
+        scrim.geometry(f"{rw}x{rh}+{rx}+{ry}")
+
+        width = 440
+        win = ctk.CTkToplevel(root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.configure(fg_color=SURFACE)
+        try:
+            win.attributes("-alpha", 0.0)
+            win.transient(root)
+        except tk.TclError:
+            pass
+        self._whats_new_win = win
+        body = ctk.CTkFrame(win, fg_color="transparent", width=width)
+        body.pack(fill=tk.BOTH, expand=True, padx=28, pady=(24, 22))
+
+        head = ctk.CTkFrame(body, fg_color="transparent")
+        head.pack(fill=tk.X)
+        try:
+            mark = _load_mark(44)
+            ctk.CTkLabel(head, text="", image=ctk.CTkImage(mark, mark, size=(44, 44))).pack(
+                side=tk.LEFT, padx=(0, 14))
+        except Exception:
+            pass
+        words = ctk.CTkFrame(head, fg_color="transparent")
+        words.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ctk.CTkLabel(words, text="WHAT'S NEW", font=_font(11, "semibold"),
+                     text_color=SPLASH_ACCENT, anchor="w").pack(fill=tk.X)
+        ctk.CTkLabel(words, text=f"{APP_NAME} {info['version']}", font=_font(22, "semibold"),
+                     text_color=TEXT_COLOR, anchor="w").pack(fill=tk.X)
+        ctk.CTkLabel(words, text=("Ready to install - restart to switch." if upcoming
+                                  else "Updated just now." if fresh else "The version you are using."),
+                     font=_font(12), text_color=MUTED_TEXT_COLOR, anchor="w").pack(fill=tk.X)
+
+        ctk.CTkFrame(body, height=1, fg_color=BORDER).pack(fill=tk.X, pady=(18, 12))
+        lines = []
+        for text in info["changes"] or ["Improvements and fixes."]:
+            row = ctk.CTkFrame(body, fg_color="transparent")
+            row.pack(fill=tk.X, pady=4)
+            ctk.CTkLabel(row, text="", image=_icon("done", 14, SOURCE_DOT), width=18).pack(
+                side=tk.LEFT, anchor="n", pady=(2, 0))
+            label = ctk.CTkLabel(row, text=text, font=_font(13),
+                                 text_color=TEXT_SOFT if reduced else SURFACE,
+                                 anchor="w", justify="left", wraplength=width - 100)
+            label.pack(side=tk.LEFT, padx=(10, 0), fill=tk.X)
+            lines.append(label)
+
+        buttons = ctk.CTkFrame(body, fg_color="transparent")
+        buttons.pack(fill=tk.X, pady=(20, 0))
+        closing = {"done": False}
+
+        def close(then=None):
+            if closing["done"]:
+                return
+            closing["done"] = True
+
+            def step(p):
+                try:
+                    win.attributes("-alpha", 1.0 - p)
+                    scrim.attributes("-alpha", 0.4 * (1.0 - p))
+                    win.geometry(f"+{x}+{y + round(6 * p)}")
+                except tk.TclError:
+                    pass
+
+            def gone():
+                for w in (win, scrim):
+                    try:
+                        w.destroy()
+                    except tk.TclError:
+                        pass
+                self._whats_new_win = None
+                if then:
+                    then()
+
+            _animate(root, 0 if reduced else 150, step, done=gone, ease=EASE_OUT)
+
+        if upcoming and self._update_ready:
+            _make_primary_button(buttons, "Restart to update",
+                                 lambda: close(self._restart_app), width=150).pack(side=tk.RIGHT)
+            _make_secondary_button(buttons, "Later", close, width=90).pack(
+                side=tk.RIGHT, padx=(0, 8))
+        else:
+            _make_primary_button(buttons, "Got it", close, width=110).pack(side=tk.RIGHT)
+
+        win.update_idletasks()
+        h = win.winfo_reqheight()
+        x = rx + max(0, (rw - width) // 2)
+        y = ry + max(0, (rh - h) // 2 - 12)
+        rise = 0 if reduced else 14
+        win.geometry(f"{width}x{h}+{x}+{y + rise}")
+        win.deiconify()
+        win.update_idletasks()
+        _round_corners(win, border=MENU_BORDER)
+        try:
+            scrim.lift()  # over the window, under the card
+        except tk.TclError:
+            pass
+        win.lift()
+        win.focus_force()
+        win.bind("<Escape>", lambda _e: close())
+        win.bind("<Return>", lambda _e: close())
+        scrim.bind("<Button-1>", lambda _e: close())
+
+        def enter(p):
+            try:
+                win.attributes("-alpha", p)
+                scrim.attributes("-alpha", 0.4 * p)
+                win.geometry(f"+{x}+{y + round(rise * (1 - p))}")
+            except tk.TclError:
+                pass
+
+        _animate(root, 120 if reduced else 260, enter, ease=EASE_OUT)
+        if not reduced:
+            for i, label in enumerate(lines):
+                def fade(label=label):
+                    _animate(root, 220, lambda p: label.winfo_exists() and label.configure(
+                        text_color=_mix(SURFACE, TEXT_SOFT, p)), ease=EASE_OUT)
+                root.after(140 + i * 55, fade)
 
     def _restart_app(self):
         """Starts the app again through the launcher, which picks up the
@@ -4798,6 +4970,690 @@ class ImageSearchApp:
             self.root.after(150, wait_for_handover)
 
         self.root.after(400, wait_for_handover)
+
+    # ---------- More menu ----------
+
+    def _show_more_menu(self, anchor):
+        def later(action):
+            # A menu item opening another menu: after this click has finished,
+            # or the click itself would count as "outside" and close it.
+            return lambda: self.root.after(80, action)
+
+        self._popup(anchor.winfo_rootx() + 12, anchor.winfo_rooty(), [
+            ("item", "Check for updates", "update", lambda: self._check_for_updates(interactive=True)),
+            ("item", "Local folder…", "local", later(lambda: self._show_local_folder_menu(anchor))),
+            ("item", "Settings", "settings", self._open_settings),
+            ("sep",),
+            ("item", "Take the tour", "tour", later(self._start_tour)),
+            ("item", "Support", "support", self._show_support_form),
+            ("item", f"About {APP_NAME}", "info", self._show_about),
+        ])
+
+    # ---------- filters ----------
+    #
+    # Two small pairs on the right of the Recent row: landscape / portrait,
+    # and with / without people. They narrow whatever is on screen - a
+    # search, a collection, favourites - and All photos samples the whole
+    # library through them. Click an active one again to switch it off.
+
+    def _filters_state(self):
+        f = self.__dict__.get("_filters")
+        if f is None:
+            f = self._filters = {"shape": None, "people": None}
+        return f
+
+    def _filters_active(self):
+        f = self._filters_state()
+        return bool(f["shape"] or f["people"])
+
+    def _build_filter_chips(self, bar):
+        f = self._filters_state()
+        box = ctk.CTkFrame(bar, fg_color="transparent")
+        box.pack(side=tk.RIGHT, padx=(8, 0))
+        if not hasattr(self, "_filter_count_var"):
+            self._filter_count_var = tk.StringVar(value="")
+        ctk.CTkLabel(box, textvariable=self._filter_count_var, text_color=FAINT_TEXT,
+                     font=_font(12)).pack(side=tk.LEFT, padx=(0, 6))
+
+        def chip(text, icon, group, value, gap):
+            on = f[group] == value
+            ink = TEXT_COLOR if on else MUTED_TEXT_COLOR
+            ctk.CTkButton(
+                box, text=text, image=_icon(icon, 13, ink), compound="left", width=0,
+                height=28, corner_radius=14, font=_font(12),
+                fg_color=NAV_SELECTED if on else "transparent",
+                hover_color=NAV_SELECTED if on else SURFACE_HOVER, text_color=ink,
+                border_width=1, border_color=PRIMARY if on else BORDER,
+                command=lambda: self._toggle_filter(group, value),
+            ).pack(side=tk.LEFT, padx=(gap, 3))
+
+        chip(" Landscape", "landscape", "shape", "landscape", 3)
+        chip(" Portrait", "portrait", "shape", "portrait", 0)
+        chip(" People", "people", "people", "with", 10)
+        chip(" No people", "nopeople", "people", "without", 0)
+
+    def _toggle_filter(self, group, value):
+        f = self._filters_state()
+        turning_on = f[group] != value
+        if (group == "people" and turning_on and self.engine.model is None
+                and self.__dict__.get("_person_vec") is None and not self._load_concept_cache()):
+            self._warm_model()
+            self.status_var.set(
+                "The search engine is still starting - try the people filter again in a few seconds.")
+            return
+        f[group] = value if turning_on else None
+        self._refresh_suggestions()
+        if getattr(self, "_sample_view", False):
+            self._show_all_photos()
+        else:
+            self._render_results(self._last_results)
+        names = {"landscape": "landscape", "portrait": "portrait",
+                 "with": "with people", "without": "without people"}
+        on = [names[v] for v in (f["shape"], f["people"]) if v]
+        self.status_var.set(f"Showing {' and '.join(on)} photos only - click a filter again to switch it off."
+                            if on else "Filters off - showing everything again.")
+
+    def _path_index(self):
+        paths = self.engine.paths
+        cache = self.__dict__.get("_path_index_cache")
+        if cache is None or cache[0] is not paths or cache[1] != len(paths):
+            cache = self._path_index_cache = (paths, len(paths), {p: i for i, p in enumerate(paths)})
+        return cache[2]
+
+    def _people_flags(self):
+        """Per photo: is anyone in it - seen by either the "a person" check or
+        the "guests having fun" one, so a lone golfer and a table of friends
+        both count. None while that can't be told yet."""
+        try:
+            if self.__dict__.get("_person_vec") is None or self._people_vec is None:
+                if not self._load_concept_cache():
+                    if self.engine.model is None:
+                        return None
+                    embed = self.engine.embed_concept
+                    self._person_vec, self._nobody_vec = embed(PERSON_PROMPTS), embed(NOBODY_PROMPTS)
+                    self._people_vec, self._empty_vec = embed(PEOPLE_PROMPTS), embed(EMPTY_PROMPTS)
+                    self._save_concept_cache()
+            score = self.engine.score_against
+            return (((score(self._person_vec) - score(self._nobody_vec)) > 0)
+                    | ((score(self._people_vec) - score(self._empty_vec)) > 0))
+        except Exception:
+            return None
+
+    def _concept_cache_path(self):
+        return os.path.join(DATA_DIR, "concepts.npz")
+
+    @staticmethod
+    def _concept_prompts_key():
+        return repr((PERSON_PROMPTS, NOBODY_PROMPTS, PEOPLE_PROMPTS, EMPTY_PROMPTS))
+
+    def _load_concept_cache(self):
+        """The "is anyone in it" directions, kept from an earlier run so the
+        people filter works the moment the app opens, before the search
+        engine has loaded."""
+        try:
+            data = np.load(self._concept_cache_path())
+            if str(data["tag"]) != MODEL_TAG or str(data["prompts"]) != self._concept_prompts_key():
+                return False
+            self._person_vec, self._nobody_vec = data["person"], data["nobody"]
+            self._people_vec, self._empty_vec = data["people"], data["empty"]
+            return True
+        except Exception:
+            return False
+
+    def _save_concept_cache(self):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(self._concept_cache_path(), "wb") as f:
+                np.savez(f, tag=MODEL_TAG, prompts=self._concept_prompts_key(),
+                         person=self._person_vec, nobody=self._nobody_vec,
+                         people=self._people_vec, empty=self._empty_vec)
+        except Exception:
+            pass
+
+    def _passes_filters(self, idx, people):
+        f = self._filters_state()
+        if idx is None:
+            return False
+        if f["shape"]:
+            if self._is_landscape(idx) != (f["shape"] == "landscape"):
+                return False
+        if f["people"] and people is not None and idx < len(people):
+            if bool(people[idx]) != (f["people"] == "with"):
+                return False
+        return True
+
+    def _apply_filters(self, results):
+        if not results or not self._filters_active():
+            return results
+        index = self._path_index()
+        people = self._people_flags() if self._filters_state()["people"] else None
+        return [r for r in results if self._passes_filters(index.get(r[0]), people)]
+
+    def _filtered_sample_indices(self):
+        """A cross-section of the whole library through the filters, checking
+        only as many photos as it takes to fill the opening screen."""
+        total = len(self.engine.paths)
+        if not total:
+            return []
+        people = self._people_flags() if self._filters_state()["people"] else None
+        step = max(1, total // (ALL_PHOTOS_PREVIEW * 6))
+        picked = []
+        for offset in range(step):
+            for i in range(offset, total, step):
+                if self._passes_filters(i, people):
+                    picked.append(i)
+                    if len(picked) >= ALL_PHOTOS_PREVIEW:
+                        return picked
+        return picked
+
+    def _show_filter_count(self, total, shown):
+        var = getattr(self, "_filter_count_var", None)
+        if var is None:
+            return
+        if self._filters_active() and not getattr(self, "_sample_view", False) and total:
+            var.set(f"{shown} of {total}")
+        else:
+            var.set("")
+        if self._filters_active() and total and not shown:
+            self.status_var.set("No photos here match these filters - switch one off to see more.")
+
+    # ---------- picking several photos ----------
+
+    def _bind_selection_keys(self):
+        self._sel = {}
+        self._sel_anchor = None
+        self._tile_by_pos = {}
+        self._shown_results = []
+
+        def escape(_e):
+            if getattr(self, "_menu", None) is None and self._sel:
+                self._clear_selection()
+
+        def select_all(_e):
+            try:
+                if self.root.focus_get() is self.query_entry or str(self.root.focus_get()).startswith(
+                        str(self.query_entry)):
+                    return None  # Ctrl+A in the search box selects its text
+            except Exception:
+                pass
+            for pos in range(len(self._shown_results)):
+                self._select_pos(pos, True)
+            self._update_selection_bar()
+            return "break"
+
+        self.root.bind("<Escape>", escape, add="+")
+        self.root.bind("<Command-a>" if IS_MAC else "<Control-a>", select_all, add="+")
+
+    def _select_click(self, pos, mode):
+        self._suppress_release = True
+        if mode == "range" and self._sel_anchor is not None:
+            lo, hi = sorted((self._sel_anchor, pos))
+            for p in range(lo, hi + 1):
+                self._select_pos(p, True)
+        else:
+            self._select_pos(pos, pos not in self._sel)
+            self._sel_anchor = pos
+        self._update_selection_bar()
+        return "break"
+
+    def _select_pos(self, pos, on):
+        shown = getattr(self, "_shown_results", None) or []
+        if not 0 <= pos < len(shown):
+            return
+        if on:
+            path, _score, meta = shown[pos]
+            self._sel[pos] = (path, meta)
+        else:
+            self._sel.pop(pos, None)
+        label = self._tile_by_pos.get(pos)
+        if label is not None:
+            label.selected = on
+            self._paint_tile(label)
+
+    def _paint_tile(self, label):
+        try:
+            if getattr(label, "dragging", False):
+                return
+            if getattr(label, "selected", False):
+                if getattr(label, "sel_image", None) is None:
+                    path, size, key = label.tile
+                    label.sel_image = self._tile_photo(path, size, key in self._render_favs,
+                                                       selected=True)
+                label.configure(image=label.sel_image)
+            else:
+                label.configure(image=label.image)
+        except Exception:
+            pass
+
+    def _selection_items(self):
+        return [self._sel[p] for p in sorted(self._sel)]
+
+    def _clear_selection(self, animate=True):
+        sel = getattr(self, "_sel", None)
+        if sel is None:
+            return
+        for pos in list(sel):
+            label = self._tile_by_pos.get(pos)
+            if label is not None:
+                label.selected = False
+                self._paint_tile(label)
+        sel.clear()
+        self._sel_anchor = None
+        self._update_selection_bar(animate=animate)
+
+    def _drag_group(self, label):
+        pos = getattr(label, "pos", None)
+        sel = getattr(self, "_sel", None) or {}
+        if pos in sel and len(sel) > 1:
+            return self._selection_items()
+        return None
+
+    def _selected_look(self, tile, size):
+        """Picked: a soft green veil, a green ring and a tick, so a screen of
+        picks reads at a glance."""
+        w, h = size
+        k = 3
+        veil = Image.new("RGBA", size, _hex_rgb(PRIMARY) + (0,))
+        veil.putalpha(self._tile_mask(size).point(lambda a: a * 46 // 255))
+        tile = Image.alpha_composite(tile, veil)
+        ring = Image.new("RGBA", (w * k, h * k), (0, 0, 0, 0))
+        ImageDraw.Draw(ring).rounded_rectangle(
+            (k, k, w * k - k - 1, h * k - k - 1), radius=TILE_RADIUS * k,
+            outline=_hex_rgb(PRIMARY_HOVER) + (255,), width=3 * k)
+        tile.alpha_composite(ring.resize(size, Image.LANCZOS))
+        tile.alpha_composite(_selection_badge(), (8, 8))
+        return tile
+
+    def _with_count_badge(self, img, count):
+        """The carried photo, with how many are coming along."""
+        base = img.convert("RGBA").copy()
+        w, h = base.size
+        d = max(26, w // 6)
+        k = 4
+        badge = Image.new("RGBA", (d * k, d * k), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(badge)
+        draw.ellipse((0, 0, d * k - 1, d * k - 1), fill=_hex_rgb(PRIMARY) + (255,))
+        try:
+            font = ImageFont.truetype(_resource_path("assets", "fonts", "Inter-SemiBold.ttf"),
+                                      int(d * k * 0.48))
+        except Exception:
+            font = ImageFont.load_default()
+        text = str(count)
+        l, t, r, b = draw.textbbox((0, 0), text, font=font)
+        draw.text(((d * k - (r - l)) / 2 - l, (d * k - (b - t)) / 2 - t), text, font=font,
+                  fill=(255, 255, 255, 255))
+        base.alpha_composite(badge.resize((d, d), Image.LANCZOS), (w - d - 6, 6))
+        return base
+
+    # the bar that appears while photos are picked
+
+    def _selection_bar_parts(self):
+        bar = self.__dict__.get("_sel_bar")
+        if bar is not None:
+            return bar
+        holder = tk.Frame(self.root, bg=BG_COLOR, bd=0, highlightthickness=0)
+        card = ctk.CTkFrame(holder, fg_color=SURFACE, corner_radius=14, border_width=1,
+                            border_color=MENU_BORDER, bg_color=BG_COLOR)
+        card.pack(fill=tk.BOTH, expand=True)
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(padx=10, pady=8)
+        count = ctk.CTkLabel(row, text="", font=_font(13, "semibold"), text_color=TEXT_COLOR)
+        count.pack(side=tk.LEFT, padx=(8, 12))
+
+        def action(text, icon, command):
+            button = ctk.CTkButton(
+                row, text=text, image=_icon(icon, 14, TEXT_SOFT), compound="left", width=0,
+                height=32, corner_radius=8, fg_color="transparent", hover_color=SURFACE_HOVER,
+                text_color=TEXT_SOFT, font=_font(12, "medium"), command=command)
+            button.pack(side=tk.LEFT, padx=2)
+            return button
+
+        collect = action(" Add to…", "folder", None)
+        collect.configure(command=lambda: self._selection_collect_menu(collect))
+        action(" Copy", "copy", self._copy_selection)
+        action(" Save…", "save", self._save_selection)
+        action(" Favourite", "star", self._favourite_selection)
+        ctk.CTkFrame(row, width=1, height=20, fg_color=BORDER).pack(side=tk.LEFT, padx=6)
+        ctk.CTkButton(
+            row, text="", image=_icon("close", 14, MUTED_TEXT_COLOR), width=32, height=32,
+            corner_radius=8, fg_color="transparent", hover_color=SURFACE_HOVER,
+            command=self._clear_selection,
+        ).pack(side=tk.LEFT)
+        bar = self._sel_bar = {"holder": holder, "count": count, "collect": collect,
+                               "shown": False, "gen": 0, "offset": 0}
+        return bar
+
+    def _selection_bar_spot(self, bar):
+        holder = bar["holder"]
+        holder.update_idletasks()
+        w = holder.winfo_reqwidth()
+        h = holder.winfo_reqheight()
+        area = getattr(self.results_frame, "_parent_frame", self.results_frame)
+        ax = area.winfo_rootx() - self.root.winfo_rootx()
+        ay = area.winfo_rooty() - self.root.winfo_rooty()
+        x = ax + max(0, (area.winfo_width() - w) // 2)
+        y = min(self.root.winfo_height(), ay + area.winfo_height()) - h - 20
+        return x, y, w, h
+
+    def _place_selection_bar(self):
+        bar = self.__dict__.get("_sel_bar")
+        if not bar or not bar["shown"]:
+            return
+        try:
+            x, y, w, h = self._selection_bar_spot(bar)
+            bar["holder"].place(x=x, y=y + bar["offset"], width=w, height=h)
+            bar["holder"].lift()
+        except tk.TclError:
+            pass
+
+    def _update_selection_bar(self, animate=True):
+        n = len(getattr(self, "_sel", None) or {})
+        bar = self.__dict__.get("_sel_bar")
+        if n == 0:
+            if bar and bar["shown"]:
+                self._slide_selection_bar(False, animate)
+            return
+        bar = self._selection_bar_parts()
+        bar["count"].configure(text=f"{n} selected")
+        in_collection = self._view in self._collection_names()
+        bar["collect"].configure(text=" Move to…" if in_collection else " Add to…")
+        if not bar["shown"]:
+            self._slide_selection_bar(True, animate)
+        else:
+            self._place_selection_bar()
+
+    def _slide_selection_bar(self, show, animate=True):
+        """Rises from the bottom edge and leaves the same way: in with a
+        quick ease-out, out a little faster."""
+        bar = self._selection_bar_parts()
+        bar["gen"] += 1
+        gen = bar["gen"]
+        try:
+            _x, _y, _w, h = self._selection_bar_spot(bar)
+        except tk.TclError:
+            return
+        travel = h + 26
+        start = bar["offset"] if bar["shown"] else travel
+        end = 0 if show else travel
+        bar["shown"] = True
+
+        def step(p):
+            if bar["gen"] != gen:
+                return
+            bar["offset"] = round(start + (end - start) * p)
+            self._place_selection_bar()
+
+        def done():
+            if bar["gen"] != gen:
+                return
+            if not show:
+                bar["shown"] = False
+                bar["offset"] = travel
+                try:
+                    bar["holder"].place_forget()
+                except tk.TclError:
+                    pass
+
+        quick = not animate or self._motion_reduced()
+        _animate(self.root, 0 if quick else (220 if show else 150), step, done=done, ease=EASE_OUT)
+
+    # what the bar does
+
+    def _selection_collect_menu(self, anchor):
+        names = self._collection_names()
+        in_collection = self._view in names
+        shared = set(self._shared_by_name())
+        targets = [n for n in names if n != self._view]
+        n = len(self._sel)
+        items = []
+        if targets:
+            items.append(("header", f"Move {n} to" if in_collection else f"Add {n} to"))
+            for name in targets:
+                icon = "shared" if name in shared else "folder"
+                items.append(("item", name, icon, lambda t=name, v=self._view: (
+                    self._bulk_collect(t, move_from=v if in_collection else None),
+                    self._pulse_card(t))))
+        else:
+            items.append(("item", "New collection…", "newfolder", self._new_collection))
+        if in_collection:
+            items += [("sep",), ("item", f"Remove {n} from {self._view}", "remove",
+                                 lambda v=self._view: self._bulk_remove(v), {"danger": True})]
+        self._popup(anchor.winfo_rootx(), anchor.winfo_rooty(), items)
+
+    def _bulk_collect(self, target, move_from=None, items=None):
+        items = items if items is not None else self._selection_items()
+        ids = [i for i in ((m or {}).get("item_id") for _p, m in items) if i]
+        if not ids:
+            self.status_var.set("Only photos from the shared drive can be collected.")
+            return
+        by_id = self._collection_ids()
+        target_ids = by_id.setdefault(target, [])
+        added = 0
+        for item_id in ids:
+            if item_id not in target_ids:
+                target_ids.append(item_id)
+                added += 1
+        moving = set(ids)
+        if move_from and move_from in by_id:
+            by_id[move_from] = [i for i in by_id[move_from] if i not in moving]
+        if not self._write_collection_ids(by_id):
+            return
+        self._collections = self._load_collections()
+        self._rebuild_collection_cards()
+        already = len(ids) - added
+        note = f" ({already} already there)" if already else ""
+        if move_from and self._view == move_from:
+            remaining = [r for r in self._last_results
+                         if (r[2] or {}).get("item_id") not in moving]
+            self._render_results(remaining, keep_scroll=True)
+            self.status_var.set(f"Moved {len(ids)} photo(s) to {target}{note}.")
+        else:
+            self._clear_selection()
+            self.status_var.set(f"Added {added} photo(s) to {target}{note}.")
+            if self._view == target:
+                self._show_collection(target)
+
+    def _bulk_remove(self, name):
+        items = self._selection_items()
+        gone = {i for i in ((m or {}).get("item_id") for _p, m in items) if i}
+        by_id = self._collection_ids()
+        if not gone or name not in by_id:
+            return
+        by_id[name] = [i for i in by_id[name] if i not in gone]
+        if not self._write_collection_ids(by_id):
+            return
+        self._collections = self._load_collections()
+        self._rebuild_collection_cards()
+        self.status_var.set(f"Removed {len(gone)} photo(s) from {name}.")
+        if self._view == name:
+            self._show_collection(name, keep_scroll=True)
+
+    def _fetch_originals(self, items, folder, progress=None):
+        """Full-resolution originals of `items`, copied into `folder` under
+        their own names. Returns the copies' paths."""
+        os.makedirs(folder, exist_ok=True)
+        taken = set()
+        out = []
+        for n, (path, meta) in enumerate(items, start=1):
+            if progress:
+                progress(n)
+            item_id = (meta or {}).get("item_id")
+            name = (meta or {}).get("name") or os.path.basename(path)
+            source = self._ensure_full_image(item_id, name) if item_id else path
+            stem, ext = os.path.splitext(name)
+            candidate, k = name, 2
+            while candidate.lower() in taken or os.path.exists(os.path.join(folder, candidate)):
+                candidate = f"{stem} ({k}){ext}"
+                k += 1
+            taken.add(candidate.lower())
+            target = os.path.join(folder, candidate)
+            shutil.copy2(source, target)
+            out.append(target)
+        return out
+
+    def _copy_selection(self):
+        items = self._selection_items()
+        if not items:
+            return
+        if len(items) == 1:
+            path, meta = items[0]
+            self._copy_to_clipboard(path, meta)
+            return
+        total = len(items)
+        self.status_var.set(f"Getting {total} photos ready to paste…")
+
+        def work():
+            import tempfile
+
+            folder = os.path.join(tempfile.gettempdir(), "Topshot copies")
+            try:
+                for old in os.listdir(folder):
+                    try:
+                        os.remove(os.path.join(folder, old))
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+            try:
+                files = self._fetch_originals(
+                    items, folder,
+                    lambda n: self.event_queue.put(("shared_status", f"Fetching photo {n} of {total}…")))
+                self._put_files_on_clipboard(files)
+                self.event_queue.put(("shared_status",
+                                      f"Copied {len(files)} photos at full resolution - paste them "
+                                      "into PowerPoint, Teams or an email."))
+            except Exception as exc:
+                _log_reuse(f"MULTI COPY FAILED: {exc!r}")
+                self.event_queue.put(("shared_status", "Couldn't copy those photos - try again in a moment."))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _put_files_on_clipboard(self, paths):
+        """Puts files (not pixels) on the clipboard - how several photos
+        travel at once, the same as copying them in Explorer or Finder."""
+        if IS_MAC:
+            files = ", ".join('POSIX file "{}"'.format(p.replace("\\", "\\\\").replace('"', '\\"'))
+                              for p in paths)
+            subprocess.run(["osascript", "-e", f"set the clipboard to {{{files}}}"],
+                           check=True, timeout=30, capture_output=True)
+            return
+        import ctypes
+        import struct
+
+        names = ("\0".join(os.path.abspath(p) for p in paths) + "\0\0").encode("utf-16-le")
+        payload = struct.pack("<IiiII", 20, 0, 0, 0, 1) + names  # DROPFILES, wide names
+        kernel32, user32 = ctypes.windll.kernel32, ctypes.windll.user32
+        kernel32.GlobalAlloc.restype = ctypes.c_void_p
+        kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        user32.SetClipboardData.restype = ctypes.c_void_p
+        user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+        user32.RegisterClipboardFormatW.restype = ctypes.c_uint
+        user32.RegisterClipboardFormatW.argtypes = [ctypes.c_wchar_p]
+
+        def block(data):
+            handle = kernel32.GlobalAlloc(0x0042, len(data))  # GMEM_MOVEABLE | GMEM_ZEROINIT
+            pointer = kernel32.GlobalLock(handle)
+            ctypes.memmove(pointer, data, len(data))
+            kernel32.GlobalUnlock(handle)
+            return handle
+
+        files, effect = block(payload), block(struct.pack("<I", 1))  # DROPEFFECT_COPY
+        for _attempt in range(10):
+            if user32.OpenClipboard(0):
+                break
+            time.sleep(0.05)
+        else:
+            raise OSError("clipboard busy")
+        try:
+            user32.EmptyClipboard()
+            user32.SetClipboardData(15, files)  # CF_HDROP
+            user32.SetClipboardData(user32.RegisterClipboardFormatW("Preferred DropEffect"), effect)
+        finally:
+            user32.CloseClipboard()
+
+    def _save_selection(self):
+        items = self._selection_items()
+        if not items:
+            return
+        folder = filedialog.askdirectory(title=f"Save {len(items)} photo(s) to…", parent=self.root)
+        if not folder:
+            return
+        total = len(items)
+        self.status_var.set(f"Saving {total} photo(s)…")
+
+        def work():
+            try:
+                files = self._fetch_originals(
+                    items, folder,
+                    lambda n: self.event_queue.put(("shared_status", f"Saving photo {n} of {total}…")))
+                self.event_queue.put(("shared_status", f"Saved {len(files)} photo(s) to {folder}."))
+                try:
+                    _open_external(folder)
+                except Exception:
+                    pass
+            except Exception as exc:
+                _log_reuse(f"SAVE SELECTION FAILED: {exc!r}")
+                self.event_queue.put(("shared_status", "Couldn't save all of them - check the folder and try again."))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _favourite_selection(self):
+        items = self._selection_items()
+        if not items:
+            return
+        own = self._own_favourites()
+        picks = [(self._fav_key(p, m), p, m) for p, m in items]
+        all_on = all(key in own for key, _p, _m in picks)
+        for key, path, meta in picks:
+            if (key in own) == all_on:
+                self._toggle_favourite(key, path, meta)
+        if self._view == "favourites":
+            self._show_favourites()
+        else:
+            self._render_results(self._last_results, keep_scroll=True)
+        self.status_var.set(
+            f"Removed {len(picks)} from favourites." if all_on
+            else f"Starred {len(picks)} photo(s) - find them under Favourites.")
+
+    # ---------- after start: the tour for someone new, What's new after an update ----------
+
+    def _whats_new_path(self):
+        return os.path.join(DATA_DIR, "whats_new.json")
+
+    def _mark_whats_new_seen(self):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(self._whats_new_path(), "w", encoding="utf-8") as f:
+                json.dump({"seen": APP_VERSION}, f)
+        except OSError:
+            pass
+
+    def _first_screen_extras(self):
+        if not self._tour_seen():
+            # Someone new gets the tour, not a list of changes.
+            self._mark_whats_new_seen()
+            self._start_tour_when_ready()
+            return
+        seen = str(self._read_json(self._whats_new_path()).get("seen") or "0")
+        if seen != APP_VERSION and version_tuple(APP_VERSION) > version_tuple(seen):
+            self._mark_whats_new_seen()
+            self._show_whats_new(fresh=True)
+
+    def _start_tour_when_ready(self, waited=0):
+        """Starts the first-run tour once the window is really on screen -
+        not minimised, not still hidden behind the intro - however long that
+        takes."""
+        try:
+            ready = bool(self.root.winfo_viewable()) and self.root.state() != "iconic"
+        except tk.TclError:
+            return
+        if ready and getattr(self, "_whats_new_win", None) is None:
+            self._start_tour()
+        else:
+            self.root.after(700, lambda: self._start_tour_when_ready(waited + 700))
 
     def _popup(self, x_root, y_root, items):
         """Opens the app's own menu at a screen point, closing any open one."""
@@ -4863,6 +5719,7 @@ class ImageSearchApp:
             "fx": min(1.0, max(0.0, event.x / max(1, w))),
             "fy": min(1.0, max(0.0, event.y / max(1, h))),
             "active": False, "ghost": None, "hover": None, "tick": None,
+            "group": self._drag_group(event.widget),
         }
 
     def _motion_reduced(self):
@@ -4980,9 +5837,9 @@ class ImageSearchApp:
         label = drag["label"]
         try:
             label.dragging = False
-            label.configure(image=label.image)
         except Exception:
             pass
+        self._paint_tile(label)
 
     def _make_ghost(self, drag):
         """The carried photo: a borderless window that starts exactly over
@@ -5001,7 +5858,9 @@ class ImageSearchApp:
             inner = tk.Label(win, bd=0, highlightthickness=0, bg=BG_COLOR)
             inner.pack()
             g = {
-                "win": win, "label": inner, "base": self._thumb_image(drag["path"]),
+                "win": win, "label": inner,
+                "base": self._with_count_badge(self._thumb_image(drag["path"]), len(drag["group"]))
+                if drag.get("group") else self._thumb_image(drag["path"]),
                 "w": max(8, tile_w), "h": max(8, tile_h), "size": None,
                 "cx": x0 + tile_w / 2, "cy": y0 + tile_h / 2, "scale": 1.0, "alpha": 1.0,
             }
@@ -5093,7 +5952,11 @@ class ImageSearchApp:
 
         def land():
             self._end_ghost(drag)
-            if moving:
+            if drag.get("group"):
+                self._restore_source(drag)
+                self._bulk_collect(target, move_from=source if moving else None,
+                                   items=drag["group"])
+            elif moving:
                 self._move_to_collection(source, target, drag["path"], drag["meta"])
             else:
                 self._restore_source(drag)
@@ -5194,7 +6057,16 @@ class ImageSearchApp:
             pass
 
     def _render_results(self, results, keep_scroll=False):
+        if results is not self._last_results:
+            # A re-draw of the same set (the window was resized) is still
+            # whatever it was - the All photos sample stays the sample.
+            self._sample_view = False
         self._last_results = results
+        self._clear_selection(animate=False)
+        shown = self._apply_filters(results)
+        self._shown_results = shown
+        self._tile_by_pos = {}
+        self._show_filter_count(len(results), len(shown))
         self._restore_scroll = None
         if keep_scroll:
             try:
@@ -5219,7 +6091,7 @@ class ImageSearchApp:
         # first layout after startup already has the right column count.
         self._current_columns = self._desired_columns()
         avail = max(320, self._current_columns - 2 * GRID_SIDE_PAD - 4)
-        self._render_chunk(results, 0, avail)
+        self._render_chunk(shown, 0, avail)
 
     def _render_chunk(self, results, start, avail):
         """Builds a few rows of results, then yields to the event loop
@@ -5247,7 +6119,7 @@ class ImageSearchApp:
                 except Exception:
                     continue
                 aspect = min(3.0, max(0.4, img.width / max(1, img.height)))
-                items.append((path, meta, aspect))
+                items.append((path, meta, aspect, idx - 1))
                 total_aspect += aspect
                 if total_aspect * ROW_HEIGHT + TILE_GAP * (len(items) - 1) >= avail:
                     full = True
@@ -5257,12 +6129,12 @@ class ImageSearchApp:
             gaps = TILE_GAP * (len(items) - 1)
             if full:
                 height = max(40, round((avail - gaps) / total_aspect))
-                widths = [max(24, round(a * height)) for _p, _m, a in items]
+                widths = [max(24, round(a * height)) for _p, _m, a, _i in items]
                 widths[-1] += (avail - gaps) - sum(widths)  # land exactly on the edge
                 widths[-1] = max(24, widths[-1])
             else:
                 height = ROW_HEIGHT
-                widths = [max(24, round(a * height)) for _p, _m, a in items]
+                widths = [max(24, round(a * height)) for _p, _m, a, _i in items]
             self._build_row(items, widths, height)
             rows += 1
 
@@ -5286,7 +6158,7 @@ class ImageSearchApp:
     def _build_row(self, items, widths, height):
         row = tk.Frame(self.results_frame, bg=BG_COLOR, bd=0, highlightthickness=0)
         row.pack(anchor="w", padx=(GRID_SIDE_PAD, 0), pady=(0, TILE_GAP))
-        for i, ((path, meta, _a), w) in enumerate(zip(items, widths)):
+        for i, ((path, meta, _a, pos), w) in enumerate(zip(items, widths)):
             key = self._fav_key(path, meta)
             size = (w, height)
             try:
@@ -5313,6 +6185,15 @@ class ImageSearchApp:
             )
             label.bind("<Enter>", lambda e: self._tile_hover(e.widget, True))
             label.bind("<Leave>", lambda e: self._tile_hover(e.widget, False))
+            # Picking several: Ctrl-click (Cmd on a Mac) adds or drops one,
+            # Shift-click takes everything from the last pick to this one.
+            label.pos = pos
+            label.selected = False
+            label.sel_image = None
+            self._tile_by_pos[pos] = label
+            label.bind("<Shift-Button-1>", lambda e, p=pos: self._select_click(p, "range"))
+            label.bind("<Command-Button-1>" if IS_MAC else "<Control-Button-1>",
+                       lambda e, p=pos: self._select_click(p, "toggle"))
 
     def _on_star_clicked(self, key, path, meta, widget):
         added = self._toggle_favourite(key, path, meta)
@@ -5833,7 +6714,9 @@ class Tour:
         self._place_overlay()
         # Never unbound (tkinter's unbind would drop other handlers too);
         # they do nothing once the tour is closed.
-        self.canvas.bind("<Button-1>", lambda _e: self.close())
+        # A click beside the card no longer ends the tour (one click to bring
+        # the window forward used to close it): only Skip, Esc and Done do.
+        self.canvas.bind("<Button-1>", lambda _e: "break")
         self.root.bind("<Button-1>", self._on_root_click, add="+")
         for key, action in (("<Escape>", self.close), ("<Right>", self.next),
                             ("<Left>", self.back)):
@@ -5965,9 +6848,7 @@ class Tour:
     def _on_root_click(self, event):
         if self.closed:
             return
-        if self.bubble is not None and str(event.widget).startswith(str(self.bubble)):
-            return  # a click on the card itself
-        self.close()
+        return  # see __init__: clicks elsewhere leave the tour open
 
     # --- steps ---
 
@@ -5999,7 +6880,7 @@ class Tour:
             target = self._target_rect(index)
         except Exception:
             _log_crash("tour step", sys.exc_info())
-            self.close()
+            self.close(completed=False)
             return
         self.index = index
         start = self.rect or target
@@ -6127,7 +7008,7 @@ class Tour:
         except (tk.TclError, ValueError):
             _log_crash("tour card placement", sys.exc_info())
 
-    def close(self):
+    def close(self, completed=True):
         if self.closed:
             return
         self.closed = True
@@ -6141,7 +7022,7 @@ class Tour:
             if self.outline is not None:
                 self.outline.destroy()
             _fine_timer(False)
-            self.on_done()
+            self.on_done(completed)
 
         _animate(self.root, 0 if self.reduced else 200,
                  lambda p: self._overlay_alpha(self.DIM * (1 - p)), done=finish)
@@ -6571,8 +7452,7 @@ class BootSequence:
             # seconds later, from the saved sign-in only - no browser pops up.
             self.root.after(5000, self.app._start_background_checks)
             self.root.after(50, lambda: _set_window_icons(self.root))
-            if not AFTER_UPDATE and not self.app._tour_seen():
-                self.root.after(1200, self.app._start_tour)
+            self.root.after(1200, self.app._first_screen_extras)
             if AFTER_UPDATE:
                 self.root.after(400, lambda: self.app.status_var.set(
                     f"Updated to version {APP_VERSION}. Everything you had is still here."
