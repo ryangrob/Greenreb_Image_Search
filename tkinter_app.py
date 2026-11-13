@@ -1837,6 +1837,25 @@ class ImageSearchApp:
 
         self._run_in_background(work)
 
+    def _local_folder_loaded(self):
+        """A folder on this computer is loaded in place of the SharePoint
+        library (Local folder > Choose folder)."""
+        try:
+            return not self._sp_mode_active and os.path.isdir(self.folder_var.get() or "")
+        except Exception:
+            return False
+
+    def _collection_count(self, name, idxs):
+        """How many photos a collection holds. While a local folder is loaded
+        none of them are in the index, so the saved number is shown rather
+        than a 0 that looks as if the collection had been emptied."""
+        if idxs or not self._local_folder_loaded():
+            return len(idxs)
+        try:
+            return len(self._collection_ids().get(name) or [])
+        except Exception:
+            return 0
+
     def _rebuild_collection_cards(self):
         """Recreates the collection cards in the sidebar."""
         for card in self.collection_cards.values():
@@ -1850,7 +1869,8 @@ class ImageSearchApp:
             # Long names are shortened on the card only; the sidebar is narrow.
             shown = name if len(name) <= 17 else name[:16].rstrip() + "…"
             card = self._make_collection_card(
-                self.sidebar, f"  {shown} ({len(idxs)})", lambda n=name: self._set_view(n),
+                self.sidebar, f"  {shown} ({self._collection_count(name, idxs)})",
+                lambda n=name: self._set_view(n),
                 icon="shared" if name in shared_names else "folder",
             )
             _bind_context_menu(card, lambda e, n=name: self._show_collection_menu(e, n))
@@ -1933,6 +1953,14 @@ class ImageSearchApp:
 
     def _show_collection(self, name, keep_scroll=False):
         idxs = (self._collections or {}).get(name, [])
+        if not idxs and self._collection_count(name, idxs):
+            self._render_results([])
+            self.status_var.set(
+                f"{name} has {self._collection_count(name, idxs)} photo(s) in the SharePoint "
+                "library. A local folder is loaded right now - click Check for new photos to "
+                "go back to the library."
+            )
+            return
         if not idxs:
             self._render_results([])
             self.status_var.set(
@@ -4689,7 +4717,7 @@ class ImageSearchApp:
                 preview["path"], preview["meta"], token=preview["token"]), "break")[1])
         self._preview = preview
         self._preview_open(path, meta)
-        win.focus_force()
+        _bring_forward(win)
 
     # ---------- export ----------
 
@@ -4804,8 +4832,11 @@ class ImageSearchApp:
             return full.crop(crop.pixel_box(full.size))
 
         def suffix():
-            return {"original": "", "free": "_crop"}.get(state["format"]) or {
-                16 / 9: "_16x9", 9 / 16: "_9x16", 4 / 5: "_4x5", 1.0: "_1x1"}.get(state["format"], "_crop")
+            if state["format"] == "original":
+                l, t, r, b = crop.pixel_box(state["full"].size)
+                return "" if (r - l, b - t) == state["full"].size else "_crop"
+            return {16 / 9: "_16x9", 9 / 16: "_9x16", 4 / 5: "_4x5", 1.0: "_1x1"}.get(
+                state["format"], "_crop")
 
         def save():
             if state["full"] is None:
@@ -4895,6 +4926,8 @@ class ImageSearchApp:
             if "img" in loaded:
                 state["full"], state["icc"] = loaded["img"], loaded["icc"]
                 crop.set_image(loaded["img"])
+                if crop.ratio is None and state["format"] != "free":
+                    choose(state["format"])  # picked before there was a photo to shape
                 for b in (save_button, copy_button):
                     b.configure(state=tk.NORMAL)
                 update_info()
@@ -4906,7 +4939,7 @@ class ImageSearchApp:
 
         threading.Thread(target=work, daemon=True).start()
         win.after(150, poll)
-        win.focus_force()
+        _bring_forward(win)
 
     def _open_original(self, path, meta):
         item_id = (meta or {}).get("item_id")
@@ -5059,7 +5092,7 @@ class ImageSearchApp:
         _make_button(bar, "Close", close, width=90).pack(side=tk.RIGHT)
         win.protocol("WM_DELETE_WINDOW", close)
         win.bind("<Escape>", lambda _e: close())
-        win.focus_force()
+        _bring_forward(win)
 
     def _load_original_into(self, viewer, path, meta, alive):
         meta = meta or {}
@@ -5186,9 +5219,17 @@ class ImageSearchApp:
         """
         _lf, _t, full_dir, _i = self._sp_cache_dirs()
         dest = os.path.join(full_dir, f"{item_id}_{name}")
-        if os.path.exists(dest) and os.path.getsize(dest) > 0:
-            return dest
-        self._ensure_sp_client().download_file({"id": item_id}, dest)
+        # One download per photo at a time: the preview, its neighbours, Copy
+        # and Export can all ask for the same original at once, and a second
+        # caller must not pick up a half-written file. It arrives under
+        # another name and is renamed when complete.
+        locks = self.__dict__.setdefault("_full_image_locks", {})
+        with locks.setdefault(dest, threading.Lock()):
+            if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                return dest
+            part = dest + ".part"
+            self._ensure_sp_client().download_file({"id": item_id}, part)
+            os.replace(part, dest)
         return dest
 
     def _put_image_on_clipboard(self, source):
@@ -8170,6 +8211,7 @@ class ImageSearchApp:
         self.root.bind("<Motion>", moved, add="+")
 
     def _drag_start(self, event, path, meta):
+        self._suppress_release = False  # a plain press starts a new click
         self._dragout_stray = False   # a real press: no made-up release is pending
         # Only records where the press happened. The drag does not begin
         # until the pointer actually moves, so a double-click still opens
@@ -9423,15 +9465,44 @@ def _start_freeze_watchdog(root):
                         f"{APP_VERSION}: {text}\n")
                 f.flush()
                 if dump:
-                    faulthandler.dump_traceback(file=f, all_threads=True)
+                    # Written by hand: faulthandler only printed "<freed
+                    # thread state>" here (Python 3.13 on Windows), which
+                    # says nothing about where the window was stuck.
+                    names = {t.ident: t.name for t in threading.enumerate()}
+                    for ident, frame in list(sys._current_frames().items()):
+                        f.write(f"Thread {names.get(ident, ident)}:\n")
+                        f.write("".join(traceback.format_stack(frame)))
                     f.write("\n")
         except Exception:
             pass
 
+    def awake_clock():
+        """Seconds the computer has been awake, not counting sleep - None
+        where the system can't say (then nothing is skipped)."""
+        try:
+            import ctypes
+
+            ticks = ctypes.c_ulonglong()
+            if ctypes.windll.kernel32.QueryUnbiasedInterruptTime(ctypes.byref(ticks)):
+                return ticks.value / 1e7
+        except Exception:
+            pass
+        return None
+
     def watch():
         dumps = 0
+        awake = awake_clock()
         while True:
+            before = time.monotonic()
             time.sleep(0.5)
+            overslept = time.monotonic() - before - 0.5
+            was_awake, awake = awake, awake_clock()
+            if (overslept > 2.0 and awake is not None and was_awake is not None
+                    and awake - was_awake < overslept):
+                # The computer was asleep, not the window stuck: without this
+                # every wake-up was logged (and reported) as a freeze.
+                beat[0] = time.monotonic()
+                continue
             stalled = time.monotonic() - beat[0]
             if stalled >= 3.0 and dumps == 0 or stalled >= 12.0 and dumps == 1:
                 dumps += 1
@@ -9829,6 +9900,26 @@ class _DragOutSession:
         raise OSError(f"DoDragDrop failed ({code:#x})")
 
 
+def _bring_forward(win):
+    """Puts a new window in front with the keyboard, and in front again a
+    moment later: CustomTkinter touches a new window about 200 ms after it
+    opens, which on Windows can leave it behind the main window."""
+    def front(focus):
+        try:
+            if win.winfo_exists():
+                win.lift()
+                if focus:
+                    win.focus_force()
+        except tk.TclError:
+            pass
+
+    front(True)
+    try:
+        win.after(280, lambda: front(False))
+    except tk.TclError:
+        pass
+
+
 def _fine_timer(on):
     """Windows runs Tk's timers at about 15ms by default - 64 frames a second
     at best, visibly steppy on a fast display. A 1ms resolution is asked for
@@ -9954,9 +10045,36 @@ class CropCanvas:
     # --- geometry ---
 
     def set_image(self, img):
+        old = self.image
         self.image = img
         self.disp_key = None
+        if self.ratio and img is not None:
+            if old is not None and abs(self.ratio - old.size[0] / old.size[1]) < 1e-9:
+                # "Original": the format is the photo's own shape - follow
+                # the full-resolution copy, not the rounded quick preview.
+                self.ratio = img.size[0] / img.size[1]
+            self._conform()
         self.redraw()
+
+    def _conform(self):
+        """Makes the crop exactly the chosen format again: the quick preview
+        and the original differ by the rounding of their sizes."""
+        fr = self._fraction_ratio()
+        if not fr:
+            return
+        u0, v0, u1, v1 = self.rect
+        cx, cy = (u0 + u1) / 2, (v0 + v1) / 2
+        w0, h0 = min(1.0, max(1e-6, u1 - u0)), min(1.0, max(1e-6, v1 - v0))
+        # Keep the width or keep the height - whichever fits and loses less,
+        # so a crop that filled the photo's height still does.
+        fits = [(w, h) for w, h in ((w0, w0 / fr), (h0 * fr, h0)) if w <= 1.0 and h <= 1.0]
+        if fits:
+            w, h = max(fits, key=lambda size: size[0] * size[1])
+        else:
+            w, h = (1.0, 1.0 / fr) if fr >= 1.0 else (fr, 1.0)
+        cx = min(1 - w / 2, max(w / 2, cx))
+        cy = min(1 - h / 2, max(h / 2, cy))
+        self.rect = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
 
     def _box(self):
         """Where the photo sits on the canvas: x, y, w, h."""
@@ -10021,7 +10139,19 @@ class CropCanvas:
         """The crop in pixels of a photo of `size` (the original)."""
         iw, ih = size
         u0, v0, u1, v1 = self.rect
-        return (round(u0 * iw), round(v0 * ih), round(u1 * iw), round(v1 * ih))
+        # Always inside the photo and never empty; with a fixed format the
+        # height comes from the width, so 16:9 is 16:9 to the pixel.
+        left = min(iw - 1, max(0, round(u0 * iw)))
+        top = min(ih - 1, max(0, round(v0 * ih)))
+        w = min(iw - left, max(1, round((u1 - u0) * iw)))
+        h = min(ih - top, max(1, round((v1 - v0) * ih)))
+        if self.ratio:
+            if round(w / self.ratio) <= ih - top:
+                h = max(1, round(w / self.ratio))
+            else:
+                h = ih - top
+                w = min(iw - left, max(1, round(h * self.ratio)))
+        return (left, top, left + w, top + h)
 
     def _changed(self):
         self._busy = False
@@ -10080,7 +10210,10 @@ class CropCanvas:
         part = self._hit(event.x, event.y)
         cursors = {"nw": "top_left_corner", "se": "bottom_right_corner",
                    "ne": "top_right_corner", "sw": "bottom_left_corner", "move": "fleur"}
-        self.canvas.configure(cursor=cursors.get(part, ""))
+        try:
+            self.canvas.configure(cursor=cursors.get(part, ""))
+        except tk.TclError:
+            pass  # a cursor name this system doesn't have
 
     def _press(self, event):
         if self.image is None:
@@ -10259,8 +10392,14 @@ class PhotoViewer:
             else:
                 break
         try:
+            # Per axis: a halved level rounds an odd size up, so one factor for
+            # both put the box a fraction of a pixel outside it, and Pillow
+            # refused - such photos never sharpened.
+            sw, sh = source.size
+            kx, ky = sw / iw, sh / ih
             frame = source.resize((out_w, out_h), Image.BILINEAR if fast else Image.LANCZOS,
-                                  box=(x0 * k, y0 * k, x1 * k, y1 * k))
+                                  box=(min(sw, x0 * kx), min(sh, y0 * ky),
+                                       min(sw, x1 * kx), min(sh, y1 * ky)))
             self.photo = ImageTk.PhotoImage(frame)
         except Exception:
             return
@@ -10337,7 +10476,20 @@ class PhotoViewer:
         self._anim += 1
         self.zoom_at(event.x, event.y, self.zoom * (self.WHEEL_STEP ** steps), fast=True)
 
+    def _in_nav_zone(self, x, y):
+        """Whether a click landed where a previous/next arrow sits. Those
+        clicks step through the photos; a quick second one must not also
+        count as a double-click that zooms."""
+        if not self._nav:
+            return False
+        cw, ch = self._size()
+        reach = self.NAV_R + 8
+        edge = 18 + 2 * self.NAV_R + 8
+        return abs(y - ch / 2) <= reach and (x <= edge or x >= cw - edge)
+
     def _press(self, event):
+        if self._in_nav_zone(event.x, event.y):
+            return
         self._drag = (event.x, event.y, self.fx, self.fy)
         if self.zoom > 1.001:
             self.canvas.configure(cursor="fleur")
@@ -10359,7 +10511,7 @@ class PhotoViewer:
         self.canvas.configure(cursor="")
 
     def _double(self, event):
-        if self.image is None:
+        if self.image is None or self._in_nav_zone(event.x, event.y):
             return
         if self.zoom > 1.01:
             self.animate_zoom(1.0, event.x, event.y)

@@ -157,7 +157,9 @@ _DE_AMBIGUOUS = {"an", "in", "am", "so", "was", "will", "hat", "tag", "rot", "ba
                  "buffet", "cola", "pizza", "steak", "burger", "sandwich", "wrap", "taco",
                  "tacos", "nachos", "snack", "donut", "vegan", "restaurant", "monitor", "trainer",
                  "golfer", "person", "meeting", "dessert", "sauce", "cocktail", "cocktails",
-                 "shots", "popcorn", "prosecco", "halloween", "sekt"}
+                 "shots", "popcorn", "prosecco", "halloween", "sekt",
+                 # English words too - "golf tee" must not become "golf tea"
+                 "tee", "gross", "handy", "bunt", "teller"}
 
 
 def _de_norm(text):
@@ -215,13 +217,49 @@ def _de_compound(token, depth=0):
     return None
 
 
+def _de_stem(token):
+    """The vocabulary entry a word is read as: itself, or itself minus an ending."""
+    if token in _DE_WORDS:
+        return token
+    for ending in _DE_ENDINGS:
+        stem = token[: -len(ending)]
+        if token.endswith(ending) and len(stem) >= 3 and stem in _DE_WORDS:
+            return stem
+    return None
+
+
+def _de_is_german(token, depth=0):
+    """Whether a word marks the query as German. A word both languages share
+    does not, and neither does its English plural: "drinks", "burgers",
+    "events", "monitors" used to switch translation on for English searches."""
+    if token in _DE_AMBIGUOUS:
+        return False
+    if token in _DE_MARKERS:
+        return True
+    stem = _de_stem(token)
+    if stem is not None:
+        return stem not in _DE_AMBIGUOUS
+    if depth > 2 or len(token) < 6:
+        return False
+    for i in range(3, len(token) - 2):
+        head, tail = token[:i], token[i:]
+        tail_stem = _de_stem(tail)
+        if tail_stem is None or not _de_word(tail):
+            continue
+        for left in (head, head[:-1] if head.endswith("s") else None,
+                     head[:-2] if head.endswith("es") else None,
+                     head[:-1] if head.endswith("n") else None,
+                     head[:-2] if head.endswith("en") else None):
+            if left and len(left) >= 3 and _de_compound(left, depth + 1):
+                return tail_stem not in _DE_AMBIGUOUS or _de_is_german(left, depth + 1)
+    return False
+
+
 def looks_german(text):
     if any(ch in text for ch in "äöüÄÖÜß"):
         return True
     tokens = re.findall(r"[a-z]+", _de_norm(text))
-    return any(t in _DE_MARKERS for t in tokens) or any(
-        _de_compound(t) and t not in _DE_AMBIGUOUS and len(t) >= 6 and _de_compound(t) != t
-        for t in tokens)
+    return any(_de_is_german(t) for t in tokens)
 
 
 def to_english(text):
