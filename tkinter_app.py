@@ -295,6 +295,49 @@ EMPTY_PROMPTS = [
     "an empty venue interior",
     "a close up of an object",
 ]
+# The People / No people filter. Whether someone is in a photo is read from
+# the photo's own embedding with a small linear probe: 512 weights, trained
+# on 735 photos of this library that were labelled by eye (people /
+# nobody / unclear). Comparing photos with sentences, as below, got about
+# one people photo in four wrong here; the probe separates the labelled
+# photos almost perfectly, and needs no search engine to be loaded.
+#   score >= PEOPLE_YES_MIN  someone is clearly in the photo
+#   score <= PEOPLE_NO_MAX   clearly nobody
+#   in between               unclear (a hand, tiny figures) - in neither filter
+# The weights only fit embeddings of PEOPLE_PROBE_TAG.
+PEOPLE_PROBE_TAG = "ViT-B-32/openai"
+PEOPLE_PROBE_BIAS = 0.0023
+PEOPLE_NO_MAX = -0.45
+PEOPLE_YES_MIN = 0.35
+PEOPLE_TEXT_MARGIN = 0.006  # the sentence fallback, for any other model
+PEOPLE_PROBE_B64 = (
+    "hTI+uCGrVyx9M4EwrDQfJ1IzK7ATuZ83tDWJLWss5y+vvAsufDgLpvM8oznlsZm5+rHJJJC2dbiyMAEw0zgEsII0dLdK"
+    "NqkxtDUBtHCqzbgAJLM4TKvlKaqytT0gtMAzIzZBpVg2izyqN3K3ULvQNVC1q7Rrueez8DiLtqI26zc3Nawzf7mOPx2x"
+    "xjQFtmU5MrnMNuw2Ay4QuDW5wTi3MUYwIqIMMCsyMydTOOm5ILFYujA2UiP/sWg4irWbtfI4l6P6tog4aD0VsJW0tjXw"
+    "Nb8nxidtOX+4SDCNt+qwd7XZsVEqXa58sLOz+LBquhu4TCxEsBC4ETSUsCIxprh9MXgmQDYmOI436azDLr63XjS3sM04"
+    "dSWaspu1u7d9sY0xV7apOMQ14Dq9rdC1hrIQp2k7UbaQN04uxqkctXS2FLSNJP4qrjnuNIe1c6yislU4STbRNHu137Dx"
+    "t/2oTzxStWs2dTRgsBSsDbakNFQyHDdnNF2robToumA1BjO2uYOnXSmdtUOWxTHqsko16TsHNaSzPTLqsQYmwLQ/sASu"
+    "7LduNjkzLzhRMGKwHzYltn8xO65ktUyynLf2NPuthzjDtwSzXC6+Lw0wcLWEsKS3jqu4sTezTTSauNKz5zclKYkyvyY8"
+    "OPW12LZVpyYujbrhOFgwajmQMLqh/rDJt0eworIELvu1ZDR5tg0yRTTdMqO7l7HVrp+spLbhsoUzgjnuJBk4s7VLuFMy"
+    "fDhDpVUsTLhxuJQyDjg8HzM1STXVue2qMrCKrVS4hTT1q72x2rXRLTI2yjctuAU0JbgjJwI2FbEos6KtX6NAtSe09baZ"
+    "sG257y4MN201IzlTNjW2p7m0PfqwYb+FLbY3fDNKNRS6szbzqvuvtTVJNdU0wzSys9Q28LYuMqesnLTHsV4wPbhjOWSz"
+    "jLHHOCewnbAvNSU4zjgrrHw2ZjCxKe6rpbGGuq81EjyqMR4yVDhZPDoxnTERuOEacy75NBos2q2kqEM5RrhRP7a02TWb"
+    "te82xCqWMF+4IzR5uWo5vBMlM3s3N7ZquHQncyhUuZksITammK2x37W8uJEtpTtrrhuxTLXWMwCrfLgFrZW2WSrXpbC5"
+    "grUWrJqwzTMNNKG4IzQSMKsrKDQasN0svjJ7uFc0QKIdn+U6paZjtKyz7KraMrOkurDxOOW5VTQjtB0ziyydM7ewYS+e"
+    "MZQ1ATYEsJQxXrAwtES1lixRpFe4eq6ntRSx3jYqtiO1erHzpIwvKTXIN6Y3Xrx4KVcypLZ+OaYwEa7ztr8ziLZUMxM0"
+    "JbAMNzq0LbGXtYe2uDMIOF8wfzikJKm24Dk3nPKuqzjCtoa4c7EfsOcuTTJlvOC6WCG0sV0z3iQBNw=="
+)
+_people_probe_cache = []
+
+
+def _people_probe():
+    """The probe's weights (float16 in the source, float32 in use)."""
+    if not _people_probe_cache:
+        _people_probe_cache.append(
+            np.frombuffer(base64.b64decode(PEOPLE_PROBE_B64), dtype="<f2").astype(np.float32))
+    return _people_probe_cache[0]
+
+
 # For the People / No people filter: is anyone in the photo at all - a
 # single golfer counts - rather than "guests having fun", which is what
 # ranking uses.
@@ -6782,11 +6825,13 @@ class ImageSearchApp:
     def _toggle_filter(self, group, value):
         f = self._filters_state()
         turning_on = f[group] != value
-        if (group == "people" and turning_on and self.engine.model is None
-                and self.__dict__.get("_person_vec") is None and not self._load_concept_cache()):
-            self._warm_model()
+        if group == "people" and turning_on and self._people_flags() is None:
+            if len(self.engine.paths) and self.engine.model is None:
+                self._warm_model()
             self.status_var.set(
-                "The search engine is still starting - try the people filter again in a few seconds.")
+                "The people filter isn't ready yet - try it again in a few seconds."
+                if len(self.engine.paths) else
+                "The people filter needs the photo library - load it with Check for new photos.")
             return
         f[group] = value if turning_on else None
         self._refresh_suggestions()
@@ -6794,11 +6839,7 @@ class ImageSearchApp:
             self._show_all_photos()
         else:
             self._render_results(self._last_results)
-        names = {"landscape": "landscape", "portrait": "portrait",
-                 "with": "with people", "without": "without people"}
-        on = [names[v] for v in (f["shape"], f["people"]) if v]
-        self.status_var.set(f"Showing {' and '.join(on)} photos only - click a filter again to switch it off."
-                            if on else "Filters off - showing everything again.")
+        self.status_var.set(self._filter_status())
 
     def _path_index(self):
         paths = self.engine.paths
@@ -6808,23 +6849,99 @@ class ImageSearchApp:
         return cache[2]
 
     def _people_flags(self):
-        """Per photo: is anyone in it - seen by either the "a person" check or
-        the "guests having fun" one, so a lone golfer and a table of friends
-        both count. None while that can't be told yet."""
-        try:
-            if self.__dict__.get("_person_vec") is None or self._people_vec is None:
-                if not self._load_concept_cache():
-                    if self.engine.model is None:
-                        return None
-                    embed = self.engine.embed_concept
-                    self._person_vec, self._nobody_vec = embed(PERSON_PROMPTS), embed(NOBODY_PROMPTS)
-                    self._people_vec, self._empty_vec = embed(PEOPLE_PROMPTS), embed(EMPTY_PROMPTS)
-                    self._save_concept_cache()
-            score = self.engine.score_against
-            return (((score(self._person_vec) - score(self._nobody_vec)) > 0)
-                    | ((score(self._people_vec) - score(self._empty_vec)) > 0))
-        except Exception:
+        """Per photo: 1 = someone is clearly in it, -1 = clearly nobody,
+        0 = unclear (a hand reaching for food, tiny figures far away).
+        None only when it cannot be told at all - then the filter is not
+        offered, rather than switched on and doing nothing."""
+        emb = self.engine.embeddings
+        if emb is None or len(emb) == 0:
             return None
+        cached = self.__dict__.get("_people_flags_cache")
+        if cached is not None and cached[0] is emb:
+            return cached[1]
+        try:
+            scores, lo, hi = self._people_scores(emb)
+        except Exception as exc:
+            _log_reuse(f"PEOPLE FILTER FAILED: {exc!r}")
+            return None
+        if scores is None:
+            return None
+        flags = np.zeros(len(scores), dtype=np.int8)
+        flags[scores >= hi] = 1
+        flags[scores <= lo] = -1
+        self._people_flags_cache = (emb, flags)  # holds emb, so "is" stays meaningful
+        return flags
+
+    def _people_scores(self, emb):
+        """(score per photo, the "nobody" limit, the "people" limit)."""
+        if MODEL_TAG == PEOPLE_PROBE_TAG and emb.ndim == 2 and emb.shape[1] == 512:
+            return emb @ _people_probe() + PEOPLE_PROBE_BIAS, PEOPLE_NO_MAX, PEOPLE_YES_MIN
+        # Another model: the probe does not fit it. Sentences, with a margin.
+        if self.__dict__.get("_person_vec") is None:
+            if not self._load_concept_cache():
+                if self.engine.model is None:
+                    return None, 0.0, 0.0
+                embed = self.engine.embed_concept
+                self._person_vec, self._nobody_vec = embed(PERSON_PROMPTS), embed(NOBODY_PROMPTS)
+                self._people_vec, self._empty_vec = embed(PEOPLE_PROMPTS), embed(EMPTY_PROMPTS)
+                self._save_concept_cache()
+        return (emb @ self._person_vec - emb @ self._nobody_vec,
+                -PEOPLE_TEXT_MARGIN, PEOPLE_TEXT_MARGIN)
+
+    def _people_for_filter(self):
+        """The flags while a people filter is on. If they cannot be had, the
+        filter switches itself off again and the status line says why - never
+        a chip that looks on while every photo passes."""
+        f = self._filters_state()
+        if not f["people"]:
+            return None
+        flags = self._people_flags()
+        if flags is None:
+            f["people"] = None
+            try:
+                self.root.after(0, self._people_filter_unavailable)
+            except Exception:
+                pass
+        return flags
+
+    def _people_filter_unavailable(self):
+        self._refresh_suggestions()
+        self.status_var.set(
+            "The people filter isn't ready yet, so it was switched off - try it again in a "
+            "few seconds.")
+
+    def _filter_status(self):
+        """What the filters are doing, for the status line."""
+        f = self._filters_state()
+        names = {"landscape": "landscape", "portrait": "portrait",
+                 "with": "with people", "without": "without people"}
+        on = [names[v] for v in (f["shape"], f["people"]) if v]
+        if not on:
+            return "Filters off - showing everything again."
+        text = f"Showing {' and '.join(on)} photos only"
+        if getattr(self, "_sample_view", False):
+            if f["people"]:
+                return text + (" - photos where it is unclear (a hand, someone far away) are "
+                               "left out. Click a filter again to switch it off.")
+            return text + " - click a filter again to switch it off."
+        total, shown = self.__dict__.get("_filter_counts") or (
+            len(self._last_results or []), len(getattr(self, "_shown_results", None) or []))
+        text += f": {shown} of {total}."
+        if f["people"] and total:
+            flags = self._people_flags()
+            index = self._path_index()
+            unclear = 0
+            if flags is not None:
+                for r in self._last_results:
+                    i = index.get(r[0])
+                    if i is not None and i < len(flags) and flags[i] == 0:
+                        unclear += 1
+            if unclear:
+                text += (f" {unclear} photo(s) where it is unclear (a hand, someone far away) "
+                         "are in neither people filter.")
+        if total and not shown:
+            text += " Switch a filter off to see more."
+        return text
 
     def _concept_cache_path(self):
         return os.path.join(DATA_DIR, "concepts.npz")
@@ -6864,8 +6981,11 @@ class ImageSearchApp:
         if f["shape"]:
             if self._is_landscape(idx) != (f["shape"] == "landscape"):
                 return False
-        if f["people"] and people is not None and idx < len(people):
-            if bool(people[idx]) != (f["people"] == "with"):
+        if f["people"]:
+            # Unknown or unclear photos are in neither people filter.
+            if people is None or idx >= len(people):
+                return False
+            if int(people[idx]) != (1 if f["people"] == "with" else -1):
                 return False
         return True
 
@@ -6873,7 +6993,9 @@ class ImageSearchApp:
         if not results or not self._filters_active():
             return results
         index = self._path_index()
-        people = self._people_flags() if self._filters_state()["people"] else None
+        people = self._people_for_filter()
+        if not self._filters_active():
+            return results  # the people filter was the only one and could not run
         return [r for r in results if self._passes_filters(index.get(r[0]), people)]
 
     def _filtered_sample_indices(self):
@@ -6882,7 +7004,7 @@ class ImageSearchApp:
         total = len(self.engine.paths)
         if not total:
             return []
-        people = self._people_flags() if self._filters_state()["people"] else None
+        people = self._people_for_filter()
         step = max(1, total // (ALL_PHOTOS_PREVIEW * 6))
         picked = []
         for offset in range(step):
@@ -6901,8 +7023,20 @@ class ImageSearchApp:
             var.set(f"{shown} of {total}")
         else:
             var.set("")
-        if self._filters_active() and total and not shown:
-            self.status_var.set("No photos here match these filters - switch one off to see more.")
+        # Photos, not tiles: what is drawn may fold several photos into one.
+        self._filter_counts = (total, shown)
+        if (self._filters_active() and total and shown < total
+                and not getattr(self, "_sample_view", False)):
+            # After the view's own status line ("6 photo(s) in ..."), say what
+            # the filters left out - that line used to hide it.
+            try:
+                self.root.after(0, self._show_filter_status_if_on)
+            except Exception:
+                pass
+
+    def _show_filter_status_if_on(self):
+        if self._filters_active() and not getattr(self, "_sample_view", False):
+            self.status_var.set(self._filter_status())
 
     # ---------- picking several photos ----------
 
