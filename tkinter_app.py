@@ -3061,6 +3061,8 @@ class ImageSearchApp:
                     self._support_fallback(event[1], event[2], event[3])
                 elif kind == "shared_invite":
                     self._offer_invite(event[1], event[2])
+                elif kind == "invite_fallback":
+                    self._invite_fallback(event[1], event[2], event[3])
                 elif kind in ("shared_status", "update_status"):
                     self.status_var.set(event[1])
                 elif kind == "update_ready":
@@ -4178,20 +4180,45 @@ class ImageSearchApp:
         threading.Thread(target=work, daemon=True).start()
 
     def _offer_invite(self, name, emails):
-        """Offers to open a ready-written invitation in the user's email app
-        (Outlook) - they read it and press Send themselves."""
+        """Sends the people just added a short invitation, straight from the
+        user's own mailbox (it shows in their Sent Items) - one click, no
+        email app. If the organisation doesn't let the app send mail, the
+        same invitation opens ready-written in the email app instead."""
         if not emails:
             return
+        emails = list(emails)
         who = emails[0] if len(emails) == 1 else f"{len(emails)} people"
         if not messagebox.askyesno(
             "Invite people",
-            f"Write an invitation email to {who} about “{name}”?\n\n"
-            "It opens in your email app so you can read it and send it yourself.",
+            f"Send {who} an email that you've shared “{name}” with them?\n\n"
+            "It goes out from your own mailbox.",
         ):
             return
+        subject, body = self._invite_text(name)
+        self.status_var.set(f"Sending the invitation to {who}…")
+
+        def work():
+            try:
+                client = self._sp_client(True)
+                if client is None:
+                    raise RuntimeError("not signed in")
+                client.send_mail(emails, subject, body)
+                _log_reuse(f"INVITE SENT: {name!r} to {len(emails)} recipient(s)")
+                self.event_queue.put(("shared_status", f"Invitation sent to {who}."))
+            except Exception as exc:
+                _log_reuse(f"INVITE MAIL FAILED: {exc!r}")
+                self.event_queue.put(("invite_fallback", emails, subject, body))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _invite_text(self, name):
         import config
 
         download = getattr(config, "DOWNLOAD_URL", "")
+        # A link into the private GitHub repository opens for nobody else,
+        # so it is only offered once DOWNLOAD_URL points somewhere shared.
+        if "github.com" in download:
+            download = ""
         subject = f"I've shared the photo collection “{name}” with you"
         body = (
             "Hi,\n\n"
@@ -4204,6 +4231,12 @@ class ImageSearchApp:
                else "Don't have the app yet? Just reply and I'll send it to you.\n\n")
             + "Best"
         )
+        return subject, body
+
+    def _invite_fallback(self, emails, subject, body):
+        """Sending from the app wasn't possible: the invitation opens in the
+        email app, ready to send."""
+        self.status_var.set("Couldn't send from the app - the invitation opens in your email app instead.")
         url = "mailto:" + ",".join(emails) + "?" + urllib.parse.urlencode(
             {"subject": subject, "body": body}, quote_via=urllib.parse.quote
         )
@@ -4211,7 +4244,7 @@ class ImageSearchApp:
             _open_external(url)
         except Exception as exc:
             _log_reuse(f"INVITE EMAIL FAILED: {exc!r}")
-            messagebox.showinfo(APP_NAME, "Couldn't open your email app - please send the invitation yourself.")
+            messagebox.showinfo(APP_NAME, "Couldn't send the invitation - please let them know yourself.")
 
     def _manage_shared(self, shown_name):
         record = self._shared_by_name().get(shown_name)

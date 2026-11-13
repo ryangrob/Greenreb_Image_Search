@@ -101,8 +101,10 @@ class SharePointClient:
 
     def send_mail(self, to, subject, body):
         """Sends an email from the signed-in user's own mailbox (it appears
-        in their Sent Items). The first time, Microsoft may ask them to
-        allow the app to send mail on their behalf."""
+        in their Sent Items). `to` is one address or a list of them. The
+        first time, Microsoft may ask them to allow the app to send mail on
+        their behalf."""
+        recipients = [to] if isinstance(to, str) else [a for a in to if a]
         accounts = self._app.get_accounts()
         result = None
         if accounts:
@@ -120,7 +122,7 @@ class SharePointClient:
                 "message": {
                     "subject": subject,
                     "body": {"contentType": "Text", "content": body},
-                    "toRecipients": [{"emailAddress": {"address": to}}],
+                    "toRecipients": [{"emailAddress": {"address": a}} for a in recipients],
                 },
                 "saveToSentItems": True,
             },

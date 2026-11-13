@@ -8,7 +8,7 @@ releases folder on SharePoint and launcher.py runs that copy instead of the
 one inside the .exe.
 """
 
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.2.1"
 
 # What people see the app called (window title, sidebar, intro, About).
 # Folders, settings and file names keep "ImageSearch" so a rename never
@@ -20,6 +20,8 @@ APP_AUTHOR = "Ryan Grob"
 # what they are about to get. Keep each line short; the first two are the
 # summary on the update card.
 WHATS_NEW = [
+    "Invitations to shared collections are sent for you - no email app needed",
+    "A 6-step tour, now with shared collections",
     "Topshot: a new name, icon and green look",
     "Updates itself - “Restart to update” appears here",
     "Shared collections for your team, with email invites",
