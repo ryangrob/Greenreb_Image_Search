@@ -96,6 +96,859 @@ def _data_dir():
 
 DATA_DIR = _data_dir()
 
+# ---------- settings read at start: theme, text size, language ----------
+#
+# Three choices shape the whole window, so they are read here, before the
+# first colour or font is defined, and take effect on the next start:
+# the theme (the palette below is passed through _c), the text size (every
+# font size goes through _fs) and the language (texts go through t).
+# Everything else in settings.json is read where it is used.
+
+SETTINGS_PATH = os.path.join(DATA_DIR, "sharepoint_cache", "settings.json")
+
+
+def _read_settings_file():
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+_SETTINGS = _read_settings_file()
+
+
+def _write_settings_file():
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+        tmp = SETTINGS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_SETTINGS, f, ensure_ascii=False)
+        os.replace(tmp, SETTINGS_PATH)
+    except OSError:
+        pass
+
+
+def _setting(key, default=None):
+    value = _SETTINGS.get(key)
+    return default if value is None else value
+
+
+def _set_setting(key, value):
+    if value is None:
+        _SETTINGS.pop(key, None)
+    else:
+        _SETTINGS[key] = value
+    _write_settings_file()
+
+
+def _top_k():
+    """How many results a search shows (Settings > Search)."""
+    try:
+        return max(24, min(600, int(_setting("results_count", DEFAULT_TOP_K))))
+    except (TypeError, ValueError):
+        return DEFAULT_TOP_K
+
+
+# --- theme ---
+
+def _system_theme():
+    """What the computer is set to: "light" or "dark"."""
+    try:
+        if IS_MAC:
+            out = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"],
+                                 capture_output=True, text=True, timeout=3)
+            return "dark" if "dark" in (out.stdout or "").lower() else "light"
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        ) as key:
+            return "light" if winreg.QueryValueEx(key, "AppsUseLightTheme")[0] else "dark"
+    except Exception:
+        return "dark"
+
+
+THEME_SETTING = _setting("theme", "dark")
+if THEME_SETTING not in ("dark", "light", "system"):
+    THEME_SETTING = "dark"
+_THEME = _system_theme() if THEME_SETTING == "system" else THEME_SETTING
+
+# The light theme: every colour of the dark one and what it becomes. A
+# near-white page, a slightly tinted sidebar, hairline borders, near-black
+# text, and the same green - a step deeper, so it holds against white.
+# Colours that are not listed stay as they are in both themes (white on
+# the green button, the black behind a dimmed window, lines over a photo).
+_LIGHT_THEME = {
+    "#090b0a": "#f6f8f7",  # page
+    "#0f1311": "#edf1ef",  # sidebar
+    "#141917": "#ffffff",  # cards, fields, menus
+    "#1c2420": "#eef2f0",  # hover on a card
+    "#17201b": "#e3e9e6",  # hover in the sidebar
+    "#123628": "#d2eee2",  # selected
+    "#1b4a37": "#bce5d3",  # a collection about to take a photo
+    "#1d2621": "#e2e8e5",  # quiet buttons, tracks
+    "#24302a": "#d5ddd9",  # hairlines
+    "#2a3830": "#cad4cf",  # menu border, quiet button hover
+    "#33443b": "#bbc7c1",
+    "#3a4c42": "#adbab3",
+    "#3f4a44": "#98a69f",
+    "#fafafa": "#111614",  # text
+    "#e5e5e5": "#27302c",  # softer text
+    "#9ca8a2": "#55625b",  # muted text
+    "#84928b": "#5e6b65",  # system items
+    "#6b7a72": "#67746d",  # faint text
+    "#10a573": "#0e9467",  # the green
+    "#14c088": "#0b7f58",  # its hover: darker on a light page
+    "#34d399": "#0a7d57",  # accent text and dots
+    "#1f6b4c": "#9ad9be",  # the glow when a photo lands
+    "#a7d8c4": "#dcf1e8",  # text on a disabled green button
+    "#f87171": "#cf3636",  # errors
+    "#7a2330": "#f7d6d6",  # hover on a destructive item
+}
+
+
+def _c(colour):
+    """A colour of the dark palette, as the current theme shows it."""
+    if _THEME != "light":
+        return colour
+    return _LIGHT_THEME.get(colour.lower(), colour)
+
+
+# Behind a photo it stays dark in both themes, as in any photo tool: the
+# large preview, compare, and the crop area of the export window.
+PHOTO_BG = "#" + "090b0a"
+
+# --- text size ---
+
+TEXT_SCALES = {"small": 0.9, "default": 1.0, "large": 1.15, "xlarge": 1.3}
+TEXT_SIZE_SETTING = _setting("text_size", "default")
+if TEXT_SIZE_SETTING not in TEXT_SCALES:
+    TEXT_SIZE_SETTING = "default"
+FONT_SCALE = TEXT_SCALES[TEXT_SIZE_SETTING]
+
+
+def _fs(px):
+    """A font size (or a length that has to grow with the text)."""
+    if FONT_SCALE == 1.0:
+        return px
+    return max(1, int(round(px * FONT_SCALE)))
+
+
+def _scale_ctk_default_font():
+    """Widgets that were given no font use CustomTkinter's default one."""
+    if FONT_SCALE == 1.0:
+        return
+    try:
+        theme = ctk.ThemeManager.theme["CTkFont"]
+        for entry in [theme] + [v for v in theme.values() if isinstance(v, dict)]:
+            if isinstance(entry.get("size"), (int, float)):
+                entry["size"] = _fs(entry["size"])
+    except Exception:
+        pass
+
+
+def _install_text_scale():
+    """Controls with text in them get taller with it."""
+    def taller(cls):
+        original = cls.__init__
+
+        def __init__(self, *args, **kwargs):
+            height = kwargs.get("height")
+            if isinstance(height, (int, float)) and height > 8:
+                kwargs["height"] = _fs(height)
+            original(self, *args, **kwargs)
+
+        cls.__init__ = __init__
+
+    for name in ("CTkButton", "CTkEntry", "CTkSegmentedButton", "CTkCheckBox", "CTkSwitch"):
+        cls = getattr(ctk, name, None)
+        if cls is not None:
+            taller(cls)
+
+
+# --- language ---
+
+def _system_language():
+    """"de" when the computer is set to German, otherwise "en"."""
+    try:
+        if IS_MAC:
+            out = subprocess.run(["defaults", "read", "-g", "AppleLanguages"],
+                                 capture_output=True, text=True, timeout=3)
+            first = re.search(r"[A-Za-z]{2}", out.stdout or "")
+            return "de" if first and first.group(0).lower() == "de" else "en"
+        if sys.platform.startswith("win"):
+            import ctypes
+
+            return "de" if ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF == 0x07 else "en"
+        return "de" if (os.environ.get("LANG") or "").lower().startswith("de") else "en"
+    except Exception:
+        return "en"
+
+
+LANGUAGE_SETTING = _setting("language", "system")
+if LANGUAGE_SETTING not in ("system", "en", "de"):
+    LANGUAGE_SETTING = "system"
+LANGUAGE = _system_language() if LANGUAGE_SETTING == "system" else LANGUAGE_SETTING
+
+# English -> German. Keys are the English texts exactly as the app builds
+# them (without the spaces around them). "{}" stands for any inserted text,
+# "{n}" for an inserted number; in the German text "{0}", "{1}" ... put the
+# inserted values back in, and "{t0}" puts one back translated.
+_DE = {
+    # --- sidebar and header ---
+    "Marketing photo library": "Marketing-Fotobibliothek",
+    "LIBRARY": "BIBLIOTHEK",
+    "COLLECTIONS": "SAMMLUNGEN",
+    "SYSTEM": "SYSTEM",
+    "All photos": "Alle Fotos",
+    "Favourites": "Favoriten",
+    "Favourites ({n})": "Favoriten ({0})",
+    "Search history": "Suchverlauf",
+    "Search history ({n})": "Suchverlauf ({0})",
+    "Check for new photos": "Nach neuen Fotos suchen",
+    "Updates": "Updates",
+    "Local folder": "Lokaler Ordner",
+    "Local folder…": "Lokaler Ordner…",
+    "Settings": "Einstellungen",
+    "Support": "Support",
+    "Tour": "Tour",
+    "About": "Über",
+    "About {}": "Über {0}",
+    "More": "Mehr",
+    "Check for updates": "Nach Updates suchen",
+    "Take the tour": "Tour starten",
+    "What's new": "Neuigkeiten",
+    "WHAT'S NEW": "NEUIGKEITEN",
+    "Restart to update": "Neu starten und aktualisieren",
+    "No folder selected": "Kein Ordner ausgewählt",
+    "SharePoint: Fotos & Videos (all subfolders)": "SharePoint: Fotos & Videos (alle Unterordner)",
+    "No collections.\nClick + to make one.": "Keine Sammlungen.\nMit + eine anlegen.",
+    # --- search ---
+    "Describe a photo - in English or German…": "Foto beschreiben - auf Deutsch oder Englisch…",
+    "Search your favourites...": "Favoriten durchsuchen...",
+    "Search within {}...": "In {0} suchen...",
+    "Find similar…": "Ähnliche finden…",
+    "Search": "Suchen",
+    "Recent": "Zuletzt",
+    "Landscape": "Querformat",
+    "Portrait": "Hochformat",
+    "People": "Personen",
+    "No people": "Ohne Personen",
+    "{n} of {n}": "{0} von {1}",
+    "Loading your photo library...": "Fotobibliothek wird geladen...",
+    "Loading your photo library…": "Fotobibliothek wird geladen…",
+    "No photos yet - click Check for new photos (bottom left) to load the library from SharePoint. The first time takes a few minutes.":
+        "Noch keine Fotos - unten links auf „Nach neuen Fotos suchen“ klicken, um die Bibliothek aus SharePoint zu laden. Beim ersten Mal dauert das einige Minuten.",
+    "{} photos ready. Type what you are looking for, or pick a collection on the left.":
+        "{0} Fotos bereit. Suchbegriff eingeben oder links eine Sammlung wählen.",
+    "{} is empty - drag photos onto it, or right-click a photo and choose 'Add to {}'.":
+        "{0} ist leer - Fotos hineinziehen oder per Rechtsklick auf ein Foto „Hinzufügen zu {1}“ wählen.",
+    "{n} photo(s) in {}. Search to narrow it down.": "{0} Foto(s) in {1}. Suchen, um einzugrenzen.",
+    "{n} photo(s) in {} (showing first {n}). Search to narrow it down.":
+        "{0} Foto(s) in {1} (die ersten {2} werden angezeigt). Suchen, um einzugrenzen.",
+    "No favourites yet - click the star on any result to save it.":
+        "Noch keine Favoriten - den Stern auf einem Foto anklicken, um es zu merken.",
+    "{n} favourite(s).": "{0} Favorit(en).",
+    "Still loading photos - one moment, then try that search again.":
+        "Fotos werden noch geladen - einen Moment, dann die Suche erneut starten.",
+    "Still loading photos - one moment, then try again.":
+        "Fotos werden noch geladen - einen Moment, dann erneut versuchen.",
+    "Index the folder first before searching.": "Vor dem Suchen zuerst den Ordner indexieren.",
+    "Load the photo library first.": "Zuerst die Fotobibliothek laden.",
+    "Pick a photo to find similar ones": "Foto wählen, um ähnliche zu finden",
+    "Finding photos like {}...": "Suche nach Fotos wie {0}...",
+    "No searches yet - your search history will appear here.":
+        "Noch keine Suchen - der Suchverlauf erscheint hier.",
+    "{n} previous search(es). Click one to run it again.":
+        "{0} frühere Suche(n). Anklicken, um erneut zu suchen.",
+    "Clear search history": "Suchverlauf löschen",
+    "Clear all {n} searches from your history?\n\nThis also clears the Recent shortcuts under the search box. It can't be undone.":
+        "Alle {0} Suchen aus dem Verlauf löschen?\n\nDamit verschwinden auch die Schnellzugriffe unter dem Suchfeld. Das lässt sich nicht rückgängig machen.",
+    "Could not clear the search history.": "Der Suchverlauf konnte nicht gelöscht werden.",
+    "Search history cleared.": "Suchverlauf gelöscht.",
+    "Found {n} results.{}": "{0} Ergebnisse gefunden.{t1}",
+    "Close-ups first, people shots below.": "Nahaufnahmen zuerst, Fotos mit Personen darunter.",
+    "Most visually similar first.": "Die ähnlichsten zuerst.",
+    "Searched as “{}”.": "Gesucht als „{0}“.",
+    "Searched as “{}”.{}": "Gesucht als „{0}“.{t1}",
+    "The search engine is still starting - try the people filter again in a few seconds.":
+        "Die Suche startet noch - den Personenfilter in ein paar Sekunden erneut versuchen.",
+    "Filters off - showing everything again.": "Filter aus - es wird wieder alles angezeigt.",
+    "No photos here match these filters - switch one off to see more.":
+        "Kein Foto passt zu diesen Filtern - einen ausschalten, um mehr zu sehen.",
+    "Loading the search model...": "Suchmodell wird geladen...",
+    "Model loaded.": "Suchmodell geladen.",
+    "Ready to search.": "Bereit zum Suchen.",
+    "Error.": "Fehler.",
+    # --- loading the library ---
+    "Choose a folder of images": "Ordner mit Bildern wählen",
+    "Loaded {n} cached images. Click 'Index Folder' to refresh.":
+        "{0} gespeicherte Bilder geladen. Zum Aktualisieren „Ordner indexieren“ wählen.",
+    "No cached index found. Click 'Index Folder' to build one.":
+        "Kein gespeicherter Index gefunden. „Ordner indexieren“ wählen, um einen zu erstellen.",
+    "Signing in to Microsoft...": "Anmeldung bei Microsoft...",
+    "Sign-in failed: {}": "Anmeldung fehlgeschlagen: {0}",
+    "Warning: couldn't upload shared index: {}": "Warnung: Der geteilte Index konnte nicht hochgeladen werden: {0}",
+    "Reading folder names... {n}/{n}": "Ordnernamen werden gelesen... {0}/{1}",
+    "Verifying shared index {n}/{n}...": "Geteilter Index wird geprüft {0}/{1}...",
+    "Sharing index for folder {n}/{n} with the team...": "Index für Ordner {0}/{1} wird mit dem Team geteilt...",
+    "Couldn't read shared index: {}": "Der geteilte Index konnte nicht gelesen werden: {0}",
+    "Skipped {}: {}": "Übersprungen {0}: {1}",
+    "Indexing {n} image(s)...": "{0} Bild(er) werden indexiert...",
+    "Checking SharePoint for changes...": "SharePoint wird auf Änderungen geprüft...",
+    "Delta expired - doing a full resync...": "Änderungsstand abgelaufen - vollständiger Abgleich...",
+    "Syncing team favourites and feedback...": "Team-Favoriten und Feedback werden abgeglichen...",
+    "Downloading {}...": "{0} wird heruntergeladen...",
+    "Failed to download {}: {}": "Download von {0} fehlgeschlagen: {1}",
+    "Indexing... {n}/{n}": "Indexierung... {0}/{1}",
+    "Indexed {n} images. Ready to search.": "{0} Bilder indexiert. Bereit zum Suchen.",
+    "Indexing from SharePoint... {n}/{n}": "Indexierung aus SharePoint... {0}/{1}",
+    "{n} image(s) failed (e.g. lost connection) and will automatically retry next run.":
+        "{0} Bild(er) fehlgeschlagen (z. B. Verbindung unterbrochen) - sie werden beim nächsten Mal automatisch wiederholt.",
+    "Indexed {n} image(s) total ({n} folder(s) had changes). Ready to search.{}":
+        "Insgesamt {0} Bild(er) indexiert ({1} Ordner mit Änderungen). Bereit zum Suchen.{t2}",
+    "Up to date - {n} image(s) already indexed. Ready to search.{}":
+        "Aktuell - {0} Bild(er) bereits indexiert. Bereit zum Suchen.{t1}",
+    "Saved to {}": "Gespeichert unter {0}",
+    # --- preview, copy, export, details ---
+    "Preview": "Vorschau",
+    "Copy image": "Bild kopieren",
+    "Open original": "Original öffnen",
+    "Export…": "Exportieren…",
+    "Details…": "Details…",
+    "Close": "Schließen",
+    "Copy": "Kopieren",
+    "Compare": "Vergleichen",
+    "Fit": "Einpassen",
+    "{}   (sharpening…)": "{0}   (wird schärfer…)",
+    "Zoom and move one photo - the other follows.": "Ein Foto zoomen und verschieben - das andere folgt.",
+    "Fetching the full-resolution photo...": "Foto wird in voller Auflösung geladen...",
+    "Copied at full resolution - {n} x {n}.": "In voller Auflösung kopiert - {0} x {1}.",
+    "Could not copy this photo to the clipboard.": "Dieses Foto konnte nicht in die Zwischenablage kopiert werden.",
+    "EXPORT": "EXPORT",
+    "FORMAT": "FORMAT",
+    "FILE": "DATEI",
+    "Export · {}": "Export · {0}",
+    "Original": "Original",
+    "Free": "Frei",
+    "16:9 Landscape": "16:9 Querformat",
+    "9:16 Story": "9:16 Story",
+    "4:5 Instagram post": "4:5 Instagram-Beitrag",
+    "1:1 Square": "1:1 Quadrat",
+    "Loading the full-resolution original…": "Original wird in voller Auflösung geladen…",
+    "Save…": "Speichern…",
+    "Cancel": "Abbrechen",
+    "PNG · lossless": "PNG · verlustfrei",
+    "JPEG · maximum quality, no subsampling": "JPEG · höchste Qualität, ohne Farbunterabtastung",
+    "{n} × {n} px from the {n} × {n} original\n{}": "{0} × {1} px aus dem Original mit {2} × {3} px\n{t4}",
+    "Save the photo": "Foto speichern",
+    "Couldn't save there - pick another folder.": "Speichern dort nicht möglich - anderen Ordner wählen.",
+    "Saved {n} × {n} px.": "{0} × {1} px gespeichert.",
+    "Exported {}.": "{0} exportiert.",
+    "Copying…": "Wird kopiert…",
+    "Copied {n} × {n} px - paste it anywhere.": "{0} × {1} px kopiert - überall einfügbar.",
+    "Couldn't copy - try again.": "Kopieren fehlgeschlagen - erneut versuchen.",
+    "Couldn't load the original - check your connection.": "Original konnte nicht geladen werden - Verbindung prüfen.",
+    "DETAILS": "DETAILS",
+    "This computer": "Dieser Computer",
+    "Dimensions": "Abmessungen",
+    "File size": "Dateigröße",
+    "Taken": "Aufgenommen",
+    "Camera": "Kamera",
+    "Added": "Hinzugefügt",
+    "Added by": "Hinzugefügt von",
+    "Folder": "Ordner",
+    "Open in SharePoint": "In SharePoint öffnen",
+    # --- collections ---
+    "Add to collection": "Zu Sammlung hinzufügen",
+    "Move to": "Verschieben nach",
+    "Remove from {}": "Aus {0} entfernen",
+    "Rename…": "Umbenennen…",
+    "Remove…": "Entfernen…",
+    "New collection…": "Neue Sammlung…",
+    "New shared collection…": "Neue geteilte Sammlung…",
+    "New collection": "Neue Sammlung",
+    "Name for the new collection:": "Name der neuen Sammlung:",
+    "Rename collection": "Sammlung umbenennen",
+    "New name for “{}”:": "Neuer Name für „{0}“:",
+    "Remove collection": "Sammlung entfernen",
+    "Remove “{}”?\n\n{}": "„{0}“ entfernen?\n\n{t1}",
+    "The {n} photo(s) in it stay in the library - only the collection goes.":
+        "Die {0} Foto(s) darin bleiben in der Bibliothek - nur die Sammlung wird entfernt.",
+    "It is empty.": "Sie ist leer.",
+    "Could not save that collection - see crash.log.": "Die Sammlung konnte nicht gespeichert werden - siehe crash.log.",
+    "Please keep collection names to {n} characters.": "Sammlungsnamen bitte auf {0} Zeichen beschränken.",
+    "“{}” is already used by the app - please choose another name.":
+        "„{0}“ wird bereits von der App verwendet - bitte einen anderen Namen wählen.",
+    "There is already a collection called “{}”.": "Es gibt bereits eine Sammlung namens „{0}“.",
+    "Created {} - drag photos onto it, or right-click a photo and choose 'Add to {}'.":
+        "{0} angelegt - Fotos hineinziehen oder per Rechtsklick auf ein Foto „Hinzufügen zu {1}“ wählen.",
+    "Renamed {} to {}.": "{0} in {1} umbenannt.",
+    "Removed {}.": "{0} entfernt.",
+    "Only photos from the shared drive can be collected.": "Nur Fotos vom geteilten Laufwerk können gesammelt werden.",
+    "Already in {}.": "Bereits in {0}.",
+    "Added to {} - {n} photo(s).": "Zu {0} hinzugefügt - {1} Foto(s).",
+    "Removed from {} - {n} photo(s) left.": "Aus {0} entfernt - noch {1} Foto(s).",
+    "Moved to {}. {n} photo(s) left in {}.": "Nach {0} verschoben. Noch {1} Foto(s) in {2}.",
+    "Moved to {} (it was already in {}). {n} photo(s) left in {}.":
+        "Nach {0} verschoben (war bereits in {1}). Noch {2} Foto(s) in {3}.",
+    "Removed from favourites.": "Aus den Favoriten entfernt.",
+    # --- picking several ---
+    "{n} selected": "{0} ausgewählt",
+    "Add to…": "Hinzufügen zu…",
+    "Move to…": "Verschieben nach…",
+    "Favourite": "Favorit",
+    "Remove from favourites": "Aus Favoriten entfernen",
+    "Add {n} to": "{0} hinzufügen zu",
+    "Move {n} to": "{0} verschieben nach",
+    "Remove {n} from {}": "{0} aus {1} entfernen",
+    "Moved {n} photo(s) to {}.": "{0} Foto(s) nach {1} verschoben.",
+    "Moved {n} photo(s) to {} ({n} already there).": "{0} Foto(s) nach {1} verschoben ({2} bereits vorhanden).",
+    "Added {n} photo(s) to {}.": "{0} Foto(s) zu {1} hinzugefügt.",
+    "Added {n} photo(s) to {} ({n} already there).": "{0} Foto(s) zu {1} hinzugefügt ({2} bereits vorhanden).",
+    "Removed {n} photo(s) from {}.": "{0} Foto(s) aus {1} entfernt.",
+    "Getting {n} photos ready to paste…": "{0} Fotos werden zum Einfügen vorbereitet…",
+    "Fetching photo {n} of {n}…": "Foto {0} von {1} wird geladen…",
+    "Copied {n} photos at full resolution - paste them into PowerPoint, Teams or an email.":
+        "{0} Fotos in voller Auflösung kopiert - in PowerPoint, Teams oder eine E-Mail einfügen.",
+    "Couldn't copy those photos - try again in a moment.": "Die Fotos konnten nicht kopiert werden - gleich noch einmal versuchen.",
+    "Save {n} photo(s) to…": "{0} Foto(s) speichern unter…",
+    "Saving {n} photo(s)…": "{0} Foto(s) werden gespeichert…",
+    "Saving photo {n} of {n}…": "Foto {0} von {1} wird gespeichert…",
+    "Saved {n} photo(s) to {}.": "{0} Foto(s) in {1} gespeichert.",
+    "Couldn't save all of them - check the folder and try again.":
+        "Nicht alle konnten gespeichert werden - Ordner prüfen und erneut versuchen.",
+    "Removed {n} from favourites.": "{0} aus den Favoriten entfernt.",
+    "Starred {n} photo(s) - find them under Favourites.": "{0} Foto(s) markiert - zu finden unter Favoriten.",
+    # --- shared collections ---
+    "Syncing shared collections…": "Geteilte Sammlungen werden abgeglichen…",
+    "Couldn't reach SharePoint to sync shared collections - try again in a moment.":
+        "SharePoint nicht erreichbar, geteilte Sammlungen nicht abgeglichen - gleich noch einmal versuchen.",
+    "That shared collection was removed, or you are no longer in it.":
+        "Diese geteilte Sammlung wurde entfernt oder die Freigabe wurde aufgehoben.",
+    "Shared collections are up to date - {n} shared with you.":
+        "Geteilte Sammlungen sind aktuell - {0} freigegeben.",
+    "No shared collections yet - use + to create one.": "Noch keine geteilten Sammlungen - mit + eine anlegen.",
+    "That shared collection no longer exists on SharePoint.": "Diese geteilte Sammlung gibt es auf SharePoint nicht mehr.",
+    "Couldn't save that change to SharePoint, so others won't see it yet. Check your connection and try again.":
+        "Die Änderung konnte nicht auf SharePoint gespeichert werden, andere sehen sie noch nicht. Verbindung prüfen und erneut versuchen.",
+    "Shared with {n} person": "Geteilt mit {0} Person",
+    "Shared with {n} people": "Geteilt mit {0} Personen",
+    "Shared with {n} person · by {}": "Geteilt mit {0} Person · von {1}",
+    "Shared with {n} people · by {}": "Geteilt mit {0} Personen · von {1}",
+    "Name and people…": "Name und Personen…",
+    "Sync now": "Jetzt abgleichen",
+    "Delete shared collection…": "Geteilte Sammlung löschen…",
+    "Leave this collection…": "Diese Sammlung verlassen…",
+    "Everyone you list sees this collection in their {} and can add or remove photos. They need access to the photo library on SharePoint.":
+        "Alle aufgeführten Personen sehen diese Sammlung in ihrem {0} und können Fotos hinzufügen oder entfernen. Sie brauchen Zugriff auf die Fotobibliothek in SharePoint.",
+    "Name": "Name",
+    "People - work email addresses, one per line": "Personen - geschäftliche E-Mail-Adressen, eine pro Zeile",
+    "Please give the collection a name.": "Bitte einen Namen für die Sammlung eingeben.",
+    "Please keep the name to {n} characters.": "Den Namen bitte auf {0} Zeichen beschränken.",
+    "“{}” is used by the app - please choose another name.": "„{0}“ wird von der App verwendet - bitte einen anderen Namen wählen.",
+    "These don't look like email addresses: {}": "Das sehen nicht wie E-Mail-Adressen aus: {0}",
+    "New shared collection": "Neue geteilte Sammlung",
+    "Create": "Anlegen",
+    "Creating {} on SharePoint…": "{0} wird auf SharePoint angelegt…",
+    "Created {}, shared with {n} person. They see it after their next sync - or straight away if they click Sync.":
+        "{0} angelegt, geteilt mit {1} Person. Sie sieht die Sammlung nach dem nächsten Abgleich - oder sofort per Klick auf Abgleichen.",
+    "Created {}, shared with {n} people. They see it after their next sync - or straight away if they click Sync.":
+        "{0} angelegt, geteilt mit {1} Personen. Sie sehen die Sammlung nach dem nächsten Abgleich - oder sofort per Klick auf Abgleichen.",
+    "Couldn't create the shared collection on SharePoint - check your connection and try again.":
+        "Die geteilte Sammlung konnte nicht auf SharePoint angelegt werden - Verbindung prüfen und erneut versuchen.",
+    "Invite people": "Personen einladen",
+    "Send {} an email that you've shared “{}” with them?\n\nIt goes out from your own mailbox.":
+        "{0} per E-Mail mitteilen, dass „{1}“ geteilt wurde?\n\nDie E-Mail wird aus dem eigenen Postfach gesendet.",
+    "Send {n} people an email that you've shared “{}” with them?\n\nIt goes out from your own mailbox.":
+        "{0} Personen per E-Mail mitteilen, dass „{1}“ geteilt wurde?\n\nDie E-Mail wird aus dem eigenen Postfach gesendet.",
+    "Sending the invitation to {}…": "Einladung an {0} wird gesendet…",
+    "Sending the invitation to {n} people…": "Einladung an {0} Personen wird gesendet…",
+    "Invitation sent to {}.": "Einladung an {0} gesendet.",
+    "Invitation sent to {n} people.": "Einladung an {0} Personen gesendet.",
+    "Couldn't send from the app - the invitation opens in your email app instead.":
+        "Senden aus der App nicht möglich - die Einladung öffnet sich stattdessen im E-Mail-Programm.",
+    "Couldn't send the invitation - please let them know yourself.":
+        "Die Einladung konnte nicht gesendet werden - bitte selbst Bescheid geben.",
+    "Only {} can change the name and people of this collection.":
+        "Nur {0} kann Namen und Personen dieser Sammlung ändern.",
+    "Shared collection": "Geteilte Sammlung",
+    "Save": "Speichern",
+    "Saving {}…": "{0} wird gespeichert…",
+    "Saved {} - shared with {n} people.": "{0} gespeichert - geteilt mit {1} Personen.",
+    "Delete shared collection": "Geteilte Sammlung löschen",
+    "Delete “{}” for everyone it is shared with?\n\nThe photos stay in the library - only the collection goes.":
+        "„{0}“ für alle löschen, mit denen sie geteilt ist?\n\nDie Fotos bleiben in der Bibliothek - nur die Sammlung wird entfernt.",
+    "Deleted {}.": "{0} gelöscht.",
+    "Leave collection": "Sammlung verlassen",
+    "Leave “{}”? It disappears from your sidebar; the others keep it.":
+        "„{0}“ verlassen? Sie verschwindet aus der eigenen Seitenleiste; die anderen behalten sie.",
+    "You left {}.": "{0} verlassen.",
+    "Choose folder…": "Ordner wählen…",
+    "Index folder": "Ordner indexieren",
+    # --- support ---
+    "How can we help?": "Wie können wir helfen?",
+    "Your message goes straight to {}, sent from your Greenreb email so a reply comes back to you.":
+        "Die Nachricht geht direkt an {0}, gesendet von der eigenen Greenreb-Adresse, damit die Antwort ankommt.",
+    "Problem": "Problem",
+    "Idea": "Idee",
+    "Question": "Frage",
+    "What's on your mind?": "Worum geht es?",
+    "Include app details (version, system, recent error log)": "App-Details mitsenden (Version, System, letzte Fehlermeldungen)",
+    "Send": "Senden",
+    "Please write a few words first.": "Bitte zuerst ein paar Worte schreiben.",
+    "Sending your message…": "Nachricht wird gesendet…",
+    "Thanks - your message was sent to {}.": "Danke - die Nachricht wurde an {0} gesendet.",
+    "Couldn't send from the app - opening it in your email app instead.":
+        "Senden aus der App nicht möglich - die Nachricht öffnet sich im E-Mail-Programm.",
+    "Please email {} - your message couldn't be sent.": "Bitte eine E-Mail an {0} schreiben - die Nachricht konnte nicht gesendet werden.",
+    # --- tour ---
+    "Skip": "Überspringen",
+    "How to browse through the library": "So lassen sich Fotos finden",
+    "Once your photos are loaded - that's the last step of this tour - type what you need in plain English, like “burger on a tray” or “friends cheering at night”, and press Enter. Below: your recent searches, and filters for landscape, portrait and people.":
+        "Sobald die Fotos geladen sind - das ist der letzte Schritt dieser Tour - einfach eingeben, was gebraucht wird, zum Beispiel „Burger mit Pommes“ oder „Freunde jubeln bei Nacht“, und Enter drücken. Darunter: die letzten Suchen und Filter für Querformat, Hochformat und Personen.",
+    "Type what you need in plain English - “burger on a tray”, “friends cheering at night” - and press Enter. Got a photo that's close? Use Find similar. Below: your recent searches, and filters for landscape, portrait and people.":
+        "Einfach eingeben, was gebraucht wird - „Burger mit Pommes“, „Freunde jubeln bei Nacht“ - und Enter drücken. Ein Foto passt schon fast? „Ähnliche finden“ nutzen. Darunter: die letzten Suchen und Filter für Querformat, Hochformat und Personen.",
+    "Collections": "Sammlungen",
+    "Your own folders for the photos you keep using. Drag any photo onto one to file it, or right-click a photo and pick Add to collection.":
+        "Eigene Ordner für Fotos, die immer wieder gebraucht werden. Ein Foto hineinziehen, um es abzulegen, oder per Rechtsklick „Zu Sammlung hinzufügen“ wählen.",
+    "Shared collections": "Geteilte Sammlungen",
+    "Click + and choose New shared collection, then add your colleagues' email addresses - Topshot sends them the invite. Everyone sees the same photos and can add their own; ↻ fetches what others added. Right-click a shared collection to change who's in it.":
+        "Auf + klicken und „Neue geteilte Sammlung“ wählen, dann die E-Mail-Adressen der Kolleginnen und Kollegen eintragen - Topshot verschickt die Einladung. Alle sehen dieselben Fotos und können eigene hinzufügen; ↻ holt, was andere ergänzt haben. Per Rechtsklick auf eine geteilte Sammlung lässt sich ändern, wer dabei ist.",
+    "Your photos": "Die Fotos",
+    "This is where your photos will be - the grey tiles are placeholders until the library is loaded in the last step. Then: double-click for a big preview, right-click to copy in full resolution, hover to star a favourite, and {}-click or Shift-click to pick several.":
+        "Hier erscheinen die Fotos - die grauen Kacheln sind Platzhalter, bis die Bibliothek im letzten Schritt geladen ist. Danach: Doppelklick für die große Vorschau, Rechtsklick zum Kopieren in voller Auflösung, mit der Maus darüber einen Favoriten-Stern setzen, und mit {0}-Klick oder Umschalt-Klick mehrere auswählen.",
+    "Double-click for a big preview, right-click to copy it in full resolution, and hover to star a favourite. {}-click or Shift-click to pick several - then add, copy or save them in one go.":
+        "Doppelklick für die große Vorschau, Rechtsklick zum Kopieren in voller Auflösung, mit der Maus darüber einen Favoriten-Stern setzen. Mit {0}-Klick oder Umschalt-Klick mehrere auswählen - und alle auf einmal hinzufügen, kopieren oder speichern.",
+    "Favourites and history": "Favoriten und Verlauf",
+    "Every photo you starred and every search you ran - one click to get back to them.":
+        "Jedes markierte Foto und jede bisherige Suche - mit einem Klick wieder da.",
+    "Load your photos": "Fotos laden",
+    "New photos, updates and help": "Neue Fotos, Updates und Hilfe",
+    "Last step: click ✓ and Topshot loads the photo library from SharePoint. A Microsoft sign-in page opens in your browser - sign in with your Greenreb account, then come back here. The first load takes a few minutes and shows its progress at the top; after that, Topshot opens in seconds. Updates, settings and help live down here.":
+        "Letzter Schritt: Auf ✓ klicken, dann lädt Topshot die Fotobibliothek aus SharePoint. Im Browser öffnet sich die Microsoft-Anmeldung - mit dem Greenreb-Konto anmelden und hierher zurückkehren. Das erste Laden dauert einige Minuten, der Fortschritt steht oben; danach startet Topshot in Sekunden. Updates, Einstellungen und Hilfe sind hier unten zu finden.",
+    "Check for new photos brings in the latest shots. The app keeps itself up to date - settings, support and this tour live down here. Enjoy!":
+        "„Nach neuen Fotos suchen“ holt die neuesten Aufnahmen. Die App hält sich selbst aktuell - Einstellungen, Support und diese Tour sind hier unten zu finden. Viel Spaß!",
+    "First-run preview finished - on a new computer the library starts loading now. Start Topshot normally to get your photos back.":
+        "Vorschau des ersten Starts beendet - auf einem neuen Computer würde die Bibliothek jetzt geladen. Topshot normal starten, um die Fotos wieder zu sehen.",
+    # --- about ---
+    "Version {}  ·  Marketing photo library": "Version {0}  ·  Marketing-Fotobibliothek",
+    "Created by": "Erstellt von",
+    "How it was built": "So ist die App entstanden",
+    "Designed and developed by {} with Claude, Anthropic's AI assistant, as a coding partner: {n} Python files with about {n} lines of code. It reads the marketing photo library on Microsoft SharePoint through Microsoft Graph, signing in with your Greenreb Microsoft account.":
+        "Entworfen und entwickelt von {0} mit Claude, dem KI-Assistenten von Anthropic, als Programmierpartner: {1} Python-Dateien mit rund {2} Zeilen Code. Die App liest die Marketing-Fotobibliothek in Microsoft SharePoint über Microsoft Graph, angemeldet mit dem Greenreb-Microsoft-Konto.",
+    "Built on": "Basiert auf",
+    "OpenAI CLIP (open_clip) to understand what is in each photo · PyTorch · CustomTkinter · Pillow · Microsoft MSAL · the Inter typeface (SIL Open Font License) · Lucide icons (ISC License).":
+        "OpenAI CLIP (open_clip), um zu verstehen, was auf jedem Foto zu sehen ist · PyTorch · CustomTkinter · Pillow · Microsoft MSAL · die Schrift Inter (SIL Open Font License) · Lucide-Icons (ISC-Lizenz).",
+    # --- updates and What's new ---
+    "Version {} is ready - restart to update.": "Version {0} ist bereit - zum Aktualisieren neu starten.",
+    "Checking for updates…": "Suche nach Updates…",
+    "Couldn't check for updates - try again later.": "Die Update-Suche ist fehlgeschlagen - später erneut versuchen.",
+    "You're up to date - version {}.": "Alles aktuell - Version {0}.",
+    "Checking…": "Prüfe…",
+    "Up to date": "Aktuell",
+    "Update ready · {}": "Update bereit · {0}",
+    "A newer version is ready.": "Eine neuere Version ist bereit.",
+    "Version {} available": "Version {0} verfügbar",
+    "This one needs a new download.": "Dafür ist ein neuer Download nötig.",
+    "Download": "Herunterladen",
+    "Improvements and fixes.": "Verbesserungen und Fehlerbehebungen.",
+    "Ready to install - restart to switch.": "Bereit zur Installation - zum Wechseln neu starten.",
+    "Updated just now.": "Gerade aktualisiert.",
+    "The version you are using.": "Die aktuell verwendete Version.",
+    "Later": "Später",
+    "Got it": "Verstanden",
+    "Couldn't restart: {}": "Neustart fehlgeschlagen: {0}",
+    "Updating to version {}…": "Aktualisierung auf Version {0}…",
+    "Updated to version {}. Everything you had is still here.": "Auf Version {0} aktualisiert. Alles ist noch da.",
+    "Search in German too - „Burger mit Pommes“ finds the same as “burger with fries”":
+        "Suche auch auf Deutsch - „Burger mit Pommes“ findet dasselbe wie „burger with fries“",
+    "Ctrl+F (⌘F on a Mac) jumps to search, Esc empties it": "Strg+F (⌘F am Mac) springt zur Suche, Esc leert sie",
+    "Ctrl+C copies the photos you picked, or the one under the mouse":
+        "Strg+C kopiert die ausgewählten Fotos oder das Foto unter der Maus",
+    "Right-click a photo › Details: size, date taken, camera, who added it, its folder":
+        "Rechtsklick auf ein Foto › Details: Größe, Aufnahmedatum, Kamera, hinzugefügt von, Ordner",
+    "Pick several photos at once - Ctrl-click or Shift-click (⌘ on a Mac)":
+        "Mehrere Fotos auf einmal auswählen - Strg-Klick oder Umschalt-Klick (⌘ am Mac)",
+    "Filters for landscape, portrait and photos with or without people":
+        "Filter für Querformat, Hochformat und Fotos mit oder ohne Personen",
+    "Favourites: every photo has its gold star - click it to remove the photo":
+        "Favoriten: Jedes Foto trägt den goldenen Stern - Anklicken entfernt das Foto",
+    "Invitations to shared collections are sent for you": "Einladungen zu geteilten Sammlungen werden automatisch verschickt",
+    "A smaller System section, so more collections fit": "Kompakterer Systembereich, damit mehr Sammlungen Platz haben",
+    # --- starting ---
+    "Starting…": "Wird gestartet…",
+    "Starting version {}…": "Version {0} wird gestartet…",
+    "version {}": "Version {0}",
+    "Preparing {} photos…": "{0} Fotos werden vorbereitet…",
+    "Ready": "Bereit",
+    "{} could not start. The details were written to crash.log in {}.":
+        "{0} konnte nicht starten. Die Details stehen in crash.log in {1}.",
+    # --- small dialogs ---
+    "Ok": "OK",
+    "Not set": "Nicht festgelegt",
+    "Choose a download folder": "Download-Ordner wählen",
+    "Choose...": "Wählen...",
+    "Clear": "Leeren",
+    "Done": "Fertig",
+    "Images": "Bilder",
+    "All files": "Alle Dateien",
+    # --- settings page ---
+    "SETTINGS": "EINSTELLUNGEN",
+    "Make Topshot yours": "Topshot einrichten",
+    "APPEARANCE": "DARSTELLUNG",
+    "Theme": "Design",
+    "Dark, light, or whatever your computer uses.": "Dunkel, hell oder wie am Computer eingestellt.",
+    "Dark": "Dunkel",
+    "Light": "Hell",
+    "System": "System",
+    "Text size": "Textgröße",
+    "For the whole app.": "Für die gesamte App.",
+    "Small": "Klein",
+    "Default": "Standard",
+    "Large": "Groß",
+    "Extra large": "Sehr groß",
+    "LANGUAGE": "SPRACHE",
+    "Language": "Sprache",
+    "Menus and messages. Search understands English and German either way.":
+        "Menüs und Meldungen. Die Suche versteht in jedem Fall Deutsch und Englisch.",
+    "English": "English",
+    "Deutsch": "Deutsch",
+    "SEARCH": "SUCHE",
+    "Results per search": "Ergebnisse pro Suche",
+    "More results take a little longer to draw.": "Mehr Ergebnisse brauchen etwas länger zum Anzeigen.",
+    "Remember filters": "Filter merken",
+    "Keep landscape, portrait and people filters switched on between starts.":
+        "Filter für Querformat, Hochformat und Personen beim nächsten Start beibehalten.",
+    "PHOTOS YOU OPEN": "GEÖFFNETE FOTOS",
+    "Save opened images to": "Geöffnete Bilder speichern unter",
+    "Open original keeps a copy here. Leave empty to just open the photo.":
+        "„Original öffnen“ legt hier eine Kopie ab. Leer lassen, um das Foto nur zu öffnen.",
+    "Choose…": "Wählen…",
+    "UPDATES AND HELP": "UPDATES UND HILFE",
+    "Show what's new after an update": "Neuigkeiten nach einem Update anzeigen",
+    "A short card with the version and what changed.": "Eine kurze Karte mit Version und Änderungen.",
+    "Send error reports automatically": "Fehlerberichte automatisch senden",
+    "If something breaks, the error log goes to the team's SharePoint folder so it can be fixed. No photos, no searches.":
+        "Wenn etwas schiefgeht, wird das Fehlerprotokoll im SharePoint-Ordner des Teams abgelegt, damit es behoben werden kann. Keine Fotos, keine Suchen.",
+    "The tour": "Die Tour",
+    "Six short steps through the app.": "Sechs kurze Schritte durch die App.",
+    "Show again": "Erneut zeigen",
+    "DATA ON THIS COMPUTER": "DATEN AUF DIESEM COMPUTER",
+    "Downloaded originals": "Heruntergeladene Originale",
+    "Full-resolution copies kept so copying and previews are instant. Safe to clear - they download again when needed.":
+        "Kopien in voller Auflösung, damit Kopieren und Vorschau sofort gehen. Kann gefahrlos geleert werden - sie werden bei Bedarf neu geladen.",
+    "Measuring…": "Wird gemessen…",
+    "{} MB in {n} files": "{0} MB in {1} Dateien",
+    "Nothing stored": "Nichts gespeichert",
+    "Clear…": "Leeren…",
+    "Clear downloaded originals": "Heruntergeladene Originale leeren",
+    "Delete {n} downloaded originals ({} MB) from this computer?\n\nNothing is removed from SharePoint, and your collections and favourites stay.":
+        "{0} heruntergeladene Originale ({1} MB) von diesem Computer löschen?\n\nAuf SharePoint wird nichts entfernt, Sammlungen und Favoriten bleiben erhalten.",
+    "Cleared {} MB.": "{0} MB freigegeben.",
+    "Data folder": "Datenordner",
+    "Settings, caches and logs.": "Einstellungen, Zwischenspeicher und Protokolle.",
+    "Open folder": "Ordner öffnen",
+    "Restart Topshot to apply the change.": "Topshot neu starten, um die Änderung zu übernehmen.",
+    "Restart now": "Jetzt neu starten",
+    "Restarting…": "Neustart…",
+}
+# The filter line names what is showing: every combination, so a search
+# for a word like "people" is never translated by accident.
+for _shape_en, _shape_de in (("", ""), ("landscape", "Querformat"), ("portrait", "Hochformat")):
+    for _people_en, _people_de in (("", ""), ("with people", "mit Personen"),
+                                   ("without people", "ohne Personen")):
+        _en = " and ".join(x for x in (_shape_en, _people_en) if x)
+        _de = " und ".join(x for x in (_shape_de, _people_de) if x)
+        if _en:
+            _DE[f"Showing {_en} photos only - click a filter again to switch it off."] = (
+                f"Nur Fotos: {_de} - Filter erneut anklicken, um ihn auszuschalten.")
+
+
+_T_NUMBER = r"([\d.,]+)"
+_T_ANY = r"(.*?)"
+_T_LEAD = re.compile(r"^[\s·]*")
+_T_SPLIT = re.compile(r"(\s+·\s+)")
+_T_SLOT = re.compile(r"\{(t?)(\d+)\}")
+_T_CACHE = {}
+_T_MISSES = set()
+_DE_LOWER = {}
+_DE_PATTERNS = []
+
+
+def _prepare_translations():
+    for english, german in _DE.items():
+        if "{}" in english or "{n}" in english:
+            pieces = re.split(r"(\{n\}|\{\})", english)
+            regex = "".join(
+                _T_NUMBER if p == "{n}" else _T_ANY if p == "{}" else re.escape(p) for p in pieces
+            )
+            prefix = pieces[0].lower()
+            literal = sum(len(p) for p in pieces if p not in ("{n}", "{}"))
+            _DE_PATTERNS.append((literal, prefix, re.compile(regex, re.DOTALL | re.IGNORECASE),
+                                 german))
+        else:
+            _DE_LOWER.setdefault(english.lower(), german)
+    # The most specific first: the pattern with the most fixed text wins.
+    _DE_PATTERNS.sort(key=lambda entry: -entry[0])
+
+
+def _translate_core(core, split=True):
+    hit = _DE.get(core)
+    if hit is not None:
+        return hit
+    shouting = core.isupper()
+    if shouting:
+        hit = _DE_LOWER.get(core.lower())
+        if hit is not None:
+            return hit.upper()
+    lowered = core.lower()
+    for _literal, prefix, regex, german in _DE_PATTERNS:
+        if prefix and not lowered.startswith(prefix):
+            continue
+        match = regex.fullmatch(core)
+        if match is None:
+            continue
+
+        def fill(slot):
+            value = match.group(int(slot.group(2)) + 1)
+            return _translate(value) if slot.group(1) else value
+
+        out = _T_SLOT.sub(fill, german)
+        return out.upper() if shouting else out
+    if split:
+        parts = _T_SPLIT.split(core)
+        if len(parts) > 1:
+            changed = False
+            for i in range(0, len(parts), 2):
+                piece = _translate_core(parts[i], split=False)
+                if piece is not None:
+                    parts[i], changed = piece, True
+            if changed:
+                return "".join(parts)
+    return None
+
+
+def _translate(text):
+    if not text:
+        return text
+    lead = _T_LEAD.match(text).group(0)
+    core = text[len(lead):].rstrip()
+    if len(core) < 2:
+        return text
+    tail = text[len(lead) + len(core):]
+    out = _translate_core(core)
+    return text if out is None else lead + out + tail
+
+
+def t(text):
+    """`text` in the language of the interface. Anything that is not in the
+    dictionary - a file name, a collection, a text added later - comes back
+    unchanged."""
+    if LANGUAGE != "de" or not isinstance(text, str) or len(text) < 2:
+        return text
+    hit = _T_CACHE.get(text)
+    if hit is None:
+        hit = _translate(text)
+        if len(_T_CACHE) < 6000:
+            _T_CACHE[text] = hit
+        if hit == text and _T_LOG_MISSES and text not in _T_MISSES and len(_T_MISSES) < 2000:
+            _T_MISSES.add(text)
+            try:
+                with open(os.path.join(DATA_DIR, "untranslated.txt"), "a", encoding="utf-8") as f:
+                    f.write(repr(text) + "\n")
+            except OSError:
+                pass
+    return hit
+
+
+# Set TOPSHOT_LOG_UNTRANSLATED=1 to collect, in untranslated.txt in the data
+# folder, every text that reached the screen without a German version.
+_T_LOG_MISSES = bool(os.environ.get("TOPSHOT_LOG_UNTRANSLATED"))
+
+
+class _TVar(tk.StringVar):
+    """A text variable for the interface's own messages (the status line,
+    the title): what is put in comes out in the interface language. Not for
+    text the user types."""
+
+    def __init__(self, master=None, value=None, name=None):
+        super().__init__(master, t(value) if isinstance(value, str) else value, name)
+
+    def set(self, value):
+        super().set(t(value) if isinstance(value, str) else value)
+
+
+def _install_translation():
+    """Translates at the last step before the screen, so the rest of the app
+    keeps working in English: every Tk label (which is also what every
+    CustomTkinter label, button, checkbox and segmented button draws its
+    text with), text drawn on a canvas, entry placeholders, window titles,
+    and the system's message and file dialogs."""
+    def texts(kwargs, keys):
+        for key in keys:
+            value = kwargs.get(key)
+            if isinstance(value, str) and value:
+                kwargs[key] = t(value)
+
+    def wrap(cls, name, keys):
+        original = getattr(cls, name)
+
+        def method(self, *args, **kwargs):
+            texts(kwargs, keys)
+            return original(self, *args, **kwargs)
+
+        method.__name__ = name
+        setattr(cls, name, method)
+
+    for name in ("__init__", "configure", "config"):
+        wrap(tk.Label, name, ("text",))
+    for name in ("create_text", "itemconfigure", "itemconfig"):
+        wrap(tk.Canvas, name, ("text",))
+    for name in ("__init__", "configure"):
+        wrap(ctk.CTkEntry, name, ("placeholder_text",))
+
+    def title_wrapper(original):
+        def title(self, string=None):
+            return original(self, t(string) if isinstance(string, str) else string)
+        return title
+
+    tk.Wm.wm_title = title_wrapper(tk.Wm.wm_title)
+    tk.Wm.title = title_wrapper(tk.Wm.title)
+
+    def dialog_wrapper(original, positional):
+        def dialog(*args, **kwargs):
+            args = tuple(t(a) if i < positional and isinstance(a, str) else a
+                         for i, a in enumerate(args))
+            texts(kwargs, ("title", "message", "detail"))
+            return original(*args, **kwargs)
+        return dialog
+
+    for name in ("showinfo", "showwarning", "showerror", "askquestion", "askokcancel",
+                 "askyesno", "askyesnocancel", "askretrycancel"):
+        if hasattr(messagebox, name):
+            setattr(messagebox, name, dialog_wrapper(getattr(messagebox, name), 2))
+    for name in ("askdirectory", "askopenfilename", "askopenfilenames", "asksaveasfilename"):
+        if hasattr(filedialog, name):
+            setattr(filedialog, name, dialog_wrapper(getattr(filedialog, name), 0))
+
+
+if LANGUAGE == "de":
+    try:
+        _prepare_translations()
+        _install_translation()
+    except Exception:
+        LANGUAGE = "en"   # never let the language stop the app from starting
+if FONT_SCALE != 1.0:
+    try:
+        _install_text_scale()
+    except Exception:
+        pass
+
+
 CRASH_LOG_PATH = os.path.join(
     DATA_DIR, "crash.log"
 )
@@ -364,13 +1217,13 @@ OBJECT_PROMPTS = [
 ]
 DEFAULT_TOP_K = 150
 
-BG_COLOR = "#090b0a"
-CARD_COLOR = "#141917"
-ACCENT_COLOR = "#1d2621"
-ACCENT_ACTIVE = "#1b4a37"
-FIELD_BG = "#141917"
-TEXT_COLOR = "#fafafa"
-MUTED_TEXT_COLOR = "#9ca8a2"
+BG_COLOR = _c("#090b0a")
+CARD_COLOR = _c("#141917")
+ACCENT_COLOR = _c("#1d2621")
+ACCENT_ACTIVE = _c("#1b4a37")
+FIELD_BG = _c("#141917")
+TEXT_COLOR = _c("#fafafa")
+MUTED_TEXT_COLOR = _c("#9ca8a2")
 
 CARD_RADIUS = 14
 
@@ -468,25 +1321,25 @@ def _font(size, weight="regular"):
         "semibold": UI_FONT_SEMIBOLD, "bold": UI_FONT,
     }[weight]
     bold = weight == "bold" or (weight != "regular" and family == UI_FONT)
-    return ctk.CTkFont(family=family, size=size, weight="bold" if bold else "normal")
-SURFACE = "#141917"
-SURFACE_HOVER = "#1c2420"
-BORDER = "#24302a"
-TEXT_SOFT = "#e5e5e5"
-FAINT_TEXT = "#6b7a72"
-SIDEBAR_BG = "#0f1311"
+    return ctk.CTkFont(family=family, size=_fs(size), weight="bold" if bold else "normal")
+SURFACE = _c("#141917")
+SURFACE_HOVER = _c("#1c2420")
+BORDER = _c("#24302a")
+TEXT_SOFT = _c("#e5e5e5")
+FAINT_TEXT = _c("#6b7a72")
+SIDEBAR_BG = _c("#0f1311")
 NAV_BG = SIDEBAR_BG
-PRIMARY_TEXT = "#ffffff"
-FOCUS_BORDER = "#10a573"
-PULSE_COLOUR = "#1f6b4c"
-SOURCE_DOT = "#34d399"
-NAV_HOVER = "#17201b"
-NAV_SELECTED = "#123628"
-SYSTEM_TEXT = "#84928b"  # System items sit back from the rest of the sidebar
-MENU_BORDER = "#2a3830"
-DANGER = "#f87171"
-PRIMARY = "#10a573"
-PRIMARY_HOVER = "#14c088"
+PRIMARY_TEXT = _c("#ffffff")
+FOCUS_BORDER = _c("#10a573")
+PULSE_COLOUR = _c("#1f6b4c")
+SOURCE_DOT = _c("#34d399")
+NAV_HOVER = _c("#17201b")
+NAV_SELECTED = _c("#123628")
+SYSTEM_TEXT = _c("#84928b")  # System items sit back from the rest of the sidebar
+MENU_BORDER = _c("#2a3830")
+DANGER = _c("#f87171")
+PRIMARY = _c("#10a573")
+PRIMARY_HOVER = _c("#14c088")
 
 # Segoe MDL2 Assets ships with Windows 10 and 11; the glyphs are drawn into
 # images so they sit beside Segoe UI text at any size. Without the font the
@@ -1241,8 +2094,8 @@ def _make_button(parent, text, command, width=140):
         width=width,
         height=34,
         corner_radius=8,
-        fg_color="#1d2621",
-        hover_color="#2a3830",
+        fg_color=_c("#1d2621"),
+        hover_color=_c("#2a3830"),
         text_color_disabled=FAINT_TEXT,
         text_color=TEXT_COLOR,
         font=_font(13, "medium"),
@@ -1254,7 +2107,7 @@ def _make_primary_button(parent, text, command, width=96):
     return ctk.CTkButton(
         parent, text=text, command=command, width=width, height=36, corner_radius=8,
         fg_color=PRIMARY, hover_color=PRIMARY_HOVER, text_color=PRIMARY_TEXT,
-        text_color_disabled="#a7d8c4", font=_font(13, "semibold"),
+        text_color_disabled=_c("#a7d8c4"), font=_font(13, "semibold"),
     )
 
 
@@ -1269,7 +2122,7 @@ TILE_GAP = 6
 TILE_RADIUS = 8
 GRID_SIDE_PAD = 0  # tiles line up with the search field's left edge
 ROWS_PER_CHUNK = 3  # rows built per event-loop turn, so the grid fills in smoothly
-CAPTION_FONT = ("Roboto", -12)  # what CustomTkinter used for captions on Windows
+CAPTION_FONT = ("Roboto", -_fs(12))  # what CustomTkinter used for captions on Windows
 
 
 def _hex_rgb(colour):
@@ -1285,7 +2138,7 @@ def _draw_star_badge(filled):
     big = Image.new("RGBA", (w * k, h * k), (0, 0, 0, 0))
     draw = ImageDraw.Draw(big)
     draw.rounded_rectangle(
-        (0, 0, w * k - 1, h * k - 1), radius=8 * k, fill=_hex_rgb(CARD_COLOR) + (230,)
+        (0, 0, w * k - 1, h * k - 1), radius=8 * k, fill=(20, 25, 23, 230)
     )
     cx, cy = w * k / 2, h * k / 2 + 0.4 * k
     outer = 8.0 * k
@@ -1380,7 +2233,7 @@ class ImageSearchApp:
         # are (library, collections) and the occasional system actions at
         # its foot, and a main column with the page title, the search field
         # and the photos.
-        shell = ctk.CTkFrame(self.root, fg_color=SIDEBAR_BG, corner_radius=0, width=240)
+        shell = ctk.CTkFrame(self.root, fg_color=SIDEBAR_BG, corner_radius=0, width=_fs(240))
         shell.pack(side=tk.LEFT, fill=tk.Y)
         shell.pack_propagate(False)
         ctk.CTkFrame(self.root, fg_color=BORDER, width=1, corner_radius=0).pack(
@@ -1462,7 +2315,7 @@ class ImageSearchApp:
         ctk.CTkLabel(
             source, text="\u25cf", text_color=SOURCE_DOT, font=_font(10), width=12, height=18,
         ).pack(side=tk.LEFT, anchor="n")
-        self.folder_var = tk.StringVar(value="No folder selected")
+        self.folder_var = _TVar(value="No folder selected")
         ctk.CTkLabel(
             source, textvariable=self.folder_var, text_color=MUTED_TEXT_COLOR, font=_font(12),
             justify="left", anchor="w", wraplength=180,
@@ -1541,7 +2394,7 @@ class ImageSearchApp:
         # the System section below never covers the last ones.
         self.sidebar = ctk.CTkScrollableFrame(
             nav, fg_color=SIDEBAR_BG, corner_radius=0,
-            scrollbar_button_color="#1d2621", scrollbar_button_hover_color="#33443b",
+            scrollbar_button_color=_c("#1d2621"), scrollbar_button_hover_color=_c("#33443b"),
         )
         self.sidebar.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         self._collections_hint = None
@@ -1556,12 +2409,12 @@ class ImageSearchApp:
         head.pack(fill=tk.X, pady=(0, 18))
         titles = ctk.CTkFrame(head, fg_color="transparent")
         titles.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.title_var = tk.StringVar(value="All photos")
+        self.title_var = _TVar(value="All photos")
         ctk.CTkLabel(
             titles, textvariable=self.title_var, font=_font(22, "semibold"),
             text_color=TEXT_COLOR, anchor="w", height=30,
         ).pack(anchor="w")
-        self.status_var = tk.StringVar(value="Loading your photo library...")
+        self.status_var = _TVar(value="Loading your photo library...")
         ctk.CTkLabel(
             titles, textvariable=self.status_var, font=_font(13), text_color=MUTED_TEXT_COLOR,
             anchor="w", height=20,
@@ -1638,7 +2491,7 @@ class ImageSearchApp:
         # own internal canvas, scrollbar, and mousewheel binding.
         self.results_frame = ctk.CTkScrollableFrame(
             main, fg_color=BG_COLOR, corner_radius=0, scrollbar_button_color=BORDER,
-            scrollbar_button_hover_color="#3a4c42",
+            scrollbar_button_hover_color=_c("#3a4c42"),
         )
         self.results_frame.pack(fill=tk.BOTH, expand=True)
         # CustomTkinter moves 1 pixel per scroll "unit" on Windows, which
@@ -1968,9 +2821,9 @@ class ImageSearchApp:
                 f"and choose 'Add to {name}'."
             )
             return
-        results = [(self.engine.paths[i], 1.0, self.engine.meta[i]) for i in idxs[:DEFAULT_TOP_K]]
+        results = [(self.engine.paths[i], 1.0, self.engine.meta[i]) for i in idxs[:_top_k()]]
         self._render_results(results, keep_scroll=keep_scroll)
-        extra = f" (showing first {DEFAULT_TOP_K})" if len(idxs) > DEFAULT_TOP_K else ""
+        extra = f" (showing first {_top_k()})" if len(idxs) > _top_k() else ""
         self.status_var.set(f"{len(idxs)} photo(s) in {name}{extra}. Search to narrow it down.")
 
     def _show_favourites(self, keep_scroll=False):
@@ -2130,7 +2983,7 @@ class ImageSearchApp:
                 effective_subset = self._exclude_graphic(subset)
                 bonus = self._compute_bonus(query)
                 results = self.engine.search_text(
-                    query, DEFAULT_TOP_K, status_callback=on_status, bonus=bonus,
+                    query, _top_k(), status_callback=on_status, bonus=bonus,
                     subset=effective_subset,
                 )
                 if self._query_wants_objects(to_english(query)):
@@ -2195,7 +3048,7 @@ class ImageSearchApp:
                 # responsive if Find similar is used before it has warmed up.
                 subset = self._exclude_graphic(active)
                 results = self.engine.search_image(
-                    path, DEFAULT_TOP_K, status_callback=on_status, subset=subset
+                    path, _top_k(), status_callback=on_status, subset=subset
                 )
                 # Same shape as a text search: the best matches stay in the
                 # engine's order, variety is applied only below them.
@@ -2341,7 +3194,7 @@ class ImageSearchApp:
             top, text="Clear search history", width=170, height=30, corner_radius=8,
             # A muted red on hover: the one destructive action on this screen
             # should look different from the searches beside it.
-            fg_color=CARD_COLOR, hover_color="#7a2330", text_color=TEXT_COLOR,
+            fg_color=CARD_COLOR, hover_color=_c("#7a2330"), text_color=TEXT_COLOR,
             font=_font(12, "semibold"),
             command=self._clear_history,
         ).pack(side=tk.RIGHT)
@@ -2496,69 +3349,407 @@ class ImageSearchApp:
     # ---------- settings ----------
 
     def _settings_path(self):
-        local_folder, _t, _f, _i = self._sp_cache_dirs()
-        return os.path.join(os.path.dirname(local_folder), "settings.json")
+        return SETTINGS_PATH
 
     def _load_settings(self):
-        if self._settings is None:
-            self._settings = self._read_json(self._settings_path())
-        return self._settings
+        """The app's settings: one dictionary, read once when the app starts
+        (the theme, text size and language are needed before the window
+        exists) and written back whenever one changes."""
+        return _SETTINGS
 
     def _save_settings(self):
-        try:
-            os.makedirs(os.path.dirname(self._settings_path()), exist_ok=True)
-            with open(self._settings_path(), "w", encoding="utf-8") as f:
-                json.dump(self._load_settings(), f, ensure_ascii=False)
-        except OSError:
-            pass
+        _write_settings_file()
+
+    def _setting(self, key, default=None):
+        return _setting(key, default)
+
+    def _set_setting(self, key, value):
+        _set_setting(key, value)
 
     def _download_folder(self):
         folder = self._load_settings().get("download_folder") or ""
         return folder if folder and os.path.isdir(folder) else ""
 
+    def _restart_plain(self):
+        """Starts the app again and closes this window - for a new theme,
+        text size or language, which are read when the app starts."""
+        if getattr(sys, "frozen", False):
+            command = [sys.executable]
+        else:
+            first = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+            if os.path.basename(first).lower() != "launcher.py":
+                first = os.path.join(os.path.dirname(os.path.abspath(__file__)), "launcher.py")
+            command = [sys.executable, first]
+        try:
+            subprocess.Popen(command, close_fds=True)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"Couldn't restart: {exc}")
+            return
+        self.status_var.set("Restarting…")
+        self.root.after(900, self.root.destroy)
+
+    def _originals_cache(self):
+        """(bytes, files, paths) of the full-resolution copies and large
+        previews kept on this computer."""
+        _lf, _thumbs, full_dir, _idx = self._sp_cache_dirs()
+        total, paths = 0, []
+        for folder in (full_dir, self._preview_dir()):
+            try:
+                for entry in os.scandir(folder):
+                    if entry.is_file():
+                        total += entry.stat().st_size
+                        paths.append(entry.path)
+            except OSError:
+                pass
+        return total, len(paths), paths
+
     def _open_settings(self):
-        """Small modal for the one setting worth exposing: where opened
-        images should be saved."""
+        """Settings: how the app looks and reads, a few habits of the search,
+        and what it keeps on this computer. The theme, text size and
+        language take effect after a restart, which the page offers as soon
+        as one of them has been changed."""
+        existing = getattr(self, "_settings_win", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except tk.TclError:
+                pass
+        reduced = self._motion_reduced()
         win = ctk.CTkToplevel(self.root)
+        self._settings_win = win
+        win.withdraw()
         win.title("Settings")
-        win.geometry("540x230")
         win.configure(fg_color=BG_COLOR)
+        win.resizable(False, False)
         win.transient(self.root)
-        win.grab_set()
+        win.after(250, lambda: _apply_icon(win))
+        width = _fs(640)
 
-        ctk.CTkLabel(
-            win, text="Save opened images to", text_color=TEXT_COLOR,
-            font=_font(14, "semibold"),
-        ).pack(anchor="w", padx=20, pady=(20, 2))
-        ctk.CTkLabel(
-            win,
-            text="Double-clicking a result saves a copy here, then opens it.\n"
-                 "Leave empty to just open images without keeping a copy.",
-            text_color=MUTED_TEXT_COLOR, justify="left",
-        ).pack(anchor="w", padx=20, pady=(0, 10))
+        head = ctk.CTkFrame(win, fg_color="transparent")
+        head.pack(fill=tk.X, padx=28, pady=(22, 6))
+        ctk.CTkLabel(head, text="SETTINGS", font=_font(11, "semibold"), text_color=SPLASH_ACCENT,
+                     anchor="w", height=16).pack(fill=tk.X)
+        ctk.CTkLabel(head, text="Make Topshot yours", font=_font(20, "semibold"),
+                     text_color=TEXT_COLOR, anchor="w").pack(fill=tk.X)
 
-        row = ctk.CTkFrame(win, fg_color=CARD_COLOR, corner_radius=CARD_RADIUS)
-        row.pack(fill=tk.X, padx=20)
-        folder_var = tk.StringVar(value=self._download_folder() or "Not set")
-        ctk.CTkLabel(
-            row, textvariable=folder_var, text_color=MUTED_TEXT_COLOR, anchor="w",
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=14, pady=12)
+        footer = ctk.CTkFrame(win, fg_color="transparent")
+        footer.pack(side=tk.BOTTOM, fill=tk.X, padx=28, pady=(10, 20))
+        page = ctk.CTkScrollableFrame(
+            win, fg_color=BG_COLOR, corner_radius=0, width=width,
+            scrollbar_button_color=BORDER, scrollbar_button_hover_color=_c("#3a4c42"),
+        )
+        page.pack(fill=tk.BOTH, expand=True, padx=(22, 8))
 
-        def choose():
+        def section(title):
+            ctk.CTkLabel(page, text=title, font=_font(11, "medium"), text_color=FAINT_TEXT,
+                         anchor="w", height=20).pack(fill=tk.X, padx=8, pady=(16, 6))
+            card = ctk.CTkFrame(page, fg_color=SURFACE, corner_radius=12, border_width=1,
+                                border_color=BORDER)
+            card.pack(fill=tk.X, padx=(2, 10))
+            card.rows = 0
+            return card
+
+        def row(card, title, hint=""):
+            if card.rows:
+                ctk.CTkFrame(card, height=1, fg_color=BORDER, corner_radius=0).pack(
+                    fill=tk.X, padx=16)
+            card.rows += 1
+            line = ctk.CTkFrame(card, fg_color="transparent")
+            line.pack(fill=tk.X, padx=16, pady=11)
+            words = ctk.CTkFrame(line, fg_color="transparent")
+            words.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            ctk.CTkLabel(words, text=title, font=_font(13, "medium"), text_color=TEXT_COLOR,
+                         anchor="w", height=20).pack(fill=tk.X)
+            hint_label = None
+            if hint:
+                hint_label = ctk.CTkLabel(words, text=hint, font=_font(12),
+                                          text_color=MUTED_TEXT_COLOR, anchor="w",
+                                          justify="left", wraplength=_fs(260))
+                hint_label.pack(fill=tk.X)
+            line.hint = hint_label
+            return line
+
+        def choice(line, options, current, on_pick):
+            """A segmented control. `options` is [(label, value), ...]."""
+            by_label = dict(options)
+            start = next((label for label, value in options if value == current), options[0][0])
+            var = tk.StringVar(value=start)
+            control = ctk.CTkSegmentedButton(
+                line, values=[label for label, _value in options], variable=var, height=30,
+                font=_font(12, "medium"), fg_color=BG_COLOR, selected_color=MENU_BORDER,
+                selected_hover_color=_c("#33443b"), unselected_color=BG_COLOR,
+                unselected_hover_color=SURFACE_HOVER, text_color=TEXT_COLOR,
+                command=lambda label: on_pick(by_label.get(label)),
+            )
+            control.pack(side=tk.RIGHT, padx=(12, 0))
+            return control
+
+        def switch(line, key, default):
+            var = tk.BooleanVar(value=bool(_setting(key, default)))
+            control = ctk.CTkSwitch(
+                line, text="", variable=var, width=40, switch_width=38, switch_height=20,
+                progress_color=PRIMARY, fg_color=_c("#3a4c42"), button_color="#ffffff",
+                button_hover_color="#ffffff",
+                command=lambda: _set_setting(key, bool(var.get())),
+            )
+            control.pack(side=tk.RIGHT, padx=(12, 0))
+            return control
+
+        def small_button(line, text, command):
+            button = _make_secondary_button(line, text, command, width=0)
+            button.configure(height=30, font=_font(12, "medium"))
+            button.pack(side=tk.RIGHT, padx=(8, 0))
+            return button
+
+        # --- appearance ---
+        card = section("APPEARANCE")
+        choice(row(card, "Theme", "Dark, light, or whatever your computer uses."),
+               [("Dark", "dark"), ("Light", "light"), ("System", "system")],
+               _setting("theme", "dark"), lambda v: changed("theme", v))
+        choice(row(card, "Text size", "For the whole app."),
+               [("Small", "small"), ("Default", "default"), ("Large", "large"),
+                ("Extra large", "xlarge")],
+               _setting("text_size", "default"), lambda v: changed("text_size", v))
+
+        # --- language ---
+        card = section("LANGUAGE")
+        choice(row(card, "Language",
+                   "Menus and messages. Search understands English and German either way."),
+               [("System", "system"), ("English", "en"), ("Deutsch", "de")],
+               _setting("language", "system"), lambda v: changed("language", v))
+
+        # --- search ---
+        card = section("SEARCH")
+        counts = [("100", 100), ("150", 150), ("250", 250), ("400", 400)]
+        choice(row(card, "Results per search", "More results take a little longer to draw."),
+               counts, _top_k() if _top_k() in (100, 150, 250, 400) else 150,
+               lambda v: _set_setting("results_count", v))
+        switch(row(card, "Remember filters",
+                   "Keep landscape, portrait and people filters switched on between starts."),
+               "remember_filters", False)
+
+        # --- photos you open ---
+        card = section("PHOTOS YOU OPEN")
+        hint = "Open original keeps a copy here. Leave empty to just open the photo."
+        folder_row = row(card, "Save opened images to", self._download_folder() or hint)
+
+        def choose_folder():
             chosen = filedialog.askdirectory(title="Choose a download folder", parent=win)
             if chosen:
-                self._load_settings()["download_folder"] = chosen
-                self._save_settings()
-                folder_var.set(chosen)
+                _set_setting("download_folder", chosen)
+                folder_row.hint.configure(text=chosen)
 
-        def clear():
-            self._load_settings().pop("download_folder", None)
-            self._save_settings()
-            folder_var.set("Not set")
+        def clear_folder():
+            _set_setting("download_folder", None)
+            folder_row.hint.configure(text=hint)
 
-        _make_button(row, "Choose...", choose, width=110).pack(side=tk.LEFT, padx=(0, 8), pady=12)
-        _make_button(row, "Clear", clear, width=80).pack(side=tk.LEFT, padx=(0, 14), pady=12)
-        _make_button(win, "Done", win.destroy, width=100).pack(pady=18)
+        small_button(folder_row, "Clear", clear_folder)
+        small_button(folder_row, "Choose…", choose_folder)
+
+        # --- updates and help ---
+        card = section("UPDATES AND HELP")
+        switch(row(card, "Show what's new after an update",
+                   "A short card with the version and what changed."), "whats_new", True)
+        switch(row(card, "Send error reports automatically",
+                   "If something breaks, the error log goes to the team's SharePoint folder "
+                   "so it can be fixed. No photos, no searches."), "error_reports", True)
+        small_button(row(card, "The tour", "Six short steps through the app."), "Show again",
+                     lambda: close(self._start_tour))
+
+        # --- data on this computer ---
+        card = section("DATA ON THIS COMPUTER")
+        cache_row = row(card, "Downloaded originals",
+                        "Full-resolution copies kept so copying and previews are instant. "
+                        "Safe to clear - they download again when needed.")
+        cache_size = ctk.CTkLabel(cache_row, text="Measuring…", font=_font(12),
+                                  text_color=FAINT_TEXT)
+        cache_state = {"bytes": 0, "files": 0, "paths": [], "busy": False}
+
+        def megabytes(size):
+            return f"{size / 1048576:,.0f}"
+
+        def measure():
+            result = {}
+
+            def work():
+                result["cache"] = self._originals_cache()
+
+            def poll():
+                try:
+                    if not win.winfo_exists():
+                        return
+                except tk.TclError:
+                    return
+                if "cache" not in result:
+                    win.after(150, poll)
+                    return
+                size, files, paths = result["cache"]
+                cache_state.update(bytes=size, files=files, paths=paths)
+                cache_size.configure(
+                    text=f"{megabytes(size)} MB in {files} files" if files else "Nothing stored")
+                clear_cache_button.configure(state=tk.NORMAL if files else tk.DISABLED)
+
+            threading.Thread(target=work, daemon=True).start()
+            win.after(150, poll)
+
+        def clear_cache():
+            if cache_state["busy"] or not cache_state["files"]:
+                return
+            size, files = cache_state["bytes"], cache_state["files"]
+            if not messagebox.askyesno(
+                "Clear downloaded originals",
+                f"Delete {files} downloaded originals ({megabytes(size)} MB) from this computer?"
+                "\n\nNothing is removed from SharePoint, and your collections and favourites stay.",
+                parent=win,
+            ):
+                return
+            cache_state["busy"] = True
+            paths = list(cache_state["paths"])
+            done = {}
+
+            def work():
+                freed = 0
+                for path in paths:
+                    try:
+                        size_here = os.path.getsize(path)
+                        os.remove(path)
+                        freed += size_here
+                    except OSError:
+                        pass          # in use (an open preview): it stays
+                done["freed"] = freed
+
+            def poll():
+                try:
+                    if not win.winfo_exists():
+                        return
+                except tk.TclError:
+                    return
+                if "freed" not in done:
+                    win.after(150, poll)
+                    return
+                cache_state["busy"] = False
+                self.status_var.set(f"Cleared {megabytes(done['freed'])} MB.")
+                measure()
+
+            threading.Thread(target=work, daemon=True).start()
+            win.after(150, poll)
+
+        clear_cache_button = small_button(cache_row, "Clear…", clear_cache)
+        clear_cache_button.configure(state=tk.DISABLED)
+        cache_size.pack(side=tk.RIGHT, padx=(12, 0))
+
+        def open_data_folder():
+            try:
+                _open_external(DATA_DIR)
+            except Exception:
+                pass
+
+        small_button(row(card, "Data folder", "Settings, caches and logs."), "Open folder",
+                     open_data_folder)
+        ctk.CTkFrame(page, fg_color="transparent", height=8).pack()
+
+        # --- footer: Done, and the restart offer when it is needed ---
+        closing = {"done": False}
+
+        def close(then=None):
+            if closing["done"]:
+                return
+            closing["done"] = True
+
+            def gone():
+                self._settings_win = None
+                try:
+                    win.destroy()
+                except tk.TclError:
+                    pass
+                if then:
+                    then()
+
+            def step(p):
+                try:
+                    win.attributes("-alpha", 1.0 - p)
+                except tk.TclError:
+                    pass
+
+            _animate(self.root, 0 if reduced else 140, step, done=gone, ease=EASE_OUT)
+
+        _make_primary_button(footer, "Done", lambda: close(), width=100).pack(side=tk.RIGHT)
+        restart_button = _make_secondary_button(
+            footer, "Restart now", lambda: close(self._restart_plain), width=0)
+        restart_hint = ctk.CTkLabel(footer, text="Restart Topshot to apply the change.",
+                                    font=_font(12), text_color=BG_COLOR, anchor="w")
+        offer = {"shown": False, "gen": 0}
+
+        def restart_needed():
+            return (_setting("theme", "dark") != THEME_SETTING
+                    or _setting("text_size", "default") != TEXT_SIZE_SETTING
+                    or _setting("language", "system") != LANGUAGE_SETTING)
+
+        def show_offer():
+            needed = restart_needed()
+            if needed == offer["shown"]:
+                return
+            offer["shown"] = needed
+            offer["gen"] += 1
+            gen = offer["gen"]
+            if needed:
+                restart_button.pack(side=tk.RIGHT, padx=(0, 8))
+                restart_hint.pack(side=tk.LEFT)
+
+                def step(p):
+                    if offer["gen"] == gen:
+                        try:
+                            restart_hint.configure(text_color=_mix(BG_COLOR, SOURCE_DOT, p))
+                        except tk.TclError:
+                            pass
+
+                _animate(self.root, 0 if reduced else 200, step, ease=EASE_OUT)
+            else:
+                restart_button.pack_forget()
+                restart_hint.pack_forget()
+
+        def changed(key, value):
+            _set_setting(key, value)
+            show_offer()
+
+        # --- size and entrance ---
+        win.update_idletasks()
+        try:
+            content = page.winfo_reqheight()
+        except tk.TclError:
+            content = 560
+        room = max(320, win.winfo_screenheight() - 300)
+        page.configure(height=min(content, room))
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+        x = rx + max(0, (self.root.winfo_width() - w) // 2)
+        y = max(8, ry + max(0, (self.root.winfo_height() - h) // 2 - 10))
+        rise = 0 if reduced else 10
+        try:
+            win.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+        win.geometry(f"+{x}+{y + rise}")
+        win.deiconify()
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.bind("<Escape>", lambda _e: close())
+
+        def enter(p):
+            try:
+                win.attributes("-alpha", p)
+                win.geometry(f"+{x}+{y + round(rise * (1 - p))}")
+            except tk.TclError:
+                pass
+
+        _animate(self.root, 0 if reduced else 220, enter, ease=EASE_OUT)
+        show_offer()
+        measure()
+        win.lift()
+        win.focus_force()
 
     # ---------- collections ----------
 
@@ -4670,7 +5861,7 @@ class ImageSearchApp:
             win.after(200, lambda: _apply_icon(win))
         except Exception:
             pass
-        viewer = PhotoViewer(win, BG_COLOR)
+        viewer = PhotoViewer(win, PHOTO_BG)
         viewer.canvas.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 0))
         bar = ctk.CTkFrame(win, fg_color="transparent")
         bar.pack(fill=tk.X, padx=12, pady=12)
@@ -4793,7 +5984,7 @@ class ImageSearchApp:
         kind = tk.StringVar(value="JPEG")
         ctk.CTkSegmentedButton(
             inner, values=["JPEG", "PNG"], variable=kind, height=30, font=_font(12, "medium"),
-            fg_color=SURFACE, selected_color="#2a3830", selected_hover_color="#33443b",
+            fg_color=SURFACE, selected_color=_c("#2a3830"), selected_hover_color=_c("#33443b"),
             unselected_color=SURFACE, unselected_hover_color=SURFACE_HOVER, text_color=TEXT_COLOR,
             command=lambda _v: update_info(),
         ).pack(fill=tk.X)
@@ -5063,7 +6254,7 @@ class ImageSearchApp:
         panes.grid_rowconfigure(0, weight=1)
         viewers, alive = [], {"open": True}
         for column, (path, meta) in enumerate(items):
-            viewer = PhotoViewer(panes, BG_COLOR)
+            viewer = PhotoViewer(panes, PHOTO_BG)
             viewer.canvas.grid(row=0, column=column, sticky="nsew", padx=(0, 6) if column == 0 else (6, 0))
             name = (meta or {}).get("name") or os.path.basename(path)
             ctk.CTkLabel(panes, text=name, text_color=MUTED_TEXT_COLOR, font=_font(12)).grid(
@@ -5944,7 +7135,7 @@ class ImageSearchApp:
         if members:
             people.insert("1.0", "\n".join(members))
         people.pack(fill=tk.X, pady=(4, 6))
-        error = ctk.CTkLabel(body, text="", font=_font(12), text_color="#f87171", anchor="w",
+        error = ctk.CTkLabel(body, text="", font=_font(12), text_color=_c("#f87171"), anchor="w",
                              justify="left", wraplength=400)
         error.pack(fill=tk.X)
 
@@ -6199,8 +7390,8 @@ class ImageSearchApp:
         topic = tk.StringVar(value="Problem")
         ctk.CTkSegmentedButton(
             body, values=["Problem", "Idea", "Question"], variable=topic, height=32,
-            font=_font(13, "medium"), fg_color=SURFACE, selected_color="#2a3830",
-            selected_hover_color="#33443b", unselected_color=SURFACE,
+            font=_font(13, "medium"), fg_color=SURFACE, selected_color=_c("#2a3830"),
+            selected_hover_color=_c("#33443b"), unselected_color=SURFACE,
             unselected_hover_color=SURFACE_HOVER, text_color=TEXT_COLOR,
         ).pack(anchor="w")
         ctk.CTkLabel(body, text="What's on your mind?", font=_font(12, "medium"),
@@ -6214,10 +7405,10 @@ class ImageSearchApp:
         ctk.CTkCheckBox(
             body, text="Include app details (version, system, recent error log)",
             variable=details, font=_font(12), text_color=TEXT_SOFT, fg_color=PRIMARY,
-            hover_color=PRIMARY_HOVER, checkmark_color="#ffffff", border_color="#3f4a44",
+            hover_color=PRIMARY_HOVER, checkmark_color=_c("#ffffff"), border_color=_c("#3f4a44"),
             checkbox_width=18, checkbox_height=18,
         ).pack(anchor="w")
-        error = ctk.CTkLabel(body, text="", font=_font(12), text_color="#f87171", anchor="w")
+        error = ctk.CTkLabel(body, text="", font=_font(12), text_color=_c("#f87171"), anchor="w")
         error.pack(fill=tk.X, pady=(6, 0))
 
         def send():
@@ -6630,7 +7821,7 @@ class ImageSearchApp:
 
         scrim = tk.Toplevel(root)
         scrim.overrideredirect(True)
-        scrim.configure(bg="#000000")
+        scrim.configure(bg=_c("#000000"))
         try:
             scrim.attributes("-alpha", 0.0)
             scrim.transient(root)
@@ -6831,6 +8022,13 @@ class ImageSearchApp:
         f = self.__dict__.get("_filters")
         if f is None:
             f = self._filters = {"shape": None, "people": None}
+            if _setting("remember_filters", False):
+                saved = _setting("filters", {})
+                if isinstance(saved, dict):
+                    if saved.get("shape") in ("landscape", "portrait"):
+                        f["shape"] = saved["shape"]
+                    if saved.get("people") in ("with", "without"):
+                        f["people"] = saved["people"]
         return f
 
     def _filters_active(self):
@@ -6842,7 +8040,7 @@ class ImageSearchApp:
         box = ctk.CTkFrame(bar, fg_color="transparent")
         box.pack(side=tk.RIGHT, padx=(8, 0))
         if not hasattr(self, "_filter_count_var"):
-            self._filter_count_var = tk.StringVar(value="")
+            self._filter_count_var = _TVar(value="")
         ctk.CTkLabel(box, textvariable=self._filter_count_var, text_color=FAINT_TEXT,
                      font=_font(12)).pack(side=tk.LEFT, padx=(0, 6))
 
@@ -6875,6 +8073,8 @@ class ImageSearchApp:
                 "The people filter needs the photo library - load it with Check for new photos.")
             return
         f[group] = value if turning_on else None
+        if _setting("remember_filters", False):
+            _set_setting("filters", dict(f))
         self._refresh_suggestions()
         if getattr(self, "_sample_view", False):
             self._show_all_photos()
@@ -7637,7 +8837,8 @@ class ImageSearchApp:
         seen = str(self._read_json(self._whats_new_path()).get("seen") or "0")
         if seen != APP_VERSION and version_tuple(APP_VERSION) > version_tuple(seen):
             self._mark_whats_new_seen()
-            self._show_whats_new(fresh=True)
+            if _setting("whats_new", True):
+                self._show_whats_new(fresh=True)
 
     def _start_tour_when_ready(self, waited=0):
         """Starts the first-run tour once the window is really on screen -
@@ -7665,7 +8866,7 @@ class ImageSearchApp:
         rw, rh = root.winfo_width(), root.winfo_height()
         scrim = tk.Toplevel(root)
         scrim.overrideredirect(True)
-        scrim.configure(bg="#000000")
+        scrim.configure(bg=_c("#000000"))
         try:
             scrim.attributes("-alpha", 0.0)
             scrim.transient(root)
@@ -9299,11 +10500,11 @@ class ImageSearchApp:
 
 # ---------- startup: splash and reveal ----------
 
-SPLASH_BG = "#090b0a"  # the window's own background, so the handover is seamless
-SPLASH_TRACK = "#1d2621"
-SPLASH_ACCENT = "#34d399"  # a soft white, matching the neutral palette
-SPLASH_FAINT = "#6b7a72"
-SPLASH_BORDER = "#24302a"
+SPLASH_BG = _c("#090b0a")  # the window's own background, so the handover is seamless
+SPLASH_TRACK = _c("#1d2621")
+SPLASH_ACCENT = _c("#34d399")  # a soft white, matching the neutral palette
+SPLASH_FAINT = _c("#6b7a72")
+SPLASH_BORDER = _c("#24302a")
 FRAME_MS = 8
 
 
@@ -10023,7 +11224,7 @@ class CropCanvas:
     MIN_SIZE = 48    # px on screen
 
     def __init__(self, parent, on_change=None):
-        self.canvas = tk.Canvas(parent, bg=BG_COLOR, highlightthickness=0, bd=0)
+        self.canvas = tk.Canvas(parent, bg=PHOTO_BG, highlightthickness=0, bd=0)
         self.item = self.canvas.create_image(0, 0, anchor="nw")
         self.image = None
         self.disp = self.dark = None
@@ -10180,17 +11381,17 @@ class CropCanvas:
         c.itemconfigure(self.item, image=self.photo)
         c.coords(self.item, x, y)
         c.delete("crop")
-        c.create_rectangle(sx0, sy0, sx1, sy1, outline="#ffffff", width=1, tags="crop")
+        c.create_rectangle(sx0, sy0, sx1, sy1, outline=_c("#ffffff"), width=1, tags="crop")
         if self._drag is not None or self._busy:
             for i in (1, 2):
                 gx = sx0 + (sx1 - sx0) * i / 3
                 gy = sy0 + (sy1 - sy0) * i / 3
-                c.create_line(gx, sy0, gx, sy1, fill="#cfd8d3", width=1, tags="crop")
-                c.create_line(sx0, gy, sx1, gy, fill="#cfd8d3", width=1, tags="crop")
+                c.create_line(gx, sy0, gx, sy1, fill=_c("#cfd8d3"), width=1, tags="crop")
+                c.create_line(sx0, gy, sx1, gy, fill=_c("#cfd8d3"), width=1, tags="crop")
         arm = max(10, min(22, (sx1 - sx0) / 4, (sy1 - sy0) / 4))
         for cx, cy, dx, dy in ((sx0, sy0, 1, 1), (sx1, sy0, -1, 1), (sx0, sy1, 1, -1),
                                (sx1, sy1, -1, -1)):
-            c.create_line(cx, cy + dy * arm, cx, cy, cx + dx * arm, cy, fill="#ffffff",
+            c.create_line(cx, cy + dy * arm, cx, cy, cx + dx * arm, cy, fill=_c("#ffffff"),
                           width=3, capstyle="round", joinstyle="round", tags="crop")
 
     # --- dragging ---
@@ -10536,7 +11737,7 @@ class PhotoViewer:
             image = _icon_tk(icon, 18, TEXT_COLOR)
             glyph = (c.create_image(r, r, image=image, tags=("nav", f"nav_{side}")) if image
                      else c.create_text(r, r, text="‹" if side == "prev" else "›",
-                                        fill=TEXT_COLOR, font=(UI_FONT, -20),
+                                        fill=TEXT_COLOR, font=(UI_FONT, -_fs(20)),
                                         tags=("nav", f"nav_{side}")))
             self._nav[side] = {"disc": disc, "glyph": glyph, "image": image}
             c.tag_bind(f"nav_{side}", "<Button-1>", lambda _e, f=command: f())
@@ -10783,19 +11984,19 @@ class Tour:
         self.bubble_box = None
         self._moving = False
         self._still = 0
-        self.outline = _OutlineBars(self.root, "#34d399") if IS_MAC else None
+        self.outline = _OutlineBars(self.root, _c("#34d399")) if IS_MAC else None
         self.overlay = tk.Toplevel(self.root)
         if self.outline is not None:
             self.overlay.withdraw()  # kept only so the code below has a window
         self.overlay.overrideredirect(True)
         self.overlay.transient(self.root)
-        self.overlay.configure(bg="#000000")
+        self.overlay.configure(bg=_c("#000000"))
         try:
             self.overlay.attributes("-transparentcolor", self.KEY)
             self.overlay.attributes("-alpha", 0.0)
         except tk.TclError:
             pass
-        self.canvas = tk.Canvas(self.overlay, bg="#000000", highlightthickness=0, bd=0)
+        self.canvas = tk.Canvas(self.overlay, bg=_c("#000000"), highlightthickness=0, bd=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.hole = self.canvas.create_polygon(0, 0, 0, 0, fill=self.KEY, outline="", smooth=True)
         self.card_hole = self.canvas.create_polygon(0, 0, 0, 0, fill=self.KEY, outline="",
@@ -11196,10 +12397,10 @@ class BootSplash:
             self._shield_frames = []
 
         title = c.create_text(cx, oy + 160, text=APP_NAME, fill=SPLASH_BG,
-                              font=(UI_FONT_SEMIBOLD, -26))
+                              font=(UI_FONT_SEMIBOLD, -_fs(26)))
         self._entrance.append((90, lambda q: self._fade_text(title, TEXT_COLOR, cx, oy + 160, q)))
         subtitle = c.create_text(cx, oy + 190, text="Marketing photo library", fill=SPLASH_BG,
-                                 font=(UI_FONT, -14))
+                                 font=(UI_FONT, -_fs(14)))
         self._entrance.append(
             (130, lambda q: self._fade_text(subtitle, MUTED_TEXT_COLOR, cx, oy + 190, q))
         )
@@ -11228,7 +12429,7 @@ class BootSplash:
 
         self._status_xy = (cx, oy + 252)
         self._status = c.create_text(*self._status_xy, text="Starting…", fill=SPLASH_BG,
-                                     font=(UI_FONT, -12))
+                                     font=(UI_FONT, -_fs(12)))
         self._entrance.append(
             (200, lambda q: self._fade_text(self._status, MUTED_TEXT_COLOR, *self._status_xy, q))
         )
@@ -11236,7 +12437,7 @@ class BootSplash:
         if stamp:
             version = c.create_text(ox + self.CARD_W - 16, oy + self.CARD_H - 12,
                                     text=f"version {APP_VERSION}", anchor="se",
-                                    fill=SPLASH_BG, font=(UI_FONT, -11))
+                                    fill=SPLASH_BG, font=(UI_FONT, -_fs(11)))
             self._entrance.append(
                 (240, lambda q: c.itemconfigure(version, fill=_mix(SPLASH_BG, SPLASH_FAINT, q)))
             )
@@ -11583,7 +12784,8 @@ def main():
         )
     except Exception:
         pass
-    ctk.set_appearance_mode("dark")
+    ctk.set_appearance_mode(_THEME)
+    _scale_ctk_default_font()
     # One typeface throughout. CustomTkinter defaults to Roboto, which mixed
     # with the Segoe UI used for headings made the window look assembled.
     try:
