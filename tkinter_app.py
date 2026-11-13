@@ -1810,6 +1810,7 @@ class ImageSearchApp:
                     tail = self._interleave_by_folder(tail)
                     tail = self._order_by_orientation_and_people(tail)
                     results = head + tail
+                self._stack_extras = self._burst_extras(results, effective_subset)
                 self.event_queue.put(("search_done", results))
             except Exception as exc:
                 self.event_queue.put(("error", str(exc)))
@@ -1863,7 +1864,9 @@ class ImageSearchApp:
                 # engine's order, variety is applied only below them.
                 head, tail = results[:RELEVANCE_HEAD], results[RELEVANCE_HEAD:]
                 self._last_search_mode = "image"
-                self.event_queue.put(("search_done", head + self._interleave_by_folder(tail)))
+                similar = head + self._interleave_by_folder(tail)
+                self._stack_extras = self._burst_extras(similar, subset)
+                self.event_queue.put(("search_done", similar))
             except Exception as exc:
                 self.event_queue.put(("error", str(exc)))
 
@@ -3543,6 +3546,9 @@ class ImageSearchApp:
         the star - always when it is a favourite, otherwise only on hover,
         so a screen of photos is not covered in empty stars.
         """
+        stack = self._stack_role(path)
+        if stack is not None:
+            return self._stack_tile_pil(path, size, favourite, hover, selected, stack)
         img = ImageOps.fit(self._thumb_image(path), size, Image.LANCZOS)
         tile = Image.new("RGBA", size, _hex_rgb(BG_COLOR) + (255,))
         tile.paste(img, (0, 0), self._tile_mask(size))
@@ -3594,6 +3600,10 @@ class ImageSearchApp:
             return
         dragged = self._drag is not None and self._drag.get("active")
         self._drag_release(event)
+        if not dragged and self._stack_pill_hit(event):
+            # After this click has finished: the tile it landed on is rebuilt.
+            self.root.after(1, lambda w=event.widget: self._toggle_stack(w))
+            return
         if not dragged and getattr(self, "_sel", None):
             # While photos are picked, a plain click adds or drops one.
             pos = getattr(event.widget, "pos", None)
@@ -3606,6 +3616,9 @@ class ImageSearchApp:
             self._on_star_clicked(key, path, meta, event.widget)
 
     def _on_thumb_double(self, event, path, meta):
+        if (self._stack_pill_hit(event)
+                or time.perf_counter() - self._stack_state()["toggled_at"] < 0.4):
+            return  # the clicks were for the stack's pill, not for opening the photo
         if getattr(self, "_sel", None):
             return  # picking photos, not opening one
         if self._in_star(event):
@@ -7254,6 +7267,10 @@ class ImageSearchApp:
         self._shown_results = shown
         self._tile_by_pos = {}
         self._show_filter_count(len(results), len(shown))
+        # Near-identical photos fold into stacks; what is laid out from here
+        # on (and what positions, selection and the preview count in) is the
+        # list of tiles, not the list of photos.
+        shown = self._shown_results = self._apply_stacks(results, shown, keep_scroll)
         self._restore_scroll = None
         if keep_scroll:
             try:
@@ -7347,6 +7364,7 @@ class ImageSearchApp:
     def _build_row(self, items, widths, height):
         row = tk.Frame(self.results_frame, bg=BG_COLOR, bd=0, highlightthickness=0)
         row.pack(anchor="w", padx=(GRID_SIDE_PAD, 0), pady=(0, TILE_GAP))
+        row.start_pos = items[0][3]  # lets a stack re-lay the grid from this row on
         for i, ((path, meta, _a, pos), w) in enumerate(zip(items, widths)):
             key = self._fav_key(path, meta)
             size = (w, height)
@@ -7381,9 +7399,492 @@ class ImageSearchApp:
             label.selected = False
             label.sel_image = None
             self._tile_by_pos[pos] = label
+            self._stack_tile_built(label, pos, path)
             label.bind("<Shift-Button-1>", lambda e, p=pos: self._select_click(p, "range"))
             label.bind("<Command-Button-1>" if IS_MAC else "<Control-Button-1>",
                        lambda e, p=pos: self._select_click(p, "toggle"))
+
+    # ---------- stacks of near-identical photos ----------
+    #
+    # A burst of the same moment shows as one tile: the best-ranked photo on
+    # top, the edges of two cards peeking out below it, and a small pill with
+    # how many there are. A click on the pill lays the others out right
+    # after it (they fade in one after another); the pill then folds them
+    # back. Folded, whatever is done to the tile is done to the top photo.
+    #
+    # Photos count as one burst above 0.96 similarity to the top photo.
+    # Looked at on this library: above 0.96, pairs are the same frame a
+    # moment apart; between 0.92 and 0.96 it is the same scene re-framed or
+    # with people moved, which should stay separate tiles.
+    #
+    # A search already leaves near-duplicates of a result out (see
+    # ImageSearchEngine._rank). _burst_extras finds the closest of them
+    # again, so they sit under that result instead of being lost.
+
+    STACK_SIMILARITY = 0.96
+    STACK_MAX_EXTRAS = 24      # burst photos brought in from outside the results, per stack
+    STACK_MAX_GROUPING = 4000  # more photos than this on screen: no grouping (it compares all pairs)
+    STACK_PEEK = 4             # px each card behind shows below the one in front
+
+    def _stack_state(self):
+        st = self.__dict__.get("_stacks")
+        if st is None:
+            st = self._stacks = {
+                "source": None,     # the results list the groups were made for
+                "groups": {},       # top photo's path -> [(path, score, meta), ...] under it
+                "member_of": {},    # a folded photo's path -> its top photo's path
+                "open": set(),      # top photos whose stack is laid out
+                "fade": set(),      # photos that fade in when their tile is built
+                "fade_n": 0,
+                "busy": False,
+                "toggled_at": 0.0,
+            }
+        return st
+
+    def _burst_extras(self, results, subset=None):
+        """For each search result, the library photos that are the same burst
+        but were left out of the results. Runs on the search thread.
+        Returns {"for": results, "members": {path: [(path, score, meta), ...]}}."""
+        out = {"for": results, "members": {}}
+        try:
+            embeddings = self.engine.embeddings
+            paths, metas = self.engine.paths, self.engine.meta
+            if embeddings is None or not results:
+                return out
+            index = self._path_index()
+            rows = [(r, index.get(r[0])) for r in results]
+            rows = [(r, i) for r, i in rows if i is not None and i < len(embeddings)]
+            if not rows:
+                return out
+            allowed = None if subset is None else set(subset)
+            taken = {i for _r, i in rows}
+            sims = embeddings[[i for _r, i in rows]] @ embeddings.T
+            for k, (result, _i) in enumerate(rows):
+                near = np.nonzero(sims[k] > self.STACK_SIMILARITY)[0]
+                if len(near) <= 1:
+                    continue
+                members = []
+                for j in near[np.argsort(-sims[k][near])].tolist():
+                    if j in taken or (allowed is not None and j not in allowed):
+                        continue
+                    taken.add(j)
+                    members.append((paths[j], result[1], metas[j]))
+                    if len(members) >= self.STACK_MAX_EXTRAS:
+                        break
+                if members:
+                    out["members"][result[0]] = members
+        except Exception as exc:
+            _log_reuse(f"STACK EXTRAS FAILED: {exc!r}")
+        return out
+
+    def _group_stacks(self, results, shown):
+        """{top photo's path: [the results folded under it]} for what is
+        about to be shown. The first of a burst in display order is its top
+        photo; the others must be near *it*, so a stack never drifts from
+        one moment to the next along a chain of look-alikes."""
+        embeddings = self.engine.embeddings
+        if embeddings is None or not shown:
+            return {}
+        index = self._path_index()
+        idx = [index.get(r[0]) for r in shown]
+        valid = [k for k, i in enumerate(idx) if i is not None and i < len(embeddings)]
+        groups = {}
+        folded = set()
+        if 2 <= len(valid) <= self.STACK_MAX_GROUPING:
+            vectors = embeddings[[idx[k] for k in valid]]
+            sims = vectors @ vectors.T
+            for a, k in enumerate(valid):
+                if k in folded:
+                    continue
+                near = [valid[b] for b in np.nonzero(sims[a] > self.STACK_SIMILARITY)[0].tolist()
+                        if b > a and valid[b] not in folded]
+                if near:
+                    folded.update(near)
+                    groups[shown[k][0]] = [shown[b] for b in near]
+        extras = self.__dict__.get("_stack_extras")
+        if extras and extras.get("for") is results and extras.get("members"):
+            shown_paths = {r[0] for r in shown}
+            folded_paths = {shown[k][0] for k in folded}
+            for lead, more in extras["members"].items():
+                if lead not in shown_paths or lead in folded_paths:
+                    continue
+                more = [m for m in self._apply_filters(list(more)) if m[0] not in shown_paths]
+                if more:
+                    groups.setdefault(lead, [])
+                    groups[lead] = groups[lead] + more
+        return groups
+
+    def _apply_stacks(self, results, shown, keep_scroll=False):
+        """Folds bursts in `shown` into stacks and returns the list of tiles
+        to lay out: folded photos left out, the photos of an opened stack
+        right after its top photo."""
+        st = self._stack_state()
+        if results is not st["source"] and not keep_scroll:
+            st["open"] = set()  # a new set of results starts folded
+        st["source"] = results
+        st["groups"], st["member_of"] = {}, {}
+        st["fade"], st["fade_n"], st["busy"] = set(), 0, False
+        try:
+            groups = self._group_stacks(results, shown)
+        except Exception as exc:
+            _log_reuse(f"STACKS FAILED: {exc!r}")
+            groups = {}
+        if not groups:
+            st["open"] = set()
+            return shown
+        st["groups"] = groups
+        st["member_of"] = {m[0]: lead for lead, members in groups.items() for m in members}
+        st["open"] &= set(groups)
+        tiles = []
+        for result in shown:
+            if result[0] in st["member_of"]:
+                continue
+            tiles.append(result)
+            if result[0] in st["open"]:
+                tiles.extend(groups[result[0]])
+        return tiles
+
+    def _stack_role(self, path):
+        """None for an ordinary photo; ("lead", how many photos, laid out?)
+        for the top of a stack; ("member", top photo's path) for a photo of
+        a stack that is laid out."""
+        st = self.__dict__.get("_stacks")
+        if not st or not st["groups"]:
+            return None
+        members = st["groups"].get(path)
+        if members:
+            return ("lead", len(members) + 1, path in st["open"])
+        lead = st["member_of"].get(path)
+        if lead is not None and lead in st["open"]:
+            return ("member", lead)
+        return None
+
+    def _stack_front_height(self, size, role):
+        """How tall the top photo is drawn: a folded stack gives up a few
+        pixels at the bottom to the cards behind it."""
+        w, h = size
+        if role and role[0] == "lead" and not role[2] and w >= 60 and h >= 60:
+            return h - 2 * self.STACK_PEEK
+        return h
+
+    def _stack_tile_pil(self, path, size, favourite, hover, selected, role):
+        """A tile that belongs to a stack. Folded: the photo with two cards
+        peeking out below, each narrower and dimmer, and the count. Laid
+        out: the photo as usual with the pill that folds it back; the other
+        photos of the stack carry a small mark."""
+        w, h = size
+        page = _hex_rgb(BG_COLOR)
+        thumb = self._thumb_image(path)
+        tile = Image.new("RGBA", size, page + (255,))
+        front_h = self._stack_front_height(size, role)
+        front = ImageOps.fit(thumb, (w, front_h), Image.LANCZOS).convert("RGB")
+        if front_h != h:
+            for depth in (2, 1):
+                inset = 6 * depth
+                card_w = w - 2 * inset
+                card = front.resize((card_w, front_h), Image.BILINEAR)
+                card = Image.blend(card, Image.new("RGB", card.size, page), 0.3 + 0.2 * depth)
+                tile.paste(card, (inset, depth * self.STACK_PEEK), self._tile_mask(card.size))
+        tile.paste(front, (0, 0), self._tile_mask((w, front_h)))
+        if favourite or hover:
+            badge = self._star_badges()[bool(favourite)]
+            tile.alpha_composite(badge, (w - badge.width - STAR_BADGE_INSET, STAR_BADGE_INSET))
+        pill = self._stack_pill(role)
+        if self._stack_pill_fits(pill, w, front_h):
+            tile.alpha_composite(pill, (w - pill.width - 6, front_h - pill.height - 6))
+        if selected:
+            tile = self._selected_look(tile, size)
+        return tile
+
+    def _stack_pill(self, role):
+        """The small pill in the bottom right corner, clear of the star (top
+        right) and the tick of a picked photo (top left): the count on a
+        folded stack, the same in green with a fold mark on one that is laid
+        out, a plain mark on its other photos. Drawn once per look."""
+        if role[0] == "lead":
+            kind, count = ("open" if role[2] else "closed"), role[1]
+        else:
+            kind, count = "member", 0
+        cache = self.__dict__.setdefault("_stack_pills", {})
+        key = (kind, count, BG_COLOR, NAV_SELECTED, PRIMARY)
+        if key in cache:
+            return cache[key]
+        k, height = 4, 20
+        text = str(count) if kind != "member" else ""
+        glyph = _lucide_glyph({"closed": "layers", "open": "chevrons-right-left",
+                               "member": "layers"}[kind])
+        icon_font = text_font = None
+        try:
+            if glyph:
+                icon_font = ImageFont.truetype(_resource_path("assets", "fonts", "lucide.ttf"), 11 * k)
+        except Exception:
+            icon_font = None
+        try:
+            text_font = ImageFont.truetype(
+                _resource_path("assets", "fonts", "Inter-SemiBold.ttf"), 11 * k)
+        except Exception:
+            try:
+                text_font = ImageFont.load_default(11 * k)
+            except Exception:
+                text_font = None
+        if not icon_font and not text:
+            cache[key] = None
+            return None
+        probe = ImageDraw.Draw(Image.new("RGBA", (4, 4)))
+        text_w = 0
+        if text:
+            text_w = (probe.textlength(text, font=text_font) if text_font
+                      else 6 * k * len(text))
+        icon_w = 11 * k if icon_font else 0
+        pad = 7 * k
+        gap = 4 * k if (icon_w and text) else 0
+        width = max(height * k, round(pad + icon_w + gap + text_w + pad))
+        big = Image.new("RGBA", (width, height * k), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(big)
+        if kind == "open":
+            fill, outline = _hex_rgb(NAV_SELECTED) + (240,), _hex_rgb(PRIMARY) + (255,)
+        else:
+            fill, outline = _hex_rgb(BG_COLOR) + (205,), (255, 255, 255, 52)
+        ink = (250, 250, 250, 255) if kind != "member" else (250, 250, 250, 200)
+        draw.rounded_rectangle((0, 0, width - 1, height * k - 1), radius=height * k // 2,
+                               fill=fill, outline=outline, width=k)
+        x = (width - icon_w - gap - text_w) / 2
+        if icon_font:
+            left, top, right, bottom = draw.textbbox((0, 0), glyph, font=icon_font)
+            draw.text((x + (icon_w - (right - left)) / 2 - left,
+                       (height * k - (bottom - top)) / 2 - top), glyph, font=icon_font, fill=ink)
+            x += icon_w + gap
+        if text:
+            if text_font:
+                left, top, right, bottom = draw.textbbox((0, 0), text, font=text_font)
+                draw.text((x - left, (height * k - (bottom - top)) / 2 - top), text,
+                          font=text_font, fill=ink)
+            else:
+                draw.text((x, height * k / 2 - 5), text, fill=ink)
+        pill = big.resize((max(1, round(width / k)), height), Image.LANCZOS)
+        cache[key] = pill
+        return pill
+
+    @staticmethod
+    def _stack_pill_fits(pill, width, front_height):
+        """A very narrow tile has no room for the pill; then it is neither
+        drawn nor clickable."""
+        return (pill is not None and width >= pill.width + 8
+                and front_height >= pill.height + 16)
+
+    def _stack_pill_hit(self, event):
+        """Whether a click on a tile landed on its stack pill (with a little
+        slack, since it is small)."""
+        try:
+            path, size, _key = event.widget.tile
+        except Exception:
+            return False
+        role = self._stack_role(path)
+        if role is None:
+            return False
+        pill = self._stack_pill(role)
+        w = size[0]
+        bottom = self._stack_front_height(size, role) - 6
+        if not self._stack_pill_fits(pill, w, bottom + 6):
+            return False
+        return (w - 6 - pill.width - 5 <= event.x <= w
+                and bottom - pill.height - 5 <= event.y <= bottom + 5)
+
+    @staticmethod
+    def _stack_shift(pos, lead_pos, delta):
+        """Where a tile position ends up when `delta` tiles are added
+        (delta > 0) or taken away (delta < 0) right after `lead_pos`. None
+        for a tile that is folded away."""
+        if pos <= lead_pos:
+            return pos
+        if delta >= 0:
+            return pos + delta
+        return pos + delta if pos > lead_pos - delta else None
+
+    def _toggle_stack(self, label):
+        """Lays a stack out right after its top photo, or folds it back."""
+        st = self._stack_state()
+        if st["busy"]:
+            return
+        try:
+            if not label.winfo_exists():
+                return
+            path = label.tile[0]
+        except Exception:
+            return
+        role = self._stack_role(path)
+        if role is None:
+            return
+        lead = path if role[0] == "lead" else role[1]
+        shown = self._shown_results
+        members = st["groups"].get(lead) or []
+        lead_pos = next((i for i, r in enumerate(shown) if r[0] == lead), None)
+        if lead_pos is None or not members:
+            return
+        st["toggled_at"] = time.perf_counter()
+        n = len(members)
+        if lead not in st["open"]:
+            st["open"].add(lead)
+            st["fade"], st["fade_n"] = {m[0] for m in members}, 0
+            self._stack_reflow(shown[:lead_pos + 1] + list(members) + shown[lead_pos + 1:],
+                               lead_pos, n)
+            return
+        laid_out = shown[lead_pos + 1:lead_pos + 1 + n]
+        if [r[0] for r in laid_out] != [m[0] for m in members]:
+            st["open"].discard(lead)
+            self._render_results(self._last_results, keep_scroll=True)
+            return
+
+        def fold():
+            st["busy"] = False
+            if self._shown_results is not shown:
+                return  # the grid was redrawn in the meantime
+            st["open"].discard(lead)
+            self._stack_reflow(shown[:lead_pos + 1] + shown[lead_pos + 1 + n:], lead_pos, -n)
+
+        leaving = [self._tile_by_pos.get(p) for p in range(lead_pos + 1, lead_pos + 1 + n)]
+        leaving = [w for w in leaving if w is not None]
+        if not leaving or self._motion_reduced():
+            fold()
+            return
+        # Out faster than in: 110 ms, all together.
+        st["busy"] = True
+        page = _hex_rgb(BG_COLOR) + (255,)
+        fading = []
+        for widget in leaving:
+            try:
+                tile_path, size, key = widget.tile
+                tile = self._tile_pil(tile_path, size, key in self._render_favs)
+                blank = Image.new("RGBA", size, page)
+                widget.fade_frames = [ImageTk.PhotoImage(Image.blend(tile, blank, a))
+                                      for a in (0.4, 0.7, 1.0)]
+                widget.dragging = True  # no hover star while it goes
+                fading.append(widget)
+            except Exception:
+                pass
+
+        def step(p):
+            for widget in fading:
+                try:
+                    frames = widget.fade_frames
+                    widget.configure(image=frames[min(len(frames) - 1, int(p * len(frames)))])
+                except tk.TclError:
+                    pass
+
+        _animate(self.root, 110, step, done=fold, ease=EASE_OUT)
+
+    def _stack_reflow(self, tiles, lead_pos, delta):
+        """Re-lays the grid from the row of the tile at `lead_pos` on, after
+        `delta` tiles were added or taken away right behind it. The rows
+        above stay as they are, so nothing jumps; picked photos stay picked."""
+        label = self._tile_by_pos.get(lead_pos)
+        start = getattr(getattr(label, "master", None), "start_pos", None)
+        if label is None or start is None:
+            self._render_results(self._last_results, keep_scroll=True)
+            return
+        if self._render_after_id is not None:
+            try:
+                self.root.after_cancel(self._render_after_id)
+            except Exception:
+                pass
+            self._render_after_id = None
+        canvas = self.results_frame._parent_canvas
+        try:
+            top = canvas.canvasy(0)
+        except Exception:
+            top = None
+        for row in self.results_frame.winfo_children():
+            if getattr(row, "start_pos", -1) >= start:
+                row.destroy()
+        for pos in [p for p in self._tile_by_pos if p >= start]:
+            del self._tile_by_pos[pos]
+        sel = getattr(self, "_sel", None)
+        had_picks = bool(sel)
+        if had_picks:
+            moved = {}
+            for pos, item in sel.items():
+                new_pos = self._stack_shift(pos, lead_pos, delta)
+                if new_pos is not None:
+                    moved[new_pos] = item
+            sel.clear()
+            sel.update(moved)
+            anchor = getattr(self, "_sel_anchor", None)
+            if anchor is not None:
+                anchor = self._stack_shift(anchor, lead_pos, delta)
+                self._sel_anchor = lead_pos if anchor is None else anchor
+        self._shown_results = tiles
+        self._restore_scroll = None
+        avail = max(320, self._current_columns - 2 * GRID_SIDE_PAD - 4)
+        self._render_chunk(tiles, start, avail)
+        if had_picks:
+            self._update_selection_bar()
+        if top is None:
+            return
+
+        def settle(tries=40, last=False):
+            # While the rows below are being rebuilt the grid is briefly
+            # shorter, and the view can slip upwards; put it back. Stops
+            # once the rows are all there, so it never fights the wheel.
+            try:
+                region = [float(v) for v in str(canvas.cget("scrollregion")).split()]
+                height = (region[3] - region[1]) if len(region) == 4 else 0
+                if canvas.canvasy(0) < top - 1 and height > 0:
+                    canvas.yview_moveto(max(0.0, (top - region[1]) / height))
+                if last:
+                    return
+                if tries > 0 and self._render_after_id is not None:
+                    self.root.after(30, lambda: settle(tries - 1))
+                else:
+                    self.root.after(60, lambda: settle(0, True))
+            except Exception:
+                pass
+
+        self.root.after(15, settle)
+
+    def _stack_tile_built(self, label, pos, path):
+        """Called for every tile as it is built: a photo that was picked
+        before the grid was re-laid shows as picked again, and the photos of
+        a stack that was just laid out fade in one after another (ease-out,
+        180 ms, 35 ms apart)."""
+        sel = getattr(self, "_sel", None)
+        if sel and pos in sel:
+            label.selected = True
+            self._paint_tile(label)
+        st = self.__dict__.get("_stacks")
+        if not st or path not in st["fade"]:
+            return
+        st["fade"].discard(path)
+        if label.selected or self._motion_reduced():
+            return
+        order = st["fade_n"]
+        st["fade_n"] += 1
+        try:
+            _path, size, key = label.tile
+            tile = self._tile_pil(path, size, key in self._render_favs)
+            blank = Image.new("RGBA", size, _hex_rgb(BG_COLOR) + (255,))
+            frames = [ImageTk.PhotoImage(Image.blend(blank, tile, a)) for a in (0.3, 0.6, 0.85)]
+            empty = ImageTk.PhotoImage(blank)
+            label.fade_frames = frames + [empty]
+            label.dragging = True  # no hover star until it has arrived
+            label.configure(image=empty)
+        except Exception:
+            label.dragging = False
+            return
+
+        def step(p):
+            if p < 1.0:
+                label.configure(image=frames[min(len(frames) - 1, int(p * len(frames)))])
+
+        def arrived():
+            try:
+                label.dragging = False
+                label.fade_frames = None
+                self._paint_tile(label)
+            except tk.TclError:
+                pass
+
+        self.root.after(min(order, 8) * 35,
+                        lambda: _animate(self.root, 180, step, done=arrived, ease=EASE_OUT))
 
     def _fade_tile_out(self, widget, done):
         """A photo leaving the grid: it sinks into the page (ease-out, 180 ms)."""
