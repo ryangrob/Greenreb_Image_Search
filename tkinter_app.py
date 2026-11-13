@@ -988,14 +988,29 @@ class ImageSearchApp:
 
         system = self.system_section = ctk.CTkFrame(nav, fg_color="transparent")
         system.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 10))
-        # Two quiet rows instead of a whole section: fetching new photos is
-        # the one thing people do from here often. Updates, settings, support
-        # and the tour sit behind More, so the collections above get the room.
+        # Everything one click away, but small: a full row for the thing done
+        # most often, the rest as compact pairs - about half the height of a
+        # plain list, so the collections above keep their room.
+        section(system, "SYSTEM", pady=(4, 0))
         self.sharepoint_button = self._make_system_item(
             system, "  Check for new photos", self._browse_sharepoint, icon="refresh"
         )
-        more = self.more_button = self._make_system_item(system, "  More", None, icon="more")
-        more.configure(command=lambda: self._show_more_menu(more))
+        pairs = ctk.CTkFrame(system, fg_color="transparent")
+        pairs.pack(fill=tk.X)
+        pairs.grid_columnconfigure((0, 1), weight=1, uniform="system")
+        entries = [
+            ("Updates", "update", lambda: self._check_for_updates(interactive=True)),
+            ("Local folder", "local", None),
+            ("Settings", "settings", self._open_settings),
+            ("Support", "support", self._show_support_form),
+            ("Tour", "tour", self._start_tour),
+            ("About", "info", self._show_about),
+        ]
+        for n, (text, icon, command) in enumerate(entries):
+            item = self._make_system_item(pairs, f" {text}", command, icon=icon, compact=True)
+            item.grid(row=n // 2, column=n % 2, sticky="ew")
+            if command is None:
+                item.configure(command=lambda w=item: self._show_local_folder_menu(w))
         # Not shown: only its enabled state is used, by the Local folder menu.
         self.index_button = ctk.CTkButton(system, text="", command=self._start_indexing)
         self.index_button.configure(state=tk.DISABLED)
@@ -1157,17 +1172,19 @@ class ImageSearchApp:
         self._bind_selection_keys()
         self._set_view("all")
 
-    def _make_system_item(self, parent, text, command, icon):
+    def _make_system_item(self, parent, text, command, icon, compact=False):
         """A System entry: smaller and quieter than the library and
         collections above it - used now and then, so it steps back and
-        leaves room for more collections."""
+        leaves room for more collections. Compact ones sit two to a row."""
         item = ctk.CTkButton(
-            parent, text=text, command=command, height=28, corner_radius=7,
+            parent, text=text, command=command, height=24 if compact else 26, corner_radius=7,
             fg_color=NAV_BG, hover_color=NAV_HOVER, text_color=SYSTEM_TEXT,
-            text_color_disabled=FAINT_TEXT, anchor="w", image=_icon(icon, 14, SYSTEM_TEXT),
-            compound="left", font=_font(12, "medium"),
+            text_color_disabled=FAINT_TEXT, anchor="w", width=0,
+            image=_icon(icon, 12 if compact else 13, SYSTEM_TEXT),
+            compound="left", font=_font(11, "medium"),
         )
-        item.pack(fill=tk.X, pady=0)
+        if not compact:
+            item.pack(fill=tk.X, pady=0)
         return item
 
     def _make_collection_card(self, parent, text, command, icon="folder"):
@@ -1325,6 +1342,7 @@ class ImageSearchApp:
         total = len(self.engine.paths)
         if not total:
             self._render_results([])
+            self._render_placeholder_grid()
             self.status_var.set(
                 "No photos yet - click Check for new photos (bottom left) to load the library "
                 "from SharePoint. The first time takes a few minutes."
@@ -1356,7 +1374,7 @@ class ImageSearchApp:
         extra = f" (showing first {DEFAULT_TOP_K})" if len(idxs) > DEFAULT_TOP_K else ""
         self.status_var.set(f"{len(idxs)} photo(s) in {name}{extra}. Search to narrow it down.")
 
-    def _show_favourites(self):
+    def _show_favourites(self, keep_scroll=False):
         """Lists every favourite, newest first, with no search term needed."""
         favs = self._load_favourites()
         if not favs:
@@ -1375,7 +1393,7 @@ class ImageSearchApp:
             elif entry.get("path") and os.path.exists(entry["path"]):
                 # Favourited before the current index was loaded - still show it.
                 results.append((entry["path"], 1.0, entry))
-        self._render_results(results)
+        self._render_results(results, keep_scroll=keep_scroll)
         self.status_var.set(f"{len(results)} favourite(s).")
 
     # ---------- folder selection & indexing ----------
@@ -1833,7 +1851,7 @@ class ImageSearchApp:
         def work():
             count = 0
             try:
-                count = self._load_fast_cache()
+                count = 0 if FIRST_RUN_PREVIEW else self._load_fast_cache()
             except Exception:
                 _log_crash("startup load", sys.exc_info())
             if count:
@@ -2188,10 +2206,42 @@ class ImageSearchApp:
         """This machine's saved images, plus any shared by the team."""
         if self._favourites is None:
             merged = dict(self._read_json(self._team_favourites_path()).get("items") or {})
+            # Team picks this person took out of their own view stay out.
+            for key in self._hidden_favourites():
+                merged.pop(key, None)
             # Local saves may not have been shared yet, so they go on top.
             merged.update(self._read_json(self._favourites_path()).get("items") or {})
             self._favourites = merged
         return self._favourites
+
+    def _hidden_favourites_path(self):
+        local_folder, _t, _f, _i = self._sp_cache_dirs()
+        return os.path.join(local_folder, "favourites_hidden.json")
+
+    def _hidden_favourites(self):
+        """Team favourites this person removed from their own view. Only
+        hidden here - the teammate's shortlist is never touched."""
+        return set(self._read_json(self._hidden_favourites_path()).get("items") or [])
+
+    def _set_hidden_favourite(self, key, hidden):
+        keys = self._hidden_favourites()
+        (keys.add if hidden else keys.discard)(key)
+        try:
+            os.makedirs(os.path.dirname(self._hidden_favourites_path()), exist_ok=True)
+            with open(self._hidden_favourites_path(), "w", encoding="utf-8") as f:
+                json.dump({"items": sorted(keys)}, f)
+        except OSError:
+            pass
+
+    def _unfavourite(self, key, path, meta):
+        """Takes a photo out of this person's Favourites: their own star is
+        removed, a teammate's pick is hidden for them only."""
+        if key in self._own_favourites():
+            self._toggle_favourite(key, path, meta)
+        else:
+            self._set_hidden_favourite(key, True)
+        self._favourites = None
+        self._update_favourites_button()
 
     def _own_favourites(self):
         return self._read_json(self._favourites_path()).get("items") or {}
@@ -2225,6 +2275,8 @@ class ImageSearchApp:
                 "item_id": (meta or {}).get("item_id", ""),
             }
             added = True
+            if key in self._hidden_favourites():
+                self._set_hidden_favourite(key, False)  # starred again: back in view
         try:
             os.makedirs(os.path.dirname(self._favourites_path()), exist_ok=True)
             with open(self._favourites_path(), "w", encoding="utf-8") as f:
@@ -3169,6 +3221,8 @@ class ImageSearchApp:
             self._current_columns = columns
             if self._last_results:
                 self._render_results(self._last_results)
+            elif getattr(self, "_placeholder_grid", False):
+                self._render_placeholder_grid()
 
     def _thumb_image(self, path):
         """The decoded thumbnail as a PIL image, cached.
@@ -4486,6 +4540,8 @@ class ImageSearchApp:
         )
 
     def _tour_seen(self):
+        if FIRST_RUN_PREVIEW:
+            return False
         return bool(self._read_json(self._tour_path()).get("seen"))
 
     def _start_tour(self):
@@ -4496,9 +4552,13 @@ class ImageSearchApp:
         empty = not len(self.engine.paths)
         steps = [
             (lambda: [self.search_frame, self.suggestion_bar], "How to browse through the library",
-             "Type what you need in plain English - “burger on a tray”, “friends cheering at "
-             "night” - and press Enter. Got a photo that's close? Use Find similar. Below: your "
-             "recent searches, and filters for landscape, portrait and people."),
+             ("Once your photos are loaded - that's the last step of this tour - type what you "
+              "need in plain English, like “burger on a tray” or “friends cheering at night”, and "
+              "press Enter. Below: your recent searches, and filters for landscape, portrait and "
+              "people." if empty else
+              "Type what you need in plain English - “burger on a tray”, “friends cheering at "
+              "night” - and press Enter. Got a photo that's close? Use Find similar. Below: your "
+              "recent searches, and filters for landscape, portrait and people.")),
             (lambda: [self.collections_heading,
                       getattr(self.sidebar, "_parent_frame", self.sidebar)], "Collections",
              "Your own folders for the photos you keep using. Drag any photo onto one to file "
@@ -4509,19 +4569,26 @@ class ImageSearchApp:
              "can add their own; ↻ fetches what others added. Right-click a shared collection "
              "to change who's in it."),
             (lambda: getattr(self.results_frame, "_parent_frame", self.results_frame), "Your photos",
-             "Double-click for a big preview, right-click to copy it in full resolution, and "
-             "hover to star a favourite. " + ("⌘" if IS_MAC else "Ctrl") + "-click or Shift-click "
-             "to pick several - then add, copy or save them in one go."),
+             ("This is where your photos will be - the grey tiles are placeholders until the "
+              "library is loaded in the last step. Then: double-click for a big preview, "
+              "right-click to copy in full resolution, hover to star a favourite, and "
+              + ("⌘" if IS_MAC else "Ctrl") + "-click or Shift-click to pick several."
+              if empty else
+              "Double-click for a big preview, right-click to copy it in full resolution, and "
+              "hover to star a favourite. " + ("⌘" if IS_MAC else "Ctrl") + "-click or Shift-click "
+              "to pick several - then add, copy or save them in one go.")),
             (lambda: [self.fav_card, self.history_card], "Favourites and history",
              "Every photo you starred and every search you ran - one click to get back to them."),
             (lambda: self.sharepoint_button,
              "Load your photos" if empty else "New photos, updates and help",
-             ("Last step: Check for new photos loads the photo library from SharePoint. It starts "
-              "as soon as you click ✓ - sign in with your Greenreb account, and after a few "
-              "minutes everything is searchable. Updates, settings and help live under More."
+             ("Last step: click ✓ and Topshot loads the photo library from SharePoint. A "
+              "Microsoft sign-in page opens in your browser - sign in with your Greenreb account, "
+              "then come back here. The first load takes a few minutes and shows its progress at "
+              "the top; after that, Topshot opens in seconds. Updates, settings and help live "
+              "down here."
               if empty else
               "Check for new photos brings in the latest shots. The app keeps itself up to date - "
-              "settings, support and this tour live under More. Enjoy!")),
+              "settings, support and this tour live down here. Enjoy!")),
         ]
         self._tour = Tour(self, steps, on_done=self._end_tour)
 
@@ -4537,6 +4604,11 @@ class ImageSearchApp:
             pass
         # Still no photos (a first start): load the library now, whether the
         # tour was finished or skipped - nothing works until this has run once.
+        if FIRST_RUN_PREVIEW:
+            self.status_var.set(
+                "First-run preview finished - on a new computer the library starts loading now. "
+                "Start Topshot normally to get your photos back.")
+            return
         if not len(self.engine.paths) and not self._busy:
             self.root.after(350, self._browse_sharepoint)
 
@@ -5324,14 +5396,14 @@ class ImageSearchApp:
         collect.configure(command=lambda: self._selection_collect_menu(collect))
         action(" Copy", "copy", self._copy_selection)
         action(" Save…", "save", self._save_selection)
-        action(" Favourite", "star", self._favourite_selection)
+        fav = action(" Favourite", "star", self._favourite_selection)
         ctk.CTkFrame(row, width=1, height=20, fg_color=BORDER).pack(side=tk.LEFT, padx=6)
         ctk.CTkButton(
             row, text="", image=_icon("close", 14, MUTED_TEXT_COLOR), width=32, height=32,
             corner_radius=8, fg_color="transparent", hover_color=SURFACE_HOVER,
             command=self._clear_selection,
         ).pack(side=tk.LEFT)
-        bar = self._sel_bar = {"holder": holder, "count": count, "collect": collect,
+        bar = self._sel_bar = {"holder": holder, "count": count, "collect": collect, "fav": fav,
                                "shown": False, "gen": 0, "offset": 0}
         return bar
 
@@ -5369,6 +5441,8 @@ class ImageSearchApp:
         bar["count"].configure(text=f"{n} selected")
         in_collection = self._view in self._collection_names()
         bar["collect"].configure(text=" Move to…" if in_collection else " Add to…")
+        bar["fav"].configure(text=" Remove from favourites" if self._view == "favourites"
+                             else " Favourite")
         if not bar["shown"]:
             self._slide_selection_bar(True, animate)
         else:
@@ -5615,6 +5689,12 @@ class ImageSearchApp:
     def _favourite_selection(self):
         items = self._selection_items()
         if not items:
+            return
+        if self._view == "favourites":
+            for path, meta in items:
+                self._unfavourite(self._fav_key(path, meta), path, meta)
+            self._show_favourites(keep_scroll=True)
+            self.status_var.set(f"Removed {len(items)} from favourites.")
             return
         own = self._own_favourites()
         picks = [(self._fav_key(p, m), p, m) for p, m in items]
@@ -6068,7 +6148,63 @@ class ImageSearchApp:
         except Exception:
             pass
 
+    # ---------- before the library is loaded ----------
+
+    # Widths of the placeholder tiles, as aspect ratios: the mix of landscape
+    # and portrait a real screen of photos has, so the grid looks like itself.
+    PLACEHOLDER_ASPECTS = (1.5, 0.75, 1.33, 1.0, 1.6, 0.8, 1.25, 1.5, 0.7, 1.4, 1.0, 1.78,
+                           0.75, 1.33, 1.5, 0.8, 1.2, 1.6, 1.0, 1.4, 0.75, 1.5, 1.33, 0.9)
+
+    def _render_placeholder_grid(self):
+        """Calm empty tiles in the shape of the real grid, shown until the
+        library has been loaded once: the window never looks broken, and the
+        tour has something to point at. Rows further down fade into the page."""
+        for child in self.results_frame.winfo_children():
+            child.destroy()
+        self._placeholder_grid = True
+        self._scroll_results_to_top()
+        avail = max(320, self._desired_columns() - 2 * GRID_SIDE_PAD - 4)
+        aspects = self.PLACEHOLDER_ASPECTS
+        n = 0
+        for depth in range(4):
+            row_aspects, total = [], 0.0
+            while not row_aspects or total * ROW_HEIGHT + TILE_GAP * (len(row_aspects) - 1) < avail:
+                a = aspects[n % len(aspects)]
+                n += 1
+                row_aspects.append(a)
+                total += a
+            gaps = TILE_GAP * (len(row_aspects) - 1)
+            height = max(40, round((avail - gaps) / total))
+            widths = [max(24, round(a * height)) for a in row_aspects]
+            widths[-1] = max(24, widths[-1] + (avail - gaps) - sum(widths))
+            row = tk.Frame(self.results_frame, bg=BG_COLOR, bd=0, highlightthickness=0)
+            row.pack(anchor="w", padx=(GRID_SIDE_PAD, 0), pady=(0, TILE_GAP))
+            for i, w in enumerate(widths):
+                try:
+                    photo = ImageTk.PhotoImage(self._placeholder_tile((w, height), depth))
+                except Exception:
+                    continue
+                label = tk.Label(row, image=photo, bd=0, highlightthickness=0, bg=BG_COLOR)
+                label.image = photo
+                label.pack(side=tk.LEFT, padx=(0 if i == 0 else TILE_GAP, 0))
+
+    def _placeholder_tile(self, size, depth=0):
+        fade = min(0.75, 0.2 * depth)
+        top = Image.new("RGBA", size, _hex_rgb(_mix(SURFACE_HOVER, BG_COLOR, fade)) + (255,))
+        bottom = Image.new("RGBA", size, _hex_rgb(_mix(SURFACE, BG_COLOR, fade)) + (255,))
+        body = Image.composite(bottom, top, Image.linear_gradient("L").resize(size))
+        tile = Image.new("RGBA", size, _hex_rgb(BG_COLOR) + (255,))
+        tile.paste(body, (0, 0), self._tile_mask(size))
+        ink = _mix(FAINT_TEXT, BG_COLOR, min(0.85, 0.45 + fade))
+        icon_size = max(16, min(30, size[1] // 5))
+        if _icon("photos", icon_size, ink) is not None:
+            glyph = _icon_pil_cache.get(("photos", icon_size, ink))
+            if glyph is not None:
+                tile.alpha_composite(glyph, ((size[0] - icon_size) // 2, (size[1] - icon_size) // 2))
+        return tile
+
     def _render_results(self, results, keep_scroll=False):
+        self._placeholder_grid = False
         if results is not self._last_results:
             # A re-draw of the same set (the window was resized) is still
             # whatever it was - the All photos sample stays the sample.
@@ -6098,7 +6234,9 @@ class ImageSearchApp:
             self._scroll_results_to_top()
         self.thumbnail_refs.clear()
         # Read once per render, not once per photo: it is a file on disk.
-        self._render_favs = set(self._own_favourites())
+        # In Favourites every photo is one - all of them carry the gold star.
+        self._render_favs = set(self._load_favourites() if self._view == "favourites"
+                                else self._own_favourites())
         # Measured now rather than trusting the last resize event, so the
         # first layout after startup already has the right column count.
         self._current_columns = self._desired_columns()
@@ -6207,7 +6345,36 @@ class ImageSearchApp:
             label.bind("<Command-Button-1>" if IS_MAC else "<Control-Button-1>",
                        lambda e, p=pos: self._select_click(p, "toggle"))
 
+    def _fade_tile_out(self, widget, done):
+        """A photo leaving the grid: it sinks into the page (ease-out, 180 ms)."""
+        try:
+            path, size, _key = widget.tile
+            tile = self._tile_pil(path, size, False)
+            page = Image.new("RGBA", size, _hex_rgb(BG_COLOR) + (255,))
+            frames = [ImageTk.PhotoImage(Image.blend(tile, page, a)) for a in (0.3, 0.55, 0.8, 1.0)]
+        except Exception:
+            done()
+            return
+        widget.fade_frames = frames
+        widget.dragging = True  # no hover star while it goes
+
+        def step(p):
+            try:
+                widget.configure(image=frames[min(len(frames) - 1, int(p * len(frames)))])
+            except tk.TclError:
+                pass
+
+        _animate(self.root, 0 if self._motion_reduced() else 180, step, done=done, ease=EASE_OUT)
+
     def _on_star_clicked(self, key, path, meta, widget):
+        if self._view == "favourites":
+            # Everything here is a favourite: the star takes it out, and the
+            # photo fades away before the list closes the gap.
+            self._unfavourite(key, path, meta)
+            self._render_favs.discard(key)
+            self.status_var.set("Removed from favourites.")
+            self._fade_tile_out(widget, lambda: self._show_favourites(keep_scroll=True))
+            return
         added = self._toggle_favourite(key, path, meta)
         (self._render_favs.add if added else self._render_favs.discard)(key)
         try:
@@ -6446,6 +6613,9 @@ def _round_corners(win, border=SPLASH_BORDER):
 # screen and appears without its entrance, continuing the screen the old
 # version is showing, so the update reads as one window reloading.
 AFTER_UPDATE = "--after-update" in sys.argv
+# py launcher.py --first-run-preview: the app as a brand-new computer sees it -
+# no photos, the tour - without touching the library on this one.
+FIRST_RUN_PREVIEW = "--first-run-preview" in sys.argv
 
 
 def _set_window_icons(root):
@@ -6619,47 +6789,58 @@ class PopMenu:
 
 
 class _OutlineBars:
-    """macOS stand-in for the tour's dimmed layer. Tk on a Mac can't make
-    part of a window see-through, so the highlight is drawn as four thin
-    green windows around the part being explained; nothing is dimmed and
-    nothing covers the card."""
+    """macOS stand-in for the tour's dimmed layer, drawn inside the app's own
+    window. Tk on a Mac can't make part of a window see-through, and small
+    separate windows stay on the normal desktop when Topshot is in full
+    screen or on another desktop - so the highlight is four thin green bars
+    placed inside the main window. They fade in and out by colour; nothing
+    is dimmed and nothing covers the card."""
 
-    WIDTH = 2
+    WIDTH = 3
+    GAP = 4  # space between the part being explained and the frame
 
     def __init__(self, root, colour):
         self.root = root
-        self.bars = []
-        for _ in range(4):
-            bar = tk.Toplevel(root)
-            bar.overrideredirect(True)
-            bar.configure(bg=colour)
-            try:
-                bar.transient(root)
-                bar.attributes("-alpha", 0.0)
-            except tk.TclError:
-                pass
-            bar.geometry("1x1+0+0")
-            self.bars.append(bar)
+        self.colour = colour
+        self.level = 0.0
+        self.rect = None
+        self.bars = [tk.Frame(root, bg=BG_COLOR, bd=0, highlightthickness=0) for _ in range(4)]
 
-    def place(self, rect):
-        ox, oy = self.root.winfo_rootx(), self.root.winfo_rooty()
-        x0, y0, x1, y1 = (round(v) for v in rect)
-        x0, y0, x1, y1 = x0 - 3, y0 - 3, x1 + 3, y1 + 3
-        w, h, t = max(1, x1 - x0), max(1, y1 - y0), self.WIDTH
-        for bar, (x, y, bw, bh) in zip(self.bars, (
-                (x0, y0, w, t), (x0, y1 - t, w, t), (x0, y0, t, h), (x1 - t, y0, t, h))):
+    def _spots(self):
+        x0, y0, x1, y1 = (round(v) for v in self.rect)
+        g, t = self.GAP, self.WIDTH
+        x0, y0, x1, y1 = x0 - g, y0 - g, x1 + g, y1 + g
+        w, h = max(1, x1 - x0), max(1, y1 - y0)
+        return ((x0, y0, w, t), (x0, y1 - t, w, t), (x0, y0, t, h), (x1 - t, y0, t, h))
+
+    def _show(self):
+        if self.rect is None or self.level <= 0.02:
+            for bar in self.bars:
+                try:
+                    bar.place_forget()
+                except tk.TclError:
+                    pass
+            return
+        for bar, (x, y, w, h) in zip(self.bars, self._spots()):
             try:
-                bar.geometry(f"{bw}x{bh}+{ox + x}+{oy + y}")
+                bar.place(x=x, y=y, width=w, height=h)
                 bar.lift()
             except tk.TclError:
                 pass
 
+    def place(self, rect):
+        self.rect = rect
+        self._show()
+
     def alpha(self, value):
+        self.level = max(0.0, min(1.0, value))
+        colour = _mix(BG_COLOR, self.colour, self.level)
         for bar in self.bars:
             try:
-                bar.attributes("-alpha", max(0.0, min(1.0, value)))
+                bar.configure(bg=colour)
             except tk.TclError:
                 pass
+        self._show()
 
     def lift(self):
         for bar in self.bars:

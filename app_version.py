@@ -22,9 +22,9 @@ APP_AUTHOR = "Ryan Grob"
 WHATS_NEW = [
     "Pick several photos at once - Ctrl-click or Shift-click (⌘ on a Mac)",
     "Filters for landscape, portrait and photos with or without people",
-    "More room for your collections - updates and help moved under More",
+    "Favourites: every photo has its gold star - click it to remove the photo",
     "Invitations to shared collections are sent for you",
-    "This card, after every update",
+    "A smaller System section, so more collections fit",
 ]
 
 # Bump only when a release changes what the .exe itself contains (Python,
