@@ -1326,8 +1326,8 @@ class ImageSearchApp:
         if not total:
             self._render_results([])
             self.status_var.set(
-                "No photos loaded yet. Click 'Check for new photos' to load the "
-                "shared drive, or 'Choose Folder...' for photos on this computer."
+                "No photos yet - click Check for new photos (bottom left) to load the library "
+                "from SharePoint. The first time takes a few minutes."
             )
             return
         idxs = (self._filtered_sample_indices() if self._filters_active()
@@ -4491,6 +4491,9 @@ class ImageSearchApp:
     def _start_tour(self):
         if getattr(self, "_tour", None) is not None:
             return
+        # A new computer has no photos until the library is loaded once, so
+        # the tour ends on the button that does it - and then does it.
+        empty = not len(self.engine.paths)
         steps = [
             (lambda: [self.search_frame, self.suggestion_bar], "How to browse through the library",
              "Type what you need in plain English - “burger on a tray”, “friends cheering at "
@@ -4511,9 +4514,14 @@ class ImageSearchApp:
              "to pick several - then add, copy or save them in one go."),
             (lambda: [self.fav_card, self.history_card], "Favourites and history",
              "Every photo you starred and every search you ran - one click to get back to them."),
-            (lambda: self.system_section, "New photos, updates and help",
-             "Check for new photos brings in the latest shots. The app keeps itself up to date - "
-             "settings, support and this tour live under More. Enjoy!"),
+            (lambda: self.sharepoint_button,
+             "Load your photos" if empty else "New photos, updates and help",
+             ("Last step: Check for new photos loads the photo library from SharePoint. It starts "
+              "as soon as you click ✓ - sign in with your Greenreb account, and after a few "
+              "minutes everything is searchable. Updates, settings and help live under More."
+              if empty else
+              "Check for new photos brings in the latest shots. The app keeps itself up to date - "
+              "settings, support and this tour live under More. Enjoy!")),
         ]
         self._tour = Tour(self, steps, on_done=self._end_tour)
 
@@ -4527,6 +4535,10 @@ class ImageSearchApp:
                 json.dump({"seen": True, "version": APP_VERSION}, f)
         except OSError:
             pass
+        # Still no photos (a first start): load the library now, whether the
+        # tour was finished or skipped - nothing works until this has run once.
+        if not len(self.engine.paths) and not self._busy:
+            self.root.after(350, self._browse_sharepoint)
 
     # ---------- about ----------
 
