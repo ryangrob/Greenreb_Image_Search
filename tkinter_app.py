@@ -3595,6 +3595,9 @@ class ImageSearchApp:
                 and event.y <= STAR_BADGE_INSET + badge_h + 4)
 
     def _on_thumb_release(self, event, key, path, meta):
+        if getattr(self, "_dragout_stray", False):
+            self._dragout_stray = False   # left over from a drop in another program
+            return
         if getattr(self, "_suppress_release", False):
             self._suppress_release = False  # this click was a Ctrl/Shift selection
             return
@@ -6848,7 +6851,302 @@ class ImageSearchApp:
     # and its place in the grid fades out. Released anywhere else, it
     # glides back to where it came from.
 
+    # ---------- dragging photos out into other programs ----------
+    #
+    # A photo carried inside the window still drops onto a collection. Once
+    # the pointer is clearly outside the window (DRAGOUT_MARGIN px), the
+    # carried card fades and Windows takes the drag over with the original
+    # file(s) - see the block above _fine_timer for how. A picked group goes
+    # out together. The original is fetched in the background from the
+    # moment the drag begins; if it is not there yet when the pointer leaves,
+    # the card waits ("Fetching the original...") and the hand-over happens
+    # as soon as it arrives, while the button is still held.
+
+    def _dragout_items(self, drag):
+        return drag.get("group") or [(drag["path"], drag["meta"])]
+
+    def _dragout_outside(self, x, y):
+        """Whether a screen point is clearly outside the Topshot window."""
+        try:
+            x0, y0, x1, y1 = _dragout_winapi()["window_rect"](self.root.winfo_id())
+        except OSError:
+            x0, y0 = self.root.winfo_rootx(), self.root.winfo_rooty()
+            x1, y1 = x0 + self.root.winfo_width(), y0 + self.root.winfo_height()
+        m = DRAGOUT_MARGIN
+        return x < x0 - m or x > x1 + m or y < y0 - m or y > y1 + m
+
+    def _dragout_motion(self, event):
+        """Runs first on every movement of a carried photo. True means the
+        hand-over to Windows is under way and the in-app drag must not act."""
+        drag = self._drag
+        if drag is None or not _dragout_supported() or getattr(self, "_dragout_broken", False):
+            return False
+        if drag.get("os") in ("fading", "running"):
+            return True
+        if not drag.get("active"):
+            return False
+        try:
+            outside = self._dragout_outside(event.x_root, event.y_root)
+            drag["os_out"] = outside
+            job = drag.get("dragout")
+            if job is None:
+                if not outside and (drag.get("group") or not DRAGOUT_PREFETCH_AT_START):
+                    return False     # a group is only fetched once it is on its way out
+                job = self._dragout_prepare(drag)
+            if not outside:
+                return False
+            if job["done"] and job["files"]:
+                self._dragout_handover(drag)
+                return True
+            if job["done"]:
+                self._dragout_say_failed(drag, job)
+            elif not drag.get("os_wait"):
+                drag["os_wait"] = True
+                n = job["count"]
+                self.status_var.set("Fetching the original…" if n == 1
+                                    else f"Fetching {n} originals…")
+                self._dragout_poll(drag)
+            return False
+        except Exception:
+            # Anything unexpected: dragging stays exactly what it was.
+            _log_crash("drag out", sys.exc_info())
+            self._dragout_broken = True
+            return False
+
+    def _dragout_say_failed(self, drag, job):
+        if drag.get("os_told"):
+            return
+        drag["os_told"] = True
+        self.status_var.set(
+            "Sign in first (Check for new photos) - then photos can be dragged out."
+            if job.get("error") == "signin"
+            else "Couldn't fetch the original - check your connection and try again.")
+
+    def _dragout_prepare(self, drag):
+        """Gets the originals ready in the background: downloads what is not
+        on this computer yet, and - once the pointer is on its way out - lays
+        the files out under their real names (the cache keeps them under an
+        id). A copy, not a link, so whatever receives the file can never
+        alter the cached original."""
+        items = self._dragout_items(drag)
+        job = drag["dragout"] = {"done": False, "files": None, "error": "", "count": len(items)}
+
+        def still_carried():
+            return self._drag is drag and not drag.get("released")
+
+        def work():
+            import tempfile
+
+            try:
+                sources = []
+                for path, meta in items:
+                    meta = meta or {}
+                    item_id = meta.get("item_id")
+                    name = meta.get("name") or os.path.basename(path)
+                    if not item_id:
+                        # A photo from a folder on this computer is its own original.
+                        if not os.path.isfile(path):
+                            raise FileNotFoundError(path)
+                        sources.append((None, os.path.abspath(path)))
+                        continue
+                    cached = os.path.join(self._sp_cache_dirs()[2], f"{item_id}_{name}")
+                    if not (os.path.exists(cached) and os.path.getsize(cached) > 0):
+                        if self._sp_client(False) is None:   # never opens a sign-in window
+                            job["error"] = "signin"
+                            return
+                        cached = self._ensure_full_image(item_id, name)
+                    sources.append((name, cached))
+                # The originals are now on disk (which also makes Copy, Export
+                # and the preview instant). The named copies are only made if
+                # the photo really leaves the window.
+                while still_carried() and not drag.get("os_out"):
+                    time.sleep(0.03)
+                if not still_carried():
+                    job["error"] = "ended"
+                    return
+                base = os.path.join(tempfile.gettempdir(), "Topshot drag")
+                self._dragout_tidy(base)
+                folder = os.path.join(base, uuid.uuid4().hex[:10])
+                os.makedirs(folder, exist_ok=True)
+                files, taken = [], set()
+                for name, source in sources:
+                    if name is None:
+                        files.append(source)
+                        continue
+                    stem, ext = os.path.splitext(name)
+                    candidate, k = name, 2
+                    while candidate.lower() in taken:
+                        candidate = f"{stem} ({k}){ext}"
+                        k += 1
+                    taken.add(candidate.lower())
+                    target = os.path.join(folder, candidate)
+                    shutil.copy2(source, target)
+                    files.append(target)
+                job["files"] = files
+            except Exception as exc:
+                _log_reuse(f"DRAG OUT PREPARE FAILED: {exc!r}")
+                job["error"] = job["error"] or "failed"
+            finally:
+                job["done"] = True
+
+        threading.Thread(target=work, name="drag-out", daemon=True).start()
+        return job
+
+    @staticmethod
+    def _dragout_tidy(base):
+        """Clears out the named copies of drags from more than a day ago."""
+        try:
+            now = time.time()
+            for entry in os.scandir(base):
+                if entry.is_dir() and now - entry.stat().st_mtime > 86400:
+                    shutil.rmtree(entry.path, ignore_errors=True)
+        except OSError:
+            pass
+
+    def _dragout_poll(self, drag):
+        """While the pointer waits outside for the original: hands over the
+        moment it is ready, even if the pointer is being held still."""
+        job = drag.get("dragout")
+        if job is None or drag.get("os") in ("fading", "running"):
+            return
+        if self._drag is not drag or drag.get("released"):
+            if drag.get("os_wait") and not job["files"] and not drag.get("os_told"):
+                self.status_var.set(
+                    "The original was still downloading - drag it out again in a moment.")
+            return
+        try:
+            x, y = self.root.winfo_pointerxy()
+            outside = self._dragout_outside(x, y)
+        except Exception:
+            return
+        drag["os_out"] = outside
+        if not outside:
+            drag["os_wait"] = False   # back inside: an ordinary drag again
+            return
+        if job["done"]:
+            if job["files"]:
+                self._dragout_handover(drag)
+            else:
+                self._dragout_say_failed(drag, job)
+            return
+        self.root.after(80, lambda: self._dragout_poll(drag))
+
+    def _dragout_resume(self, drag):
+        """Back to an ordinary in-app drag (the hand-over did not happen)."""
+        drag["os"] = None
+        if self._drag is drag and not drag.get("released") and drag.get("ghost") is not None \
+                and drag.get("tick") is None:
+            drag["t"] = time.perf_counter()
+            self._drag_tick(drag)
+
+    def _dragout_handover(self, drag):
+        """The carried card fades (ease-out, 90 ms), then Windows takes over."""
+        drag["os"] = "fading"
+        if drag.get("tick") is not None:
+            try:
+                self.root.after_cancel(drag["tick"])
+            except Exception:
+                pass
+            drag["tick"] = None
+        try:
+            self._set_drag_hover(None)
+        except Exception:
+            pass
+        g = drag.get("ghost")
+        start = g["alpha"] if g is not None else 0.0
+
+        def step(p):
+            if g is None or drag.get("released"):
+                return
+            g["alpha"] = start * (1.0 - p)
+            self._place_ghost(g)
+
+        def go():
+            if self._drag is not drag or drag.get("released"):
+                return   # let go during the fade: the card is already gliding home
+            try:
+                self._dragout_run(drag)
+            except Exception:
+                _log_crash("drag out", sys.exc_info())
+                self._dragout_broken = True
+                self._dragout_resume(drag)
+
+        quick = g is None or self._motion_reduced()
+        _animate(self.root, 0 if quick else 90, step, done=go, ease=EASE_OUT)
+
+    def _dragout_run(self, drag):
+        files = [f for f in (drag["dragout"]["files"] or []) if os.path.isfile(f)]
+        api = _dragout_winapi()
+        if not files or len(files) != drag["dragout"]["count"] or not api["button_down"]():
+            # Nothing to hand over, or the button is already up (its release
+            # is on its way through Tk): carry on as an ordinary drag.
+            self._dragout_resume(drag)
+            return
+        try:
+            session = _DragOutSession(files)
+        except Exception:
+            _log_crash("drag out setup", sys.exc_info())
+            self._dragout_broken = True
+            self._dragout_resume(drag)
+            return
+        # From here Windows owns the drag, so the in-app one is closed first:
+        # the card goes, the photo's place in the grid is restored.
+        drag["os"] = "running"
+        drag["released"] = True
+        if self._drag is drag:
+            self._drag = None
+        self._end_ghost(drag)
+        self._restore_source(drag)
+        # Windows swallows the button's release; Tk makes one up later, when
+        # the pointer is next over the app. That one must not count as a click.
+        self._dragout_stray = True
+        self._dragout_watch_pointer()
+        n = len(files)
+        self.status_var.set("Drop it where you need it - Esc cancels.")
+        try:
+            self.root.update_idletasks()   # paints the above before the drag blocks
+        except tk.TclError:
+            pass
+        outcome = None
+        try:
+            outcome = session.run()        # returns when dropped or cancelled
+        except Exception as exc:
+            _log_reuse(f"DRAG OUT FAILED: {exc!r}")
+        finally:
+            try:
+                api["nudge"]()
+            except Exception:
+                pass
+        if outcome == "dropped":
+            self.status_var.set(f"Dropped {n} photo{'s' if n != 1 else ''} at full resolution.")
+        elif outcome == "refused":
+            self.status_var.set("Nothing was dropped - that spot doesn't take photos.")
+        elif outcome == "cancelled":
+            self.status_var.set("Drag cancelled.")
+        else:
+            self.status_var.set("Couldn't hand the photo over - use Copy or Export instead.")
+
+    def _dragout_watch_pointer(self):
+        """Clears the "a made-up release is coming" mark on the first pointer
+        movement with the button up - by then Tk has delivered it (it sends
+        the release before that movement), or was never going to."""
+        if getattr(self, "_dragout_watching", False):
+            return
+        self._dragout_watching = True
+
+        def moved(event):
+            if getattr(self, "_dragout_stray", False):
+                try:
+                    held = int(event.state) & 0x0100   # Button1Mask
+                except (TypeError, ValueError):
+                    held = 0
+                if not held:
+                    self._dragout_stray = False
+
+        self.root.bind("<Motion>", moved, add="+")
+
     def _drag_start(self, event, path, meta):
+        self._dragout_stray = False   # a real press: no made-up release is pending
         # Only records where the press happened. The drag does not begin
         # until the pointer actually moves, so a double-click still opens
         # the photo instead of being swallowed here.
@@ -6944,6 +7242,8 @@ class ImageSearchApp:
         drag["hover"] = name
 
     def _drag_motion(self, event):
+        if self._dragout_motion(event):
+            return   # Windows is taking the drag over
         drag = self._drag
         if drag is None:
             return
@@ -8118,6 +8418,391 @@ def _start_freeze_watchdog(root):
 
     pulse()
     threading.Thread(target=watch, name="freeze-watchdog", daemon=True).start()
+
+
+# ---------- dragging photos out into other programs (Windows) ----------
+#
+# Inside the window a carried photo drops onto a collection, as before. Once
+# the pointer is clearly outside the Topshot window, the drag is handed to
+# Windows as a normal file drag (OLE drag and drop, CF_HDROP - what Explorer
+# does when a file is dragged), carrying the ORIGINAL photo, never the small
+# grid thumbnail. PowerPoint, Outlook, Teams, Explorer and anything else
+# that takes a dropped file accept it.
+#
+# Done with ctypes alone - no extra library, so it ships as a normal update.
+# Two small COM objects are built by hand: IDataObject (the files) and
+# IDropSource (when to drop, when to cancel). Everything is defensive: if any
+# part cannot be set up, dragging simply stays what it was.
+
+DRAGOUT_MARGIN = 28              # px past the window's edge before Windows takes over
+DRAGOUT_PREFETCH_AT_START = True  # one photo: fetch its original as the drag begins
+_DRAGOUT_ALIVE = []              # COM objects handed out, kept until nobody holds them
+
+
+def _dragout_supported():
+    return sys.platform.startswith("win")
+
+
+def _hresult(value):
+    """An HRESULT as the signed 32-bit number a COM callback returns."""
+    return value - 0x100000000 if value & 0x80000000 else value
+
+
+def _dragout_types():
+    """The ctypes shapes of the OLE structures and callbacks, built once.
+
+    Fixed-width types throughout, so the layout is the Windows one on any
+    64-bit Python: FORMATETC is 32 bytes, STGMEDIUM 24."""
+    cached = _dragout_types.__dict__.get("cache")
+    if cached is not None:
+        return cached
+    import ctypes as ct
+
+    class FORMATETC(ct.Structure):
+        _fields_ = [("cfFormat", ct.c_uint16), ("ptd", ct.c_void_p), ("dwAspect", ct.c_uint32),
+                    ("lindex", ct.c_int32), ("tymed", ct.c_uint32)]
+
+    class STGMEDIUM(ct.Structure):
+        _fields_ = [("tymed", ct.c_uint32), ("handle", ct.c_void_p),
+                    ("pUnkForRelease", ct.c_void_p)]
+
+    fn = getattr(ct, "WINFUNCTYPE", ct.CFUNCTYPE)
+    hr, ptr, P = ct.c_int32, ct.c_void_p, ct.POINTER
+    types_ = {
+        "ct": ct, "FORMATETC": FORMATETC, "STGMEDIUM": STGMEDIUM,
+        "QueryInterface": fn(hr, ptr, ptr, P(ptr)),
+        "AddRef": fn(ct.c_uint32, ptr),
+        "Release": fn(ct.c_uint32, ptr),
+        "GetData": fn(hr, ptr, P(FORMATETC), P(STGMEDIUM)),
+        "GetDataHere": fn(hr, ptr, P(FORMATETC), P(STGMEDIUM)),
+        "QueryGetData": fn(hr, ptr, P(FORMATETC)),
+        "GetCanonicalFormatEtc": fn(hr, ptr, P(FORMATETC), P(FORMATETC)),
+        "SetData": fn(hr, ptr, P(FORMATETC), P(STGMEDIUM), ct.c_int32),
+        "EnumFormatEtc": fn(hr, ptr, ct.c_uint32, P(ptr)),
+        "DAdvise": fn(hr, ptr, P(FORMATETC), ct.c_uint32, ptr, P(ct.c_uint32)),
+        "DUnadvise": fn(hr, ptr, ct.c_uint32),
+        "EnumDAdvise": fn(hr, ptr, P(ptr)),
+        "QueryContinueDrag": fn(hr, ptr, ct.c_int32, ct.c_uint32),
+        "GiveFeedback": fn(hr, ptr, ct.c_uint32),
+    }
+    _dragout_types.cache = types_
+    return types_
+
+
+_IID_IUNKNOWN = uuid.UUID("00000000-0000-0000-C000-000000000046").bytes_le
+_IID_IDATAOBJECT = uuid.UUID("0000010e-0000-0000-C000-000000000046").bytes_le
+_IID_IDROPSOURCE = uuid.UUID("00000121-0000-0000-C000-000000000046").bytes_le
+
+
+class _DragOutCom:
+    """What the two COM objects share: the vtable, IUnknown, the reference
+    count. An object is never freed from inside one of its own callbacks
+    (that would pull the code out from under the call in progress): it is
+    only marked, and cleared away before the next drag."""
+
+    S_OK = 0
+    E_NOTIMPL = _hresult(0x80004001)
+    E_NOINTERFACE = _hresult(0x80004002)
+    E_POINTER = _hresult(0x80004003)
+    E_UNEXPECTED = _hresult(0x8000FFFF)
+    E_OUTOFMEMORY = _hresult(0x8007000E)
+    DV_E_FORMATETC = _hresult(0x80040064)
+    DV_E_TYMED = _hresult(0x80040069)
+    DV_E_DVASPECT = _hresult(0x8004006B)
+    OLE_E_ADVISENOTSUPPORTED = _hresult(0x80040003)
+    DATA_S_SAMEFORMATETC = 0x00040130
+    DRAGDROP_S_DROP = 0x00040100
+    DRAGDROP_S_CANCEL = 0x00040101
+    DRAGDROP_S_USEDEFAULTCURSORS = 0x00040102
+
+    def __init__(self, types_, iids):
+        self.t = types_
+        self.ct = types_["ct"]
+        self.iids = (_IID_IUNKNOWN,) + tuple(iids)
+        self.refs = 1  # ours, given back after DoDragDrop returns
+        self.ptr = None
+        self._keep = None
+
+    def _iunknown(self):
+        t, ct = self.t, self.ct
+
+        def query_interface(this, riid, ppv):
+            try:
+                if not ppv:
+                    return self.E_POINTER
+                if riid and ct.string_at(riid, 16) in self.iids:
+                    ppv[0] = this
+                    self.refs += 1
+                    return self.S_OK
+                ppv[0] = None
+                return self.E_NOINTERFACE
+            except Exception:
+                return self.E_UNEXPECTED
+
+        def add_ref(this):
+            self.refs += 1
+            return self.refs
+
+        def release(this):
+            self.refs -= 1
+            return max(0, self.refs)
+
+        return [t["QueryInterface"](query_interface), t["AddRef"](add_ref), t["Release"](release)]
+
+    def _publish(self, methods):
+        """Lays the callbacks out as a COM object: a pointer to a table of
+        function pointers. self.ptr is the interface pointer."""
+        ct = self.ct
+        vtable = (ct.c_void_p * len(methods))(*[ct.cast(m, ct.c_void_p).value for m in methods])
+        instance = (ct.c_void_p * 1)(ct.addressof(vtable))
+        self.ptr = ct.addressof(instance)
+        self._keep = (methods, vtable, instance)
+        _DRAGOUT_ALIVE.append(self)
+
+
+class _DragOutData(_DragOutCom):
+    """IDataObject over ready-made blocks of bytes, one per clipboard format
+    (the file list as CF_HDROP, and "copy, please"). Each GetData hands out a
+    fresh copy, which the receiver owns and frees."""
+
+    def __init__(self, types_, blocks, alloc, make_enum):
+        super().__init__(types_, (_IID_IDATAOBJECT,))
+        t, ct = self.t, self.ct
+        self.blocks = dict(blocks)
+        self.formats = (t["FORMATETC"] * len(self.blocks))()
+        for slot, cf in zip(self.formats, self.blocks):
+            slot.cfFormat, slot.ptd, slot.dwAspect, slot.lindex, slot.tymed = cf, None, 1, -1, 1
+
+        def check(fmt):
+            if not fmt:
+                return self.E_POINTER, None
+            f = fmt.contents
+            data = self.blocks.get(f.cfFormat)
+            if data is None:
+                return self.DV_E_FORMATETC, None
+            if not f.dwAspect & 1:      # DVASPECT_CONTENT
+                return self.DV_E_DVASPECT, None
+            if not f.tymed & 1:         # TYMED_HGLOBAL
+                return self.DV_E_TYMED, None
+            return self.S_OK, data
+
+        def get_data(this, fmt, medium):
+            try:
+                if not medium:
+                    return self.E_POINTER
+                code, data = check(fmt)
+                if code != self.S_OK:
+                    return code
+                handle = alloc(data)
+                if not handle:
+                    return self.E_OUTOFMEMORY
+                m = medium.contents
+                m.tymed, m.handle, m.pUnkForRelease = 1, handle, None
+                return self.S_OK
+            except Exception:
+                return self.E_UNEXPECTED
+
+        def get_data_here(this, fmt, medium):
+            return self.E_NOTIMPL
+
+        def query_get_data(this, fmt):
+            try:
+                return check(fmt)[0]
+            except Exception:
+                return self.E_UNEXPECTED
+
+        def canonical(this, fmt, out):
+            try:
+                if not out:
+                    return self.E_POINTER
+                if fmt:
+                    ct.memmove(out, fmt, ct.sizeof(t["FORMATETC"]))
+                out.contents.ptd = None
+                return self.DATA_S_SAMEFORMATETC
+            except Exception:
+                return self.E_UNEXPECTED
+
+        def set_data(this, fmt, medium, release):
+            return self.E_NOTIMPL   # not taken, so the caller keeps (and frees) its data
+
+        def enum_format_etc(this, direction, ppenum):
+            try:
+                if not ppenum:
+                    return self.E_POINTER
+                ppenum[0] = None
+                if direction != 1:  # DATADIR_GET
+                    return self.E_NOTIMPL
+                return make_enum(len(self.formats), self.formats, ppenum)
+            except Exception:
+                return self.E_UNEXPECTED
+
+        def d_advise(this, fmt, advf, sink, connection):
+            return self.OLE_E_ADVISENOTSUPPORTED
+
+        def d_unadvise(this, connection):
+            return self.OLE_E_ADVISENOTSUPPORTED
+
+        def enum_d_advise(this, ppenum):
+            return self.OLE_E_ADVISENOTSUPPORTED
+
+        self._publish(self._iunknown() + [
+            t["GetData"](get_data), t["GetDataHere"](get_data_here),
+            t["QueryGetData"](query_get_data), t["GetCanonicalFormatEtc"](canonical),
+            t["SetData"](set_data), t["EnumFormatEtc"](enum_format_etc),
+            t["DAdvise"](d_advise), t["DUnadvise"](d_unadvise), t["EnumDAdvise"](enum_d_advise),
+        ])
+
+
+class _DragOutSource(_DragOutCom):
+    """IDropSource: Esc cancels, letting go of the button drops, and Windows
+    shows its own cursors (the little + for "copy")."""
+
+    def __init__(self, types_):
+        super().__init__(types_, (_IID_IDROPSOURCE,))
+        t = self.t
+
+        def query_continue_drag(this, escape_pressed, key_state):
+            if escape_pressed:
+                return self.DRAGDROP_S_CANCEL
+            if not key_state & 0x0001:   # MK_LBUTTON no longer held
+                return self.DRAGDROP_S_DROP
+            return self.S_OK
+
+        def give_feedback(this, effect):
+            return self.DRAGDROP_S_USEDEFAULTCURSORS
+
+        self._publish(self._iunknown() + [
+            t["QueryContinueDrag"](query_continue_drag), t["GiveFeedback"](give_feedback),
+        ])
+
+
+def _dragout_payload(files):
+    """The file list as Explorer puts it on a drag: a DROPFILES header, then
+    the paths as wide text, each ended by a zero and the list by one more."""
+    import struct
+
+    names = ("\0".join(os.path.abspath(p) for p in files) + "\0\0").encode("utf-16-le")
+    return struct.pack("<IiiII", 20, 0, 0, 0, 1) + names
+
+
+def _dragout_winapi():
+    """The Windows calls a drag needs, set up once on the window's own
+    thread. Raises OSError if OLE cannot be used here - the caller then
+    leaves dragging as it was."""
+    cached = _dragout_winapi.__dict__.get("cache")
+    if cached is not None:
+        return cached
+    import ctypes as ct
+
+    # Own handles to the libraries: argument types set here cannot disturb
+    # (or be disturbed by) the clipboard code's use of the same functions.
+    ole32, shell32 = ct.WinDLL("ole32"), ct.WinDLL("shell32")
+    kernel32, user32 = ct.WinDLL("kernel32"), ct.WinDLL("user32")
+    ole32.OleInitialize.argtypes = [ct.c_void_p]
+    ole32.OleInitialize.restype = ct.c_int32
+    code = ole32.OleInitialize(None) & 0xFFFFFFFF
+    if code not in (0, 1):   # S_OK, or S_FALSE = this thread already has OLE
+        raise OSError(f"OleInitialize failed ({code:#x})")
+    ole32.DoDragDrop.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.POINTER(ct.c_uint32)]
+    ole32.DoDragDrop.restype = ct.c_int32
+    shell32.SHCreateStdEnumFmtEtc.argtypes = [ct.c_uint32, ct.c_void_p, ct.c_void_p]
+    shell32.SHCreateStdEnumFmtEtc.restype = ct.c_int32
+    kernel32.GlobalAlloc.argtypes = [ct.c_uint32, ct.c_size_t]
+    kernel32.GlobalAlloc.restype = ct.c_void_p
+    kernel32.GlobalLock.argtypes = [ct.c_void_p]
+    kernel32.GlobalLock.restype = ct.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ct.c_void_p]
+    kernel32.GlobalFree.argtypes = [ct.c_void_p]
+    kernel32.GlobalFree.restype = ct.c_void_p
+    user32.RegisterClipboardFormatW.argtypes = [ct.c_wchar_p]
+    user32.RegisterClipboardFormatW.restype = ct.c_uint32
+    user32.GetAsyncKeyState.argtypes = [ct.c_int32]
+    user32.GetAsyncKeyState.restype = ct.c_int16
+    user32.GetSystemMetrics.argtypes = [ct.c_int32]
+    user32.GetSystemMetrics.restype = ct.c_int32
+    user32.GetParent.argtypes = [ct.c_void_p]
+    user32.GetParent.restype = ct.c_void_p
+    user32.GetWindowRect.argtypes = [ct.c_void_p, ct.c_void_p]
+    user32.GetWindowRect.restype = ct.c_int32
+    user32.mouse_event.argtypes = [ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_size_t]
+    user32.mouse_event.restype = None
+
+    def alloc(data):
+        """A movable memory block holding `data`; 0 if Windows has none."""
+        handle = kernel32.GlobalAlloc(0x0042, len(data))   # GMEM_MOVEABLE | GMEM_ZEROINIT
+        if not handle:
+            return 0
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            kernel32.GlobalFree(handle)
+            return 0
+        ct.memmove(pointer, data, len(data))
+        kernel32.GlobalUnlock(handle)
+        return handle
+
+    def make_enum(count, formats, ppenum):
+        return shell32.SHCreateStdEnumFmtEtc(count, ct.cast(formats, ct.c_void_p),
+                                             ct.cast(ppenum, ct.c_void_p))
+
+    def button_down():
+        """Whether the main mouse button is physically held right now."""
+        key = 0x02 if user32.GetSystemMetrics(23) else 0x01   # SM_SWAPBUTTON: right-handed swap
+        return bool(user32.GetAsyncKeyState(key) & 0x8000)
+
+    def window_rect(window_id):
+        """The whole window, frame and title bar included: x0, y0, x1, y1."""
+        rect = (ct.c_int32 * 4)()
+        top = user32.GetParent(window_id) or window_id
+        if not user32.GetWindowRect(top, rect):
+            raise OSError("GetWindowRect failed")
+        return tuple(rect)
+
+    def nudge():
+        """A zero-distance mouse move. The drop swallowed the button's
+        release; the next mouse message lets Tk notice the button is up."""
+        user32.mouse_event(0x0001, 0, 0, 0, 0)   # MOUSEEVENTF_MOVE
+
+    api = {
+        "ct": ct, "DoDragDrop": ole32.DoDragDrop, "alloc": alloc, "make_enum": make_enum,
+        "button_down": button_down, "window_rect": window_rect, "nudge": nudge,
+        "preferred": user32.RegisterClipboardFormatW("Preferred DropEffect"),
+    }
+    _dragout_winapi.cache = api
+    return api
+
+
+class _DragOutSession:
+    """One hand-over of files to Windows. Building it can fail (then nothing
+    has happened yet); run() blocks until the files are dropped or the drag
+    is cancelled, and says which."""
+
+    def __init__(self, files):
+        import struct
+
+        self.api = _dragout_winapi()
+        types_ = _dragout_types()
+        # Objects from earlier drags that nobody holds any more.
+        _DRAGOUT_ALIVE[:] = [o for o in _DRAGOUT_ALIVE if o.refs > 0]
+        blocks = {15: _dragout_payload(files)}                      # CF_HDROP
+        if self.api["preferred"]:
+            blocks[self.api["preferred"]] = struct.pack("<I", 1)    # DROPEFFECT_COPY
+        self.data = _DragOutData(types_, blocks, self.api["alloc"], self.api["make_enum"])
+        self.source = _DragOutSource(types_)
+
+    def run(self):
+        ct = self.api["ct"]
+        effect = ct.c_uint32(0)
+        try:
+            code = self.api["DoDragDrop"](self.data.ptr, self.source.ptr, 1,   # DROPEFFECT_COPY
+                                          ct.byref(effect)) & 0xFFFFFFFF
+        finally:
+            self.data.refs -= 1
+            self.source.refs -= 1
+        if code == _DragOutCom.DRAGDROP_S_DROP:
+            return "dropped" if effect.value else "refused"
+        if code == _DragOutCom.DRAGDROP_S_CANCEL:
+            return "cancelled"
+        raise OSError(f"DoDragDrop failed ({code:#x})")
 
 
 def _fine_timer(on):
