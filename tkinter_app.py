@@ -3490,19 +3490,27 @@ class ImageSearchApp:
         return max(640, int(sw * 0.82)), max(420, int(sh * 0.72))
 
     def _show_preview(self, path, meta):
-        """A large view inside the app, at full resolution.
+        """A large view of one photo that can be zoomed and moved, with the
+        previous and next photo one key away.
 
-        Opens at once from what is already on disk and sharpens in steps:
-        the grid thumbnail, then SharePoint's 800px preview, then the
-        original itself (downloaded in the background, which also makes
-        Copy and Open original instant afterwards). Each step only ever
-        replaces a lower-quality one.
+        Opens at once from what is already on disk and sharpens to the
+        original, which downloads in the background (that also makes Copy,
+        Export and Open original instant afterwards). The neighbours'
+        originals are fetched too, so stepping through stays quick.
         """
-        name = (meta or {}).get("name") or os.path.basename(path)
-        item_id = (meta or {}).get("item_id")
+        p = self._preview
+        if p is not None and p.get("viewer") is not None:
+            try:
+                if p["win"].winfo_exists():
+                    p["win"].deiconify()
+                    p["win"].lift()
+                    p["win"].focus_force()
+                    self._preview_open(path, meta)
+                    return
+            except tk.TclError:
+                pass
         box = self._preview_box()
         win = ctk.CTkToplevel(self.root)
-        win.title(name)
         win.configure(fg_color=BG_COLOR)
         width, height = box[0] + 24, box[1] + 84
         x = max(0, (win.winfo_screenwidth() - width) // 2)
@@ -3512,57 +3520,456 @@ class ImageSearchApp:
             win.after(200, lambda: _apply_icon(win))
         except Exception:
             pass
-
-        token = object()
-        holder = ctk.CTkFrame(win, fg_color=BG_COLOR)
-        holder.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 0))
-        image_label = ctk.CTkLabel(holder, text="", fg_color=BG_COLOR)
-        image_label.pack(fill=tk.BOTH, expand=True)
-
+        viewer = PhotoViewer(win, BG_COLOR)
+        viewer.canvas.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 0))
         bar = ctk.CTkFrame(win, fg_color="transparent")
         bar.pack(fill=tk.X, padx=12, pady=12)
-        caption = ctk.CTkLabel(
-            bar, text=(meta or {}).get("folder") or name,
-            text_color=MUTED_TEXT_COLOR, anchor="w",
-        )
+        caption = ctk.CTkLabel(bar, text="", text_color=MUTED_TEXT_COLOR, anchor="w")
         caption.pack(side=tk.LEFT)
-        _make_button(bar, "Close", win.destroy, width=90).pack(side=tk.RIGHT, padx=(8, 0))
-        if item_id:
-            open_original = lambda: self._open_sp_result(item_id, meta["name"])
-        else:
-            open_original = lambda: open_in_system_viewer(path)
-        _make_button(bar, "Open original", open_original, width=140).pack(side=tk.RIGHT, padx=(8, 0))
-        _make_button(
-            bar, "Copy", lambda: self._copy_to_clipboard(path, meta, token=token), width=90,
-        ).pack(side=tk.RIGHT, padx=(8, 0))
+        zoom_label = ctk.CTkLabel(bar, text="", text_color=FAINT_TEXT, font=_font(12), width=56)
+        zoom_label.pack(side=tk.LEFT, padx=(12, 0))
+        viewer.on_zoom_text = lambda text: zoom_label.configure(text=text)
+        preview = {"token": None, "win": win, "viewer": viewer, "caption": caption,
+                   "path": None, "meta": None, "index": None, "quality": -1}
 
-        self._preview = {
-            "token": token, "label": image_label, "win": win, "caption": caption,
-            "quality": -1, "box": box,
+        def current():
+            return preview["path"], preview["meta"]
+
+        _make_button(bar, "Close", lambda: close(), width=90).pack(side=tk.RIGHT, padx=(8, 0))
+        _make_button(bar, "Open original", lambda: self._open_original(*current()),
+                     width=140).pack(side=tk.RIGHT, padx=(8, 0))
+        _make_button(bar, "Export…", lambda: self._show_export(*current()), width=100).pack(
+            side=tk.RIGHT, padx=(8, 0))
+        _make_button(bar, "Copy", lambda: self._copy_to_clipboard(
+            preview["path"], preview["meta"], token=preview["token"]), width=90).pack(
+            side=tk.RIGHT, padx=(8, 0))
+
+        def close():
+            if self._preview is preview:
+                self._preview = None
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", close)
+        keys = {
+            "<Left>": lambda: self._preview_step(-1), "<Right>": lambda: self._preview_step(1),
+            "<Escape>": close, "<plus>": viewer.zoom_in, "<equal>": viewer.zoom_in,
+            "<KP_Add>": viewer.zoom_in, "<minus>": viewer.zoom_out,
+            "<KP_Subtract>": viewer.zoom_out, "<Key-0>": viewer.fit, "<Key-1>": viewer.actual_size,
         }
+        for sequence, action in keys.items():
+            win.bind(sequence, lambda _e, a=action: (a(), "break")[1])
+        mod = "Command" if IS_MAC else "Control"
+        for key in ("c", "C"):
+            win.bind(f"<{mod}-{key}>", lambda _e: (self._copy_to_clipboard(
+                preview["path"], preview["meta"], token=preview["token"]), "break")[1])
+        self._preview = preview
+        self._preview_open(path, meta)
+        win.focus_force()
 
+    # ---------- export ----------
+
+    EXPORT_FORMATS = (
+        ("Original", "original"), ("Free", None), ("16:9 Landscape", 16 / 9),
+        ("9:16 Story", 9 / 16), ("4:5 Instagram post", 4 / 5), ("1:1 Square", 1.0),
+    )
+
+    def _show_export(self, path, meta):
+        """Crops a photo to a format and saves or copies it - always from the
+        original at full resolution, without loss: JPEG at maximum quality
+        with no colour subsampling, or PNG, keeping the colour profile."""
+        if not path:
+            return
+        meta = meta or {}
+        name = meta.get("name") or os.path.basename(path)
+        item_id = meta.get("item_id")
+        box = self._preview_box()
+        win = ctk.CTkToplevel(self.root)
+        win.title(f"Export · {name}")
+        win.configure(fg_color=BG_COLOR)
+        width, height = box[0] + 24, box[1] + 60
+        x = max(0, (win.winfo_screenwidth() - width) // 2)
+        y = max(0, (win.winfo_screenheight() - height) // 2 - 20)
+        win.geometry(f"{width}x{height}+{x}+{y}")
+        try:
+            win.after(200, lambda: _apply_icon(win))
+        except Exception:
+            pass
+        state = {"full": None, "icc": None, "format": "original", "kind": "JPEG", "open": True}
+        panel = ctk.CTkFrame(win, fg_color=SIDEBAR_BG, width=272, corner_radius=0)
+        panel.pack(side=tk.RIGHT, fill=tk.Y)
+        panel.pack_propagate(False)
+        crop = CropCanvas(win, on_change=lambda: update_info())
+        crop.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        inner = ctk.CTkFrame(panel, fg_color="transparent")
+        inner.pack(fill=tk.BOTH, expand=True, padx=20, pady=22)
+        ctk.CTkLabel(inner, text="EXPORT", font=_font(11, "semibold"), text_color=SPLASH_ACCENT,
+                     anchor="w").pack(fill=tk.X)
+        ctk.CTkLabel(inner, text=name, font=_font(15, "semibold"), text_color=TEXT_COLOR,
+                     anchor="w", justify="left", wraplength=230).pack(fill=tk.X, pady=(2, 16))
+        ctk.CTkLabel(inner, text="FORMAT", font=_font(11, "medium"), text_color=FAINT_TEXT,
+                     anchor="w").pack(fill=tk.X, pady=(0, 4))
+        chips = {}
+
+        def choose(key):
+            state["format"] = key
+            for k, chip in chips.items():
+                on = k == key
+                chip.configure(fg_color=NAV_SELECTED if on else "transparent",
+                               text_color=TEXT_COLOR if on else TEXT_SOFT,
+                               border_color=PRIMARY if on else BORDER)
+            if crop.image is None:
+                return
+            if key == "original":
+                iw, ih = crop.image.size
+                crop.set_format(iw / ih)
+            else:
+                crop.set_format(None if key == "free" else key)
+
+        for label, ratio in self.EXPORT_FORMATS:
+            key = "original" if label == "Original" else ("free" if ratio is None else ratio)
+            chip = ctk.CTkButton(inner, text=label, height=32, corner_radius=8, anchor="w",
+                                 fg_color="transparent", hover_color=SURFACE_HOVER,
+                                 text_color=TEXT_SOFT, border_width=1, border_color=BORDER,
+                                 font=_font(13), command=lambda k=key: choose(k))
+            chip.pack(fill=tk.X, pady=3)
+            chips[key] = chip
+
+        ctk.CTkLabel(inner, text="FILE", font=_font(11, "medium"), text_color=FAINT_TEXT,
+                     anchor="w").pack(fill=tk.X, pady=(18, 4))
+        kind = tk.StringVar(value="JPEG")
+        ctk.CTkSegmentedButton(
+            inner, values=["JPEG", "PNG"], variable=kind, height=30, font=_font(12, "medium"),
+            fg_color=SURFACE, selected_color="#2a3830", selected_hover_color="#33443b",
+            unselected_color=SURFACE, unselected_hover_color=SURFACE_HOVER, text_color=TEXT_COLOR,
+            command=lambda _v: update_info(),
+        ).pack(fill=tk.X)
+        info = ctk.CTkLabel(inner, text="Loading the full-resolution original…", font=_font(12),
+                            text_color=MUTED_TEXT_COLOR, anchor="w", justify="left", wraplength=230)
+        info.pack(fill=tk.X, pady=(14, 0))
+        note = ctk.CTkLabel(inner, text="", font=_font(12), text_color=SOURCE_DOT, anchor="w",
+                            justify="left", wraplength=230)
+        note.pack(fill=tk.X, pady=(6, 0))
+
+        buttons = ctk.CTkFrame(inner, fg_color="transparent")
+        buttons.pack(side=tk.BOTTOM, fill=tk.X)
+        save_button = _make_primary_button(buttons, "Save…", lambda: save(), width=110)
+        save_button.pack(side=tk.RIGHT)
+        copy_button = _make_secondary_button(buttons, "Copy", lambda: copy(), width=80)
+        copy_button.pack(side=tk.RIGHT, padx=(0, 8))
+        ctk.CTkButton(buttons, text="Cancel", width=0, height=32, corner_radius=8,
+                      fg_color="transparent", hover_color=SURFACE_HOVER,
+                      text_color=MUTED_TEXT_COLOR, font=_font(12, "medium"),
+                      command=lambda: close()).pack(side=tk.LEFT)
+        for b in (save_button, copy_button):
+            b.configure(state=tk.DISABLED)
+
+        def update_info():
+            full = state["full"]
+            if full is None:
+                return
+            l, t, r, b = crop.pixel_box(full.size)
+            kind_text = ("PNG · lossless" if kind.get() == "PNG"
+                         else "JPEG · maximum quality, no subsampling")
+            info.configure(text=f"{r - l} × {b - t} px from the {full.size[0]} × {full.size[1]} "
+                                f"original\n{kind_text}")
+
+        def cropped():
+            full = state["full"]
+            return full.crop(crop.pixel_box(full.size))
+
+        def suffix():
+            return {"original": "", "free": "_crop"}.get(state["format"]) or {
+                16 / 9: "_16x9", 9 / 16: "_9x16", 4 / 5: "_4x5", 1.0: "_1x1"}.get(state["format"], "_crop")
+
+        def save():
+            if state["full"] is None:
+                return
+            ext = ".png" if kind.get() == "PNG" else ".jpg"
+            target = filedialog.asksaveasfilename(
+                parent=win, title="Save the photo", defaultextension=ext,
+                initialfile=os.path.splitext(name)[0] + suffix() + ext,
+                filetypes=[("PNG", "*.png")] if ext == ".png" else [("JPEG", "*.jpg *.jpeg")])
+            if not target:
+                return
+            img = cropped()
+            extra = {"icc_profile": state["icc"]} if state["icc"] else {}
+            try:
+                if ext == ".png":
+                    img.save(target, "PNG", **extra)
+                else:
+                    img.save(target, "JPEG", quality=100, subsampling=0, **extra)
+            except Exception as exc:
+                _log_reuse(f"EXPORT SAVE FAILED: {exc!r}")
+                note.configure(text="Couldn't save there - pick another folder.", text_color=DANGER)
+                return
+            note.configure(text=f"Saved {img.size[0]} × {img.size[1]} px.", text_color=SOURCE_DOT)
+            self.status_var.set(f"Exported {os.path.basename(target)}.")
+
+        def copy():
+            if state["full"] is None:
+                return
+            img = cropped()
+            note.configure(text="Copying…", text_color=MUTED_TEXT_COLOR)
+
+            def work():
+                import tempfile
+                tmp = os.path.join(tempfile.gettempdir(), "topshot-export.png")
+                try:
+                    img.save(tmp, "PNG")
+                    w, h = self._put_image_on_clipboard(tmp)
+                    result["copied"] = f"Copied {w} × {h} px - paste it anywhere."
+                except Exception as exc:
+                    _log_reuse(f"EXPORT COPY FAILED: {exc!r}")
+                    result["copied"] = "Couldn't copy - try again."
+
+            result = {}
+            threading.Thread(target=work, daemon=True).start()
+
+            def poll():
+                if not state["open"]:
+                    return
+                if "copied" in result:
+                    note.configure(text=result["copied"], text_color=SOURCE_DOT)
+                else:
+                    win.after(120, poll)
+
+            win.after(120, poll)
+
+        def close():
+            state["open"] = False
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.bind("<Escape>", lambda _e: close())
+        win.bind("<Return>", lambda _e: save())
+
+        try:
+            crop.set_image(self._thumb_image(path))
+        except Exception:
+            pass
+        choose("original")
+        loaded = {}
+
+        def work():
+            try:
+                source = self._ensure_full_image(item_id, name) if item_id else path
+                with Image.open(source) as probe:
+                    loaded["icc"] = probe.info.get("icc_profile")
+                loaded["img"] = self._open_upright(source).convert("RGB")
+            except Exception as exc:
+                _log_reuse(f"EXPORT LOAD FAILED: {exc!r}")
+                loaded["failed"] = True
+
+        def poll():
+            if not state["open"]:
+                return
+            if "img" in loaded:
+                state["full"], state["icc"] = loaded["img"], loaded["icc"]
+                crop.set_image(loaded["img"])
+                for b in (save_button, copy_button):
+                    b.configure(state=tk.NORMAL)
+                update_info()
+            elif "failed" in loaded:
+                info.configure(text="Couldn't load the original - check your connection.",
+                               text_color=DANGER)
+            else:
+                win.after(150, poll)
+
+        threading.Thread(target=work, daemon=True).start()
+        win.after(150, poll)
+        win.focus_force()
+
+    def _open_original(self, path, meta):
+        item_id = (meta or {}).get("item_id")
+        if item_id:
+            self._open_sp_result(item_id, meta.get("name") or os.path.basename(path))
+        else:
+            open_in_system_viewer(path)
+
+    def _preview_open(self, path, meta):
+        """Puts one photo in the open preview, sharpest copy on disk first."""
+        preview = self._preview
+        if preview is None:
+            return
+        shown = getattr(self, "_shown_results", None) or []
+        index = next((i for i, r in enumerate(shown) if r[0] == path), None)
+        token = object()
+        preview.update(token=token, path=path, meta=meta, index=index, quality=-1)
+        meta = meta or {}
+        name = meta.get("name") or os.path.basename(path)
+        folder = meta.get("folder") or ""
+        try:
+            preview["win"].title(name)
+        except tk.TclError:
+            return
+        base = f"{name}  ·  {folder}" if folder else name
+        preview["caption"].configure(text=f"{base}   (sharpening…)")
+        viewer = preview["viewer"]
+        viewer.reset()
+        viewer.set_nav(
+            (lambda: self._preview_step(-1)) if index is not None and index > 0 else None,
+            (lambda: self._preview_step(1)) if index is not None and index < len(shown) - 1 else None,
+        )
+        item_id = meta.get("item_id")
         large = os.path.join(self._preview_dir(), f"{item_id}.jpg") if item_id else None
         try:
             if large and os.path.exists(large):
-                self._apply_preview(token, Image.open(large).convert("RGB"), 1)
+                viewer.set_image(self._open_upright(large).convert("RGB"), 1)
             else:
-                self._apply_preview(token, self._thumb_image(path), 0)
+                viewer.set_image(self._thumb_image(path), 0)
         except Exception:
             pass
+        result = {}
 
-        caption.configure(text=f"{caption.cget('text')}   (sharpening...)")
-        if item_id:
-            if not (large and os.path.exists(large)):
-                self._fetch_preview(item_id, token, box)
-            self._load_original_preview(item_id, name, token, box)
-        else:
-            self._load_original_preview(None, path, token, box)
+        def work():
+            try:
+                source = self._ensure_full_image(item_id, name) if item_id else path
+                result["img"] = self._open_upright(source).convert("RGB")
+            except Exception as exc:
+                _log_reuse(f"ORIGINAL PREVIEW FAILED: {exc!r}")
+                result["failed"] = True
+
+        def poll():
+            if self._preview is not preview or preview["token"] is not token:
+                return
+            if "img" in result:
+                viewer.set_image(result["img"], 2)
+                preview["quality"] = 2
+                preview["caption"].configure(text=base)
+            elif "failed" in result:
+                preview["caption"].configure(text=base)
+            else:
+                viewer.canvas.after(120, poll)
+
+        threading.Thread(target=work, daemon=True).start()
+        viewer.canvas.after(120, poll)
+        self._prefetch_neighbours(index)
+
+    def _prefetch_neighbours(self, index):
+        """Downloads the originals either side of the open photo, so the
+        arrow keys find them already on disk."""
+        shown = getattr(self, "_shown_results", None) or []
+        if index is None:
+            return
+        wanted = []
+        for i in (index + 1, index - 1):
+            if 0 <= i < len(shown):
+                meta = shown[i][2] or {}
+                if meta.get("item_id"):
+                    wanted.append((meta["item_id"], meta.get("name") or os.path.basename(shown[i][0])))
+        if not wanted:
+            return
+
+        def work():
+            for item_id, name in wanted:
+                try:
+                    self._ensure_full_image(item_id, name)
+                except Exception:
+                    pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _preview_step(self, delta):
+        preview = self._preview
+        shown = getattr(self, "_shown_results", None) or []
+        if preview is None or preview.get("index") is None:
+            return
+        i = preview["index"] + delta
+        if 0 <= i < len(shown):
+            path, _score, meta = shown[i]
+            self._preview_open(path, meta)
+
+    def _show_compare(self, items):
+        """Two photos side by side; zooming or moving one moves both."""
+        if len(items) != 2:
+            return
+        box = self._preview_box()
+        win = ctk.CTkToplevel(self.root)
+        win.title("Compare")
+        win.configure(fg_color=BG_COLOR)
+        width, height = box[0] + 24, box[1] + 84
+        x = max(0, (win.winfo_screenwidth() - width) // 2)
+        y = max(0, (win.winfo_screenheight() - height) // 2 - 20)
+        win.geometry(f"{width}x{height}+{x}+{y}")
+        try:
+            win.after(200, lambda: _apply_icon(win))
+        except Exception:
+            pass
+        panes = ctk.CTkFrame(win, fg_color="transparent")
+        panes.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 0))
+        panes.grid_columnconfigure((0, 1), weight=1, uniform="compare")
+        panes.grid_rowconfigure(0, weight=1)
+        viewers, alive = [], {"open": True}
+        for column, (path, meta) in enumerate(items):
+            viewer = PhotoViewer(panes, BG_COLOR)
+            viewer.canvas.grid(row=0, column=column, sticky="nsew", padx=(0, 6) if column == 0 else (6, 0))
+            name = (meta or {}).get("name") or os.path.basename(path)
+            ctk.CTkLabel(panes, text=name, text_color=MUTED_TEXT_COLOR, font=_font(12)).grid(
+                row=1, column=column, pady=(8, 0))
+            viewers.append(viewer)
+            try:
+                viewer.set_image(self._thumb_image(path), 0)
+            except Exception:
+                pass
+            self._load_original_into(viewer, path, meta, lambda: alive["open"])
+        a, b = viewers
+        a.on_change = lambda v: b.follow(v)
+        b.on_change = lambda v: a.follow(v)
+        bar = ctk.CTkFrame(win, fg_color="transparent")
+        bar.pack(fill=tk.X, padx=12, pady=12)
+        ctk.CTkLabel(bar, text="Zoom and move one photo - the other follows.",
+                     text_color=FAINT_TEXT, font=_font(12)).pack(side=tk.LEFT)
+
+        def close():
+            alive["open"] = False
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        _make_button(bar, "Close", close, width=90).pack(side=tk.RIGHT)
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.bind("<Escape>", lambda _e: close())
+        win.focus_force()
+
+    def _load_original_into(self, viewer, path, meta, alive):
+        meta = meta or {}
+        item_id = meta.get("item_id")
+        name = meta.get("name") or os.path.basename(path)
+        result = {}
+
+        def work():
+            try:
+                source = self._ensure_full_image(item_id, name) if item_id else path
+                result["img"] = self._open_upright(source).convert("RGB")
+            except Exception as exc:
+                _log_reuse(f"COMPARE LOAD FAILED: {exc!r}")
+                result["failed"] = True
+
+        def poll():
+            if not alive():
+                return
+            if "img" in result:
+                viewer.set_image(result["img"], 2)
+            elif "failed" not in result:
+                viewer.canvas.after(120, poll)
+
+        threading.Thread(target=work, daemon=True).start()
+        viewer.canvas.after(120, poll)
 
     def _apply_preview(self, token, img, quality):
         """Shows `img` in the open preview - unless it was closed, replaced
         by another preview, or already showing something sharper."""
         preview = self._preview
-        if preview is None or preview["token"] is not token or quality <= preview["quality"]:
+        if (preview is None or "label" not in preview or preview["token"] is not token
+                or quality <= preview["quality"]):
             return
         try:
             fitted = self._fit(img, preview["box"]) if img.size != preview["box"] else img
@@ -5555,6 +5962,7 @@ class ImageSearchApp:
         collect = action(" Add to…", "folder", None)
         collect.configure(command=lambda: self._selection_collect_menu(collect))
         action(" Copy", "copy", self._copy_selection)
+        compare = action(" Compare", "similar", lambda: self._show_compare(self._selection_items()))
         action(" Save…", "save", self._save_selection)
         fav = action(" Favourite", "star", self._favourite_selection)
         ctk.CTkFrame(row, width=1, height=20, fg_color=BORDER).pack(side=tk.LEFT, padx=6)
@@ -5564,6 +5972,7 @@ class ImageSearchApp:
             command=self._clear_selection,
         ).pack(side=tk.LEFT)
         bar = self._sel_bar = {"holder": holder, "count": count, "collect": collect, "fav": fav,
+                               "compare": compare,
                                "shown": False, "gen": 0, "offset": 0}
         return bar
 
@@ -5603,6 +6012,14 @@ class ImageSearchApp:
         bar["collect"].configure(text=" Move to…" if in_collection else " Add to…")
         bar["fav"].configure(text=" Remove from favourites" if self._view == "favourites"
                              else " Favourite")
+        # Compare is offered for exactly two picks.
+        try:
+            if n == 2:
+                bar["compare"].pack(side=tk.LEFT, padx=2, after=bar["compare"].master.winfo_children()[2])
+            else:
+                bar["compare"].pack_forget()
+        except tk.TclError:
+            pass
         if not bar["shown"]:
             self._slide_selection_bar(True, animate)
         else:
@@ -6140,6 +6557,7 @@ class ImageSearchApp:
             ("item", "Preview", "preview", lambda: self._show_preview(path, meta)),
             ("item", "Copy image", "copy", lambda: self._copy_to_clipboard(path, meta)),
             ("item", "Open original", "external", open_original),
+            ("item", "Export…", "save", lambda: self._show_export(path, meta)),
             ("item", "Details…", "info", lambda: self._show_details(path, meta)),
         ]
         targets = [n for n in names if n != self._view]
@@ -7038,6 +7456,502 @@ def _work_area(win):
     except Exception:
         pass
     return 0, 0, win.winfo_screenwidth(), win.winfo_screenheight()
+
+
+class CropCanvas:
+    """The crop area of the export window.
+
+    The photo is fitted with a margin; outside the crop it is darkened, so
+    the result reads at a glance. All four corners can be dragged (with a
+    fixed format the ratio holds), dragging inside the crop moves it, and a
+    thirds grid shows while it is being moved or resized. Switching format
+    glides the crop to its new shape (ease-in-out, 260 ms). The crop is kept
+    as fractions of the photo, so it stays put when the full-resolution
+    original replaces the quick preview.
+    """
+
+    MARGIN = 28
+    HANDLE = 20      # how close to a corner counts as grabbing it
+    MIN_SIZE = 48    # px on screen
+
+    def __init__(self, parent, on_change=None):
+        self.canvas = tk.Canvas(parent, bg=BG_COLOR, highlightthickness=0, bd=0)
+        self.item = self.canvas.create_image(0, 0, anchor="nw")
+        self.image = None
+        self.disp = self.dark = None
+        self.disp_key = None
+        self.ratio = None                     # w / h in pixels, None = free
+        self.rect = [0.0, 0.0, 1.0, 1.0]      # fractions of the photo
+        self.on_change = on_change
+        self.reduced = _prefers_reduced_motion()
+        self._drag = None
+        self._anim = 0
+        self._busy = False
+        c = self.canvas
+        c.bind("<Configure>", lambda _e: self.redraw())
+        c.bind("<ButtonPress-1>", self._press)
+        c.bind("<B1-Motion>", self._motion)
+        c.bind("<ButtonRelease-1>", self._release)
+        c.bind("<Motion>", self._hover)
+
+    # --- geometry ---
+
+    def set_image(self, img):
+        self.image = img
+        self.disp_key = None
+        self.redraw()
+
+    def _box(self):
+        """Where the photo sits on the canvas: x, y, w, h."""
+        cw, ch = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
+        iw, ih = self.image.size
+        s = min((cw - 2 * self.MARGIN) / iw, (ch - 2 * self.MARGIN) / ih)
+        w, h = max(1, round(iw * s)), max(1, round(ih * s))
+        return (cw - w) // 2, (ch - h) // 2, w, h
+
+    def _screen_rect(self):
+        x, y, w, h = self._box()
+        u0, v0, u1, v1 = self.rect
+        return x + u0 * w, y + v0 * h, x + u1 * w, y + v1 * h
+
+    def _fraction_ratio(self):
+        """The format as a ratio of fractions (photo width / height folded in)."""
+        if not self.ratio or self.image is None:
+            return None
+        iw, ih = self.image.size
+        return self.ratio * ih / iw
+
+    def largest(self, ratio, centre=None):
+        """The biggest crop of `ratio` around `centre`, inside the photo."""
+        iw, ih = self.image.size
+        fr = ratio * ih / iw
+        w, h = (1.0, 1.0 / fr) if fr >= 1.0 else (fr, 1.0)
+        if h > 1.0:
+            w, h = w / h, 1.0
+        if w > 1.0:
+            w, h = 1.0, h / w
+        cx, cy = centre or (0.5, 0.5)
+        cx = min(1 - w / 2, max(w / 2, cx))
+        cy = min(1 - h / 2, max(h / 2, cy))
+        return [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
+
+    def set_format(self, ratio):
+        """None = free. Glides from the current crop to the new shape."""
+        self.ratio = ratio
+        if self.image is None:
+            return
+        if ratio is None:
+            self.redraw()
+            self._changed()
+            return
+        u0, v0, u1, v1 = self.rect
+        target = self.largest(ratio, ((u0 + u1) / 2, (v0 + v1) / 2))
+        start = list(self.rect)
+        self._anim += 1
+        gen = self._anim
+
+        def step(p):
+            if gen != self._anim:
+                return
+            self.rect = [a + (b - a) * p for a, b in zip(start, target)]
+            self._busy = p < 1
+            self.redraw()
+
+        _animate(self.canvas, 0 if self.reduced else 260, step, done=self._changed,
+                 ease=EASE_IN_OUT)
+
+    def pixel_box(self, size):
+        """The crop in pixels of a photo of `size` (the original)."""
+        iw, ih = size
+        u0, v0, u1, v1 = self.rect
+        return (round(u0 * iw), round(v0 * ih), round(u1 * iw), round(v1 * ih))
+
+    def _changed(self):
+        self._busy = False
+        self.redraw()
+        if self.on_change:
+            self.on_change()
+
+    # --- drawing ---
+
+    def redraw(self):
+        c = self.canvas
+        if self.image is None:
+            return
+        x, y, w, h = self._box()
+        if self.disp_key != (w, h, id(self.image)):
+            self.disp = self.image.resize((w, h), Image.LANCZOS)
+            self.dark = Image.blend(self.disp, Image.new("RGB", (w, h), (0, 0, 0)), 0.62)
+            self.disp_key = (w, h, id(self.image))
+        sx0, sy0, sx1, sy1 = self._screen_rect()
+        r = (max(0, round(sx0 - x)), max(0, round(sy0 - y)),
+             min(w, round(sx1 - x)), min(h, round(sy1 - y)))
+        frame = self.dark.copy()
+        if r[2] > r[0] and r[3] > r[1]:
+            frame.paste(self.disp.crop(r), (r[0], r[1]))
+        self.photo = ImageTk.PhotoImage(frame)
+        c.itemconfigure(self.item, image=self.photo)
+        c.coords(self.item, x, y)
+        c.delete("crop")
+        c.create_rectangle(sx0, sy0, sx1, sy1, outline="#ffffff", width=1, tags="crop")
+        if self._drag is not None or self._busy:
+            for i in (1, 2):
+                gx = sx0 + (sx1 - sx0) * i / 3
+                gy = sy0 + (sy1 - sy0) * i / 3
+                c.create_line(gx, sy0, gx, sy1, fill="#cfd8d3", width=1, tags="crop")
+                c.create_line(sx0, gy, sx1, gy, fill="#cfd8d3", width=1, tags="crop")
+        arm = max(10, min(22, (sx1 - sx0) / 4, (sy1 - sy0) / 4))
+        for cx, cy, dx, dy in ((sx0, sy0, 1, 1), (sx1, sy0, -1, 1), (sx0, sy1, 1, -1),
+                               (sx1, sy1, -1, -1)):
+            c.create_line(cx, cy + dy * arm, cx, cy, cx + dx * arm, cy, fill="#ffffff",
+                          width=3, capstyle="round", joinstyle="round", tags="crop")
+
+    # --- dragging ---
+
+    def _hit(self, ex, ey):
+        sx0, sy0, sx1, sy1 = self._screen_rect()
+        for name, cx, cy in (("nw", sx0, sy0), ("ne", sx1, sy0), ("sw", sx0, sy1), ("se", sx1, sy1)):
+            if abs(ex - cx) <= self.HANDLE and abs(ey - cy) <= self.HANDLE:
+                return name
+        if sx0 < ex < sx1 and sy0 < ey < sy1:
+            return "move"
+        return None
+
+    def _hover(self, event):
+        if self.image is None or self._drag is not None:
+            return
+        part = self._hit(event.x, event.y)
+        cursors = {"nw": "top_left_corner", "se": "bottom_right_corner",
+                   "ne": "top_right_corner", "sw": "bottom_left_corner", "move": "fleur"}
+        self.canvas.configure(cursor=cursors.get(part, ""))
+
+    def _press(self, event):
+        if self.image is None:
+            return
+        part = self._hit(event.x, event.y)
+        if part is None:
+            return
+        self._anim += 1   # a glide in progress stops where it is
+        self._drag = {"part": part, "x": event.x, "y": event.y, "rect": list(self.rect)}
+        self.redraw()
+
+    def _motion(self, event):
+        drag = self._drag
+        if drag is None:
+            return
+        x, y, w, h = self._box()
+        du, dv = (event.x - drag["x"]) / w, (event.y - drag["y"]) / h
+        u0, v0, u1, v1 = drag["rect"]
+        if drag["part"] == "move":
+            du = min(1 - u1, max(-u0, du))
+            dv = min(1 - v1, max(-v0, dv))
+            self.rect = [u0 + du, v0 + dv, u1 + du, v1 + dv]
+        else:
+            part = drag["part"]
+            ax = u1 if "w" in part else u0          # the corner that stays
+            ay = v1 if "n" in part else v0
+            px = min(1.0, max(0.0, (event.x - x) / w))
+            py = min(1.0, max(0.0, (event.y - y) / h))
+            min_u, min_v = self.MIN_SIZE / w, self.MIN_SIZE / h
+            width, height = max(min_u, abs(px - ax)), max(min_v, abs(py - ay))
+            fr = self._fraction_ratio()
+            if fr:
+                if width / height > fr:
+                    width = height * fr
+                else:
+                    height = width / fr
+                room_u = ax if "w" in part else 1 - ax
+                room_v = ay if "n" in part else 1 - ay
+                scale = min(1.0, room_u / width if width else 1, room_v / height if height else 1)
+                width, height = width * scale, height * scale
+            else:
+                width = min(width, ax if "w" in part else 1 - ax)
+                height = min(height, ay if "n" in part else 1 - ay)
+            nx0 = ax - width if "w" in part else ax
+            ny0 = ay - height if "n" in part else ay
+            self.rect = [nx0, ny0, nx0 + width, ny0 + height]
+        self.redraw()
+        if self.on_change:
+            self.on_change()
+
+    def _release(self, _event):
+        if self._drag is not None:
+            self._drag = None
+            self.redraw()
+
+
+class PhotoViewer:
+    """One photo on a canvas that can be zoomed and moved.
+
+    It opens fitted. The wheel zooms around the pointer, a double-click
+    goes to 100 % at that spot and back (ease-out, 220 ms), dragging moves a
+    zoomed photo. While it moves, frames are drawn quickly (bilinear); a
+    moment after it stops, the view is redrawn sharp (Lanczos). Drawing
+    works from a size pyramid of the photo, so a 24-megapixel original
+    stays smooth. Arrows for the previous and next photo appear on hover.
+    """
+
+    MAX_PIXEL_ZOOM = 4.0   # up to 400 % of the photo's pixels
+    WHEEL_STEP = 1.18
+    NAV_R = 20
+
+    def __init__(self, parent, bg):
+        self.canvas = tk.Canvas(parent, bg=bg, highlightthickness=0, bd=0)
+        self.item = self.canvas.create_image(0, 0, anchor="nw")
+        self.image = None
+        self.quality = -1
+        self.levels = []
+        self.zoom = 1.0
+        self.fx = self.fy = 0.5
+        self.photo = None
+        self.on_change = None       # called after the view moved (compare keeps two in step)
+        self.on_zoom_text = None    # e.g. the "Fit" / "100 %" label under the photo
+        self.reduced = _prefers_reduced_motion()
+        self._sharp_after = None
+        self._drag = None
+        self._anim = 0
+        self._hover = False
+        self._nav = {}
+        c = self.canvas
+        c.bind("<Configure>", lambda _e: self.render())
+        c.bind("<MouseWheel>", self._wheel)
+        c.bind("<Button-4>", lambda e: self._wheel(e, 1))
+        c.bind("<Button-5>", lambda e: self._wheel(e, -1))
+        c.bind("<ButtonPress-1>", self._press)
+        c.bind("<B1-Motion>", self._motion)
+        c.bind("<ButtonRelease-1>", self._release)
+        c.bind("<Double-Button-1>", self._double)
+        c.bind("<Enter>", lambda _e: self._set_hover(True))
+        c.bind("<Leave>", lambda _e: self._set_hover(False))
+
+    # --- the photo ---
+
+    def set_image(self, img, quality):
+        """Shows `img`, unless something sharper is already showing. The
+        view (zoom and position) is kept, so sharpening never jumps."""
+        if img is None or quality <= self.quality:
+            return
+        self.image, self.quality = img, quality
+        self.levels = [img]
+        level = img
+        while max(level.size) > 1400:
+            level = level.reduce(2)
+            self.levels.append(level)
+        self.render()
+
+    def reset(self):
+        self.image, self.quality, self.levels = None, -1, []
+        self.zoom, self.fx, self.fy = 1.0, 0.5, 0.5
+        self.render()
+
+    def _size(self):
+        return max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
+
+    def _fit_scale(self):
+        cw, ch = self._size()
+        iw, ih = self.image.size
+        return min(cw / iw, ch / ih)
+
+    def _scale(self):
+        return self._fit_scale() * self.zoom
+
+    def max_zoom(self):
+        return max(1.0, self.MAX_PIXEL_ZOOM / self._fit_scale())
+
+    def _clamp(self):
+        cw, ch = self._size()
+        s = self._scale()
+        iw, ih = self.image.size
+        vw, vh = cw / s / iw, ch / s / ih
+        self.fx = 0.5 if vw >= 1 else min(1 - vw / 2, max(vw / 2, self.fx))
+        self.fy = 0.5 if vh >= 1 else min(1 - vh / 2, max(vh / 2, self.fy))
+
+    def zoom_text(self):
+        if self.image is None:
+            return ""
+        return "Fit" if abs(self.zoom - 1.0) < 0.01 else f"{round(self._scale() * 100)} %"
+
+    def render(self, fast=False):
+        c = self.canvas
+        if self._sharp_after is not None:
+            try:
+                c.after_cancel(self._sharp_after)
+            except Exception:
+                pass
+            self._sharp_after = None
+        if self.image is None:
+            c.itemconfigure(self.item, image="")
+            self._place_nav()
+            return
+        self._clamp()
+        cw, ch = self._size()
+        s = self._scale()
+        iw, ih = self.image.size
+        vw, vh = cw / s, ch / s
+        left, top = self.fx * iw - vw / 2, self.fy * ih - vh / 2
+        x0, y0 = max(0.0, left), max(0.0, top)
+        x1, y1 = min(float(iw), left + vw), min(float(ih), top + vh)
+        if x1 <= x0 or y1 <= y0:
+            return
+        out_w, out_h = max(1, round((x1 - x0) * s)), max(1, round((y1 - y0) * s))
+        source, k = self.image, 1.0
+        for level in self.levels[1:]:
+            lk = level.size[0] / iw
+            if (x1 - x0) * lk >= out_w:
+                source, k = level, lk
+            else:
+                break
+        try:
+            frame = source.resize((out_w, out_h), Image.BILINEAR if fast else Image.LANCZOS,
+                                  box=(x0 * k, y0 * k, x1 * k, y1 * k))
+            self.photo = ImageTk.PhotoImage(frame)
+        except Exception:
+            return
+        c.itemconfigure(self.item, image=self.photo)
+        c.coords(self.item, round((x0 - left) * s), round((y0 - top) * s))
+        if fast:
+            self._sharp_after = c.after(140, self.render)
+        if self.on_zoom_text:
+            self.on_zoom_text(self.zoom_text())
+        self._place_nav()
+
+    # --- zooming and moving ---
+
+    def zoom_at(self, x, y, zoom, fast=False, notify=True):
+        if self.image is None:
+            return
+        zoom = max(1.0, min(self.max_zoom(), zoom))
+        cw, ch = self._size()
+        iw, ih = self.image.size
+        s0 = self._scale()
+        px = self.fx * iw + (x - cw / 2) / s0
+        py = self.fy * ih + (y - ch / 2) / s0
+        self.zoom = zoom
+        s1 = self._scale()
+        self.fx = (px - (x - cw / 2) / s1) / iw
+        self.fy = (py - (y - ch / 2) / s1) / ih
+        self.render(fast=fast)
+        if notify and self.on_change:
+            self.on_change(self)
+
+    def animate_zoom(self, target, x=None, y=None):
+        if self.image is None:
+            return
+        cw, ch = self._size()
+        x = cw / 2 if x is None else x
+        y = ch / 2 if y is None else y
+        start = self.zoom
+        self._anim += 1
+        gen = self._anim
+
+        def step(p):
+            if gen == self._anim:
+                self.zoom_at(x, y, start + (target - start) * p, fast=p < 1)
+
+        _animate(self.canvas, 0 if self.reduced else 220, step, ease=EASE_OUT)
+
+    def fit(self):
+        self.animate_zoom(1.0)
+
+    def actual_size(self):
+        if self.image is not None:
+            self.animate_zoom(min(self.max_zoom(), 1.0 / self._fit_scale()))
+
+    def zoom_in(self):
+        self.animate_zoom(min(self.max_zoom(), self.zoom * 1.6))
+
+    def zoom_out(self):
+        self.animate_zoom(max(1.0, self.zoom / 1.6))
+
+    def follow(self, other):
+        """Takes over another viewer's zoom and position (compare)."""
+        if self.image is None:
+            return
+        self.zoom = min(self.max_zoom(), other.zoom)
+        self.fx, self.fy = other.fx, other.fy
+        self.render(fast=True)
+
+    def _wheel(self, event, steps=None):
+        if self.image is None:
+            return
+        if steps is None:
+            d = event.delta
+            steps = d / 120 if abs(d) >= 120 else (1 if d > 0 else -1 if d < 0 else 0)
+        self._anim += 1
+        self.zoom_at(event.x, event.y, self.zoom * (self.WHEEL_STEP ** steps), fast=True)
+
+    def _press(self, event):
+        self._drag = (event.x, event.y, self.fx, self.fy)
+        if self.zoom > 1.001:
+            self.canvas.configure(cursor="fleur")
+
+    def _motion(self, event):
+        if self._drag is None or self.image is None or self.zoom <= 1.001:
+            return
+        x0, y0, fx0, fy0 = self._drag
+        s = self._scale()
+        iw, ih = self.image.size
+        self.fx = fx0 - (event.x - x0) / s / iw
+        self.fy = fy0 - (event.y - y0) / s / ih
+        self.render(fast=True)
+        if self.on_change:
+            self.on_change(self)
+
+    def _release(self, _event):
+        self._drag = None
+        self.canvas.configure(cursor="")
+
+    def _double(self, event):
+        if self.image is None:
+            return
+        if self.zoom > 1.01:
+            self.animate_zoom(1.0, event.x, event.y)
+        else:
+            self.animate_zoom(min(self.max_zoom(), max(2.0, 1.0 / self._fit_scale())),
+                              event.x, event.y)
+
+    # --- previous / next ---
+
+    def set_nav(self, previous=None, following=None):
+        """Round arrow buttons at the sides, shown while the pointer is
+        over the photo. None hides that side."""
+        c = self.canvas
+        c.delete("nav")
+        self._nav = {}
+        for side, command, icon in (("prev", previous, "back"), ("next", following, "next")):
+            if command is None:
+                continue
+            r = self.NAV_R
+            disc = c.create_oval(0, 0, 2 * r, 2 * r, fill=SURFACE, outline=MENU_BORDER,
+                                 tags=("nav", f"nav_{side}"))
+            image = _icon_tk(icon, 18, TEXT_COLOR)
+            glyph = (c.create_image(r, r, image=image, tags=("nav", f"nav_{side}")) if image
+                     else c.create_text(r, r, text="‹" if side == "prev" else "›",
+                                        fill=TEXT_COLOR, font=(UI_FONT, -20),
+                                        tags=("nav", f"nav_{side}")))
+            self._nav[side] = {"disc": disc, "glyph": glyph, "image": image}
+            c.tag_bind(f"nav_{side}", "<Button-1>", lambda _e, f=command: f())
+            c.tag_bind(f"nav_{side}", "<Enter>",
+                       lambda _e, d=disc: c.itemconfigure(d, fill=SURFACE_HOVER))
+            c.tag_bind(f"nav_{side}", "<Leave>", lambda _e, d=disc: c.itemconfigure(d, fill=SURFACE))
+        self._place_nav()
+
+    def _set_hover(self, on):
+        self._hover = on
+        self._place_nav()
+
+    def _place_nav(self):
+        c = self.canvas
+        cw, ch = self._size()
+        r = self.NAV_R
+        for side, parts in self._nav.items():
+            cx = 18 + r if side == "prev" else cw - 18 - r
+            c.coords(parts["disc"], cx - r, ch / 2 - r, cx + r, ch / 2 + r)
+            c.coords(parts["glyph"], cx, ch / 2)
+            state = "normal" if self._hover else "hidden"
+            c.itemconfigure(parts["disc"], state=state)
+            c.itemconfigure(parts["glyph"], state=state)
+        c.tag_raise("nav")
 
 
 class PopMenu:
